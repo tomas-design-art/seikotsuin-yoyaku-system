@@ -4,6 +4,7 @@ export interface Practitioner {
   id: number;
   name: string;
   role: string;
+  daily_report_code: string | null;
   is_active: boolean;
   is_visible: boolean;
   display_order: number;

@@ -161,6 +161,54 @@ class ReservationResponse(BaseModel):
         return _to_jst_str(v)
 
 
+class DailyReportPatient(BaseModel):
+    id: int
+    full_name: str
+    kana: Optional[str] = None
+    age: Optional[int] = None
+    gender: Optional[str] = None
+    visit_count: int
+
+
+class DailyReportStaff(BaseModel):
+    id: int
+    name: str
+    daily_report_code: Optional[str] = None
+
+
+class DailyReportMenu(BaseModel):
+    id: int
+    name: str
+    category: Optional[str] = None
+    duration_minutes: int
+
+
+class DailyReportReservation(BaseModel):
+    id: int
+    reservation_time: datetime
+    patient: Optional[DailyReportPatient] = None
+    staff: DailyReportStaff
+    menu: Optional[DailyReportMenu] = None
+    duration_minutes: int
+    channel: str
+    is_walk_in: bool
+
+    @field_serializer("reservation_time")
+    def serialize_reservation_time(self, v: datetime) -> str:
+        return _to_jst_str(v)  # type: ignore[arg-type]
+
+
+class DailyReportResponse(BaseModel):
+    date: date
+    cutoff_time: datetime
+    count: int
+    reservations: list[DailyReportReservation]
+
+    @field_serializer("cutoff_time")
+    def serialize_cutoff_time(self, v: datetime) -> str:
+        return _to_jst_str(v)  # type: ignore[arg-type]
+
+
 # ──────────────────────────────────────────────
 # 繰り返し予約一括生成
 # ──────────────────────────────────────────────

@@ -5,7 +5,7 @@ import zoneinfo
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Header
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -23,6 +23,7 @@ from app.schemas.reservation import (
     SeriesExtendRequest,
     SeriesModifyRequest,
     SeriesBulkEditRequest,
+    DailyReportResponse,
 )
 from app.services.reservation_service import (
     create_reservation,
@@ -40,6 +41,7 @@ from app.services.schedule_service import is_practitioner_working
 from app.services.business_hours import get_business_hours_for_date
 from app.services.audit_log_service import log_action
 from app.utils.datetime_jst import now_jst
+from app.api.auth import require_staff
 
 _JST = zoneinfo.ZoneInfo("Asia/Tokyo")
 logger = logging.getLogger(__name__)
@@ -63,6 +65,39 @@ def _operator_label(x_operator: Optional[str]) -> str:
     except Exception:
         pass
     return raw[:64]
+
+
+def _as_jst(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=_JST)
+    return value.astimezone(_JST)
+
+
+def _patient_kana(patient) -> str | None:
+    if not patient:
+        return None
+    if patient.reading:
+        return patient.reading
+    parts = [patient.last_name_kana, patient.first_name_kana]
+    kana = "".join(part for part in parts if part)
+    return kana or None
+
+
+def _patient_age(patient, target_date: date) -> int | None:
+    if not patient or not patient.birth_date:
+        return None
+    years = target_date.year - patient.birth_date.year
+    if (target_date.month, target_date.day) < (patient.birth_date.month, patient.birth_date.day):
+        years -= 1
+    return years
+
+
+def _menu_category(menu) -> str | None:
+    if not menu:
+        return None
+    if "保険" in menu.name:
+        return "insurance"
+    return None
 
 
 async def _safe_log_action(
@@ -127,6 +162,94 @@ async def list_reservations(
     result = await db.execute(query)
     reservations = result.scalars().all()
     return [build_reservation_response(r) for r in reservations]
+
+
+@router.get("/daily-report", response_model=DailyReportResponse)
+async def get_daily_report(
+    cutoff_time: Optional[datetime] = Query(None),
+    report_date: Optional[date] = Query(None, alias="date"),
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
+    target_date = report_date or now_jst().date()
+    cutoff = _as_jst(cutoff_time or now_jst())
+    day_start = datetime(target_date.year, target_date.month, target_date.day, tzinfo=_JST)
+    day_end = day_start + timedelta(days=1)
+
+    result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.start_time >= day_start,
+            Reservation.start_time < day_end,
+            Reservation.start_time <= cutoff,
+            Reservation.status == "CONFIRMED",
+        )
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+        )
+        .order_by(Reservation.start_time, Reservation.id)
+    )
+    reservations = result.scalars().all()
+
+    patient_ids = sorted({r.patient_id for r in reservations if r.patient_id})
+    visit_counts: dict[int, int] = {}
+    if patient_ids:
+        count_result = await db.execute(
+            select(Reservation.patient_id, func.count(Reservation.id))
+            .where(
+                Reservation.patient_id.in_(patient_ids),
+                Reservation.status == "CONFIRMED",
+                Reservation.start_time < day_start,
+            )
+            .group_by(Reservation.patient_id)
+        )
+        visit_counts = {patient_id: count for patient_id, count in count_result.all()}
+
+    items = []
+    for reservation in reservations:
+        start_time = _as_jst(reservation.start_time)
+        end_time = _as_jst(reservation.end_time)
+        duration_minutes = int((end_time - start_time).total_seconds() // 60)
+        patient = reservation.patient
+        practitioner = reservation.practitioner
+        menu = reservation.menu
+        items.append(
+            {
+                "id": reservation.id,
+                "reservation_time": start_time,
+                "patient": None if patient is None else {
+                    "id": patient.id,
+                    "full_name": patient.name,
+                    "kana": _patient_kana(patient),
+                    "age": _patient_age(patient, target_date),
+                    "gender": None,
+                    "visit_count": visit_counts.get(patient.id, 0),
+                },
+                "staff": {
+                    "id": practitioner.id,
+                    "name": practitioner.name,
+                    "daily_report_code": practitioner.daily_report_code,
+                },
+                "menu": None if menu is None else {
+                    "id": menu.id,
+                    "name": menu.name,
+                    "category": _menu_category(menu),
+                    "duration_minutes": menu.duration_minutes,
+                },
+                "duration_minutes": duration_minutes,
+                "channel": reservation.channel,
+                "is_walk_in": reservation.channel == "WALK_IN",
+            }
+        )
+
+    return {
+        "date": target_date,
+        "cutoff_time": cutoff,
+        "count": len(items),
+        "reservations": items,
+    }
 
 
 @router.get("/{reservation_id}")
