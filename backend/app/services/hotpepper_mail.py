@@ -719,9 +719,16 @@ async def _resolve_hotpepper_menu(
         return None, duration_minutes
 
     # price_tiers がある場合、最も近い tier の duration にスナップ
+    # ただし差が 15分超の場合は誤スナップを防ぎパース値をそのまま使う
     if menu.price_tiers:
         tier_durations = [t.duration_minutes for t in menu.price_tiers]
         best = min(tier_durations, key=lambda d: abs(d - duration_minutes))
+        if abs(best - duration_minutes) > 15:
+            logger.info(
+                "HotPepperメニュー duration snap スキップ(差 %d分): %d分のまま使用 (tiers=%s)",
+                abs(best - duration_minutes), duration_minutes, tier_durations,
+            )
+            return menu.id, duration_minutes
         logger.info(
             "HotPepperメニュー duration snap: %d分 → %d分 (tiers=%s)",
             duration_minutes, best, tier_durations,
