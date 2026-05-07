@@ -696,6 +696,31 @@ class TestDurationCompound:
         result = parse_hotpepper_mail(body)
         assert result["duration_minutes"] == 120
 
+    def test_40min_fullwidth_coupon(self):
+        """所要時間目安40分 + クーポンに全角数字４０分 → 40分（2026-05-07実事例）"""
+        body = (
+            "差出人: SALON BOARD直前予約お知らせ <yoyaku_system@salonboard.com>\n"
+            "件名: 【当日18時45分】直前予約が入りました\n\n"
+            "\ufeffcoco整骨院様\n\n"
+            "HOT PEPPER Beauty「SALON BOARD」にお客様から\nご予約が入りました。\n\n"
+            "◇ご予約内容\n"
+            "■予約番号\n　BE91112308\n"
+            "■氏名\n　テスト七郎（テスト ナナロウ）\n"
+            "■来店日時\n　2026年05月07日（木）18:45\n"
+            "■指名スタッフ\n　指名なし\n"
+            "■メニュー\n　ボディケア＋整体＋接骨・整骨\n"
+            "　（所要時間目安：40分）\n"
+            "■ご利用クーポン\n"
+            "　[新規]\n"
+            "　【人気No.3首肩こり/眼精疲労】全身整体\u3000４０分４7００円→４０００円\n"
+            "■合計金額\n　予約時合計金額\u30004,000円\n"
+        )
+        result = parse_hotpepper_mail(body)
+        assert result["duration_minutes"] == 40
+        assert result["duration_extracted"] is True
+        assert result["end_time"].hour == 19
+        assert result["end_time"].minute == 25
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
