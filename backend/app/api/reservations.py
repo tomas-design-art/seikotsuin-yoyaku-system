@@ -1020,6 +1020,8 @@ async def cancel_series_from_reservation(
     series.remaining_count = active_count
     if active_count == 0:
         series.is_active = False
+    # アラート通知済みフラグをリセット（残り回数が変わったので再評価させる）
+    series.notified_at = None
 
     await db.commit()
     logger.info(
@@ -1154,6 +1156,9 @@ async def edit_series_from_reservation(
         series.duration_minutes = update_fields["duration_minutes"]
     if "notes" in update_fields:
         series.notes = update_fields["notes"]
+
+    # アラート通知済みフラグをリセット（以降一括編集後はモーダルを再表示しない）
+    series.notified_at = None
 
     await db.commit()
     logger.info(
