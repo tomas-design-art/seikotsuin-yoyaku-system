@@ -228,3 +228,35 @@ async def test_shadow_mode_handle_created_uses_dummy_patient_not_real_name():
     mock_dummy.assert_awaited_once()
     mock_real.assert_not_awaited()
     assert result["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_process_hotpepper_email_skips_ai_review_when_required_fields_are_complete():
+    from app.services.hotpepper_mail import process_hotpepper_email
+
+    body = (
+        "差出人: SALON BOARD <yoyaku_system@salonboard.com>\n"
+        "件名: 予約連絡\n\n"
+        "coco整骨院様\nご予約が入りました。\n"
+        "◇ご予約内容\n"
+        "■予約番号\n　BE12345678\n"
+        "■氏名\n　テスト太郎\n"
+        "■来店日時\n　2026年05月02日（土）10:00\n"
+        "■指名スタッフ\n　指名なし\n"
+        "■メニュー\n　ボディケア\n"
+        "　（所要時間目安：1時間）\n"
+    )
+
+    db = AsyncMock()
+    with patch(
+        "app.services.hotpepper_mail.ai_review_hotpepper_required",
+        new=AsyncMock(side_effect=AssertionError("AI review should not be called")),
+    ) as mock_ai, patch(
+        "app.services.hotpepper_mail._handle_created",
+        new=AsyncMock(return_value={"status": "created", "reservation_id": 1}),
+    ) as mock_created:
+        result = await process_hotpepper_email(db, body)
+
+    assert result["status"] == "created"
+    mock_ai.assert_not_awaited()
+    mock_created.assert_awaited_once()

@@ -1,4 +1,4 @@
-"""院営業時間判定ヘルパー — date_override → 祝日 → 曜日 の3段階判定"""
+"""院営業時間判定ヘルパー — date_override → 曜日休診 → 祝日 → 曜日 の判定"""
 from datetime import date
 from typing import Optional
 
@@ -41,7 +41,7 @@ class BusinessHoursResult:
 async def get_business_hours_for_date(db: AsyncSession, target_date: date) -> BusinessHoursResult:
     """
     指定日の営業時間を判定する。
-    優先順位: 1) date_override  2) 祝日設定  3) 曜日設定  4) グローバル設定フォールバック
+    優先順位: 1) date_override  2) 曜日休診  3) 祝日設定  4) 曜日設定  5) グローバル設定フォールバック
     """
     # ── 1. 個別日付オーバーライド ──
     result = await db.execute(
@@ -57,7 +57,14 @@ async def get_business_hours_for_date(db: AsyncSession, target_date: date) -> Bu
             label=override.label,
         )
 
-    # ── 2. 祝日判定 ──
+    dow = target_date.isoweekday() % 7  # Mon=1..Sun=7 → Sun=0..Sat=6
+    weekly = await _get_weekly(db, dow, "weekly")
+
+    # ── 2. 曜日休診は祝日設定より優先 ──
+    if weekly.source == "weekly" and not weekly.is_open:
+        return weekly
+
+    # ── 3. 祝日判定 ──
     if is_japanese_holiday(target_date):
         holiday_mode = await _get_setting(db, "holiday_mode", "closed")
 
@@ -75,9 +82,8 @@ async def get_business_hours_for_date(db: AsyncSession, target_date: date) -> Bu
         if holiday_mode == "same_as_sunday":
             return await _get_weekly(db, 0, "holiday")  # 日曜 = day_of_week 0
 
-    # ── 3. 曜日設定 ──
-    dow = target_date.isoweekday() % 7  # Mon=1..Sun=7 → Sun=0..Sat=6
-    return await _get_weekly(db, dow, "weekly")
+    # ── 4. 曜日設定 ──
+    return weekly
 
 
 async def _get_weekly(db: AsyncSession, day_of_week: int, source: str) -> BusinessHoursResult:

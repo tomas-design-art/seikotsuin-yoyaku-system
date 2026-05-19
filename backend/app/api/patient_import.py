@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
 
 from app.database import get_db
+from app.api.auth import require_staff
 from app.models.patient import Patient
 from app.schemas.patient import _normalize_phone, _normalize_name, build_name
 from app.api.patients import _generate_patient_number, _normalize_for_compare
@@ -305,7 +306,7 @@ async def _find_duplicates(
 
 # ─── Preview API ──────────────────────────────────────
 @router.post("/preview")
-async def import_preview(file: UploadFile = File(...)):
+async def import_preview(file: UploadFile = File(...), _auth: dict = Depends(require_staff)):
     """ファイルを解析し、列候補・推定マッピング・プレビューを返す"""
     contents = await file.read()
     if not contents:
@@ -353,6 +354,7 @@ async def import_execute(
     mapping_json: str = Form(...),
     row_actions_json: str = Form(""),
     db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
 ):
     """確定マッピングに従って患者を一括登録"""
     if mode not in ("split", "full_name"):

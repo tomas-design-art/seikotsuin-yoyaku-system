@@ -372,7 +372,8 @@ async def _ai_parse(email_body: str) -> dict:
         import httpx
 
         model = settings.gemini_model
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.gemini_api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        headers = {"x-goog-api-key": settings.gemini_api_key}
 
         payload = {
             "contents": [
@@ -388,7 +389,7 @@ async def _ai_parse(email_body: str) -> dict:
         }
 
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, timeout=30)
+            response = await client.post(url, json=payload, headers=headers, timeout=30)
             response.raise_for_status()
             data = response.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -409,7 +410,8 @@ async def ai_review_hotpepper_required(email_body: str, parsed: dict | None = No
     import httpx
 
     model = settings.gemini_model
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.gemini_api_key}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {"x-goog-api-key": settings.gemini_api_key}
 
     parsed_json = json.dumps(parsed or {}, ensure_ascii=False, default=str)
     prompt = (
@@ -438,7 +440,7 @@ async def ai_review_hotpepper_required(email_body: str, parsed: dict | None = No
     }
 
     async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(url, json=payload)
+        response = await client.post(url, json=payload, headers=headers)
         response.raise_for_status()
         data = response.json()
 

@@ -15,6 +15,7 @@ import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from app.config import settings
 from app.database import Base
 from app.models.practitioner import Practitioner
 from app.models.patient import Patient
@@ -26,6 +27,7 @@ from app.models.weekly_schedule import WeeklySchedule
 from app.models.reservation_series import ReservationSeries
 
 target_metadata = Base.metadata
+config.set_main_option("sqlalchemy.url", settings.database_url)
 
 
 def run_migrations_offline() -> None:

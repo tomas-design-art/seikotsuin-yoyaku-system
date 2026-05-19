@@ -1,8 +1,16 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../../hooks/useAuth';
+import { staffLogin } from '../../api/client';
 
-export default function PinLogin() {
+interface PinLoginProps {
+    onSuccess?: () => void;
+    title?: string;
+    subtitle?: string;
+    verifyOnly?: boolean;
+}
+
+export default function PinLogin({ onSuccess, title = '予約管理システム', subtitle = 'PINを入力してください', verifyOnly = false }: PinLoginProps) {
     const [pin, setPin] = useState('');
     const [error, setError] = useState('');
     const [loading, setLoading] = useState(false);
@@ -26,17 +34,21 @@ export default function PinLogin() {
     useEffect(() => {
         if (pin.length === 4 && !loading) {
             setLoading(true);
-            staffLoginAction(pin).then((ok) => {
+            const authPromise = verifyOnly
+                ? staffLogin(pin).then(() => true).catch(() => false)
+                : staffLoginAction(pin);
+            authPromise.then((ok) => {
                 if (ok) {
-                    navigate('/', { replace: true });
+                    if (onSuccess) onSuccess();
+                    else navigate('/', { replace: true });
                 } else {
-                    setError('PINが正しくありません');
+                    setError('PINが正しくないか、一時的に制限されています');
                     setPin('');
                 }
                 setLoading(false);
             });
         }
-    }, [pin, loading, staffLoginAction, navigate]);
+    }, [pin, loading, staffLoginAction, navigate, onSuccess, verifyOnly]);
 
     // Keyboard input
     useEffect(() => {
@@ -68,8 +80,8 @@ export default function PinLogin() {
             <div className="bg-white rounded-2xl shadow-xl p-8 w-80">
                 <div className="text-center mb-6">
                     <div className="text-4xl mb-2">🦴</div>
-                    <h1 className="text-lg font-bold text-gray-800">予約管理システム</h1>
-                    <p className="text-sm text-gray-500 mt-1">PINを入力してください</p>
+                    <h1 className="text-lg font-bold text-gray-800">{title}</h1>
+                    <p className="text-sm text-gray-500 mt-1">{subtitle}</p>
                 </div>
 
                 {/* PIN dots */}

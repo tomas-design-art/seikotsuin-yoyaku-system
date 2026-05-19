@@ -1,10 +1,11 @@
 import asyncio
+import os
 import asyncpg
 
 async def create_staging_db():
-    # ↓ ここにRenderでコピーした「External Database URL」を貼り付けます
-    # 例: "postgres://user:password@host/coco-db"
-    render_db_url = "postgresql://coco_db_az91_user:1LKKhcUmTAB7NHRbDy5uFnqg2j1LipqS@dpg-d7akjtruibrs73e32990-a.oregon-postgres.render.com/coco_db_az91"
+    render_db_url = os.environ.get("DATABASE_URL")
+    if not render_db_url:
+        raise RuntimeError("DATABASE_URL 環境変数を設定してください。")
     
     print("データベースに接続中...")
     conn = await asyncpg.connect(render_db_url)

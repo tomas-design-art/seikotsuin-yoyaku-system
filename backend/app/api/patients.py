@@ -5,6 +5,7 @@ from typing import Literal
 import re
 
 from app.database import get_db
+from app.api.auth import require_staff
 from app.models.patient import Patient
 from app.models.reservation import Reservation
 from app.schemas.patient import (
@@ -49,6 +50,7 @@ async def search_patients(
     q: str = Query(..., min_length=1),
     include_inactive: bool = Query(False),
     db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
 ):
     """名前・読み方・診察券番号・電話番号で部分一致検索(active only)
 
@@ -84,7 +86,7 @@ async def search_patients(
 
 
 @router.post("/candidates", response_model=list[CandidateResponse])
-async def find_candidates(data: CandidateQuery, db: AsyncSession = Depends(get_db)):
+async def find_candidates(data: CandidateQuery, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_staff)):
     """既存患者候補を検索 — 広範囲マッチで重複を防止"""
     # 検索用の名前を組み立て
     if data.registration_mode == "full_name":
@@ -172,6 +174,7 @@ async def list_patients(
     sort_order: Literal["asc", "desc"] = Query("asc"),
     include_inactive: bool = Query(False),
     db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
 ):
     base_filter = True if include_inactive else Patient.is_active == True
 
@@ -198,7 +201,7 @@ async def list_patients(
 
 
 @router.get("/{patient_id}", response_model=PatientResponse)
-async def get_patient(patient_id: int, db: AsyncSession = Depends(get_db)):
+async def get_patient(patient_id: int, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_staff)):
     result = await db.execute(select(Patient).where(Patient.id == patient_id))
     patient = result.scalar_one_or_none()
     if not patient:
@@ -207,7 +210,7 @@ async def get_patient(patient_id: int, db: AsyncSession = Depends(get_db)):
 
 
 @router.post("/", response_model=PatientResponse, status_code=201)
-async def create_patient(data: PatientCreate, db: AsyncSession = Depends(get_db)):
+async def create_patient(data: PatientCreate, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_staff)):
     patient_number = await _generate_patient_number(db)
     name = build_name(data.registration_mode, data.last_name, data.middle_name,
                       data.first_name, data.full_name)
@@ -231,7 +234,7 @@ async def create_patient(data: PatientCreate, db: AsyncSession = Depends(get_db)
 
 @router.put("/{patient_id}", response_model=PatientResponse)
 async def update_patient(
-    patient_id: int, data: PatientUpdate, db: AsyncSession = Depends(get_db)
+    patient_id: int, data: PatientUpdate, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_staff)
 ):
     result = await db.execute(select(Patient).where(Patient.id == patient_id))
     patient = result.scalar_one_or_none()
@@ -263,7 +266,7 @@ async def update_patient(
 
 
 @router.post("/{patient_id}/deactivate", response_model=PatientResponse)
-async def deactivate_patient(patient_id: int, db: AsyncSession = Depends(get_db)):
+async def deactivate_patient(patient_id: int, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_staff)):
     """患者を非表示化（論理削除）"""
     result = await db.execute(select(Patient).where(Patient.id == patient_id))
     patient = result.scalar_one_or_none()
@@ -276,7 +279,7 @@ async def deactivate_patient(patient_id: int, db: AsyncSession = Depends(get_db)
 
 
 @router.post("/{patient_id}/reactivate", response_model=PatientResponse)
-async def reactivate_patient(patient_id: int, db: AsyncSession = Depends(get_db)):
+async def reactivate_patient(patient_id: int, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_staff)):
     """患者を再有効化"""
     result = await db.execute(select(Patient).where(Patient.id == patient_id))
     patient = result.scalar_one_or_none()
@@ -293,6 +296,7 @@ async def purge_patient(
     patient_id: int,
     data: PatientPurgeRequest,
     db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
 ):
     """完全削除（2段階目）: 非表示化済み患者のみ削除可能。"""
     result = await db.execute(select(Patient).where(Patient.id == patient_id))

@@ -4,6 +4,7 @@ export interface Practitioner {
   id: number;
   name: string;
   role: string;
+  daily_report_code: string | null;
   is_active: boolean;
   is_visible: boolean;
   display_order: number;
@@ -418,7 +419,7 @@ export interface PractitionerDayStatus {
   start_time: string | null;
   end_time: string | null;
   reason: string | null;
-  source: 'override' | 'default' | 'fallback';
+  source: 'override' | 'default' | 'fallback' | 'clinic' | 'weekly' | 'holiday' | 'holiday_schedule' | 'holiday_default';
   unavailable_times?: { id: number; start_time: string; end_time: string; reason: string | null }[];
 }
 

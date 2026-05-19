@@ -17,6 +17,13 @@ const BLOCKED_HATCH_BG = 'repeating-linear-gradient(45deg, rgba(156,163,175,0.18
 const BLOCKED_BASE_BG = 'rgba(209,213,219,0.5)';
 const BUSINESS_BLOCK_BG = '#e5e7eb';
 
+interface ReservationLayout {
+  reservation: Reservation;
+  laneIndex: number;
+  laneCount: number;
+  overlapCount: number;
+}
+
 interface TimeTableProps {
   onSlotClick: (practitionerId: number, startMinutes: number, date: Date) => void;
   onDragSelect: (practitionerId: number, startMinutes: number, endMinutes: number, date: Date) => void;
@@ -85,8 +92,8 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     return def?.color_code || '#3B82F6';
   }, [colors]);
 
-  const getBlockColor = useCallback((r: Reservation): string => {
-    if (r.conflict_note) return '#DC2626';
+  const getBlockColor = useCallback((r: Reservation, forceConflict = false): string => {
+    if (forceConflict || r.conflict_note) return '#DC2626';
     if (r.status === 'CANCEL_REQUESTED') return '#9CA3AF';
     if (r.status === 'CHANGE_REQUESTED') return '#EAB308';
     if (r.status === 'HOLD') return '#8B5CF6';
@@ -222,6 +229,68 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     [reservations]
   );
 
+  const getReservationLayouts = useCallback((columnReservations: Reservation[]): ReservationLayout[] => {
+    const sorted = [...columnReservations].sort((a, b) => {
+      const startDiff = dateToMinutes(a.start_time) - dateToMinutes(b.start_time);
+      if (startDiff !== 0) return startDiff;
+      const endDiff = dateToMinutes(a.end_time) - dateToMinutes(b.end_time);
+      if (endDiff !== 0) return endDiff;
+      return a.id - b.id;
+    });
+
+    const layouts: ReservationLayout[] = [];
+    let group: Reservation[] = [];
+    let groupEnd = -Infinity;
+
+    const flushGroup = () => {
+      if (group.length === 0) return;
+
+      const laneEnds: number[] = [];
+      const assigned = group.map((reservation) => {
+        const start = dateToMinutes(reservation.start_time);
+        const end = dateToMinutes(reservation.end_time);
+        let laneIndex = laneEnds.findIndex((laneEnd) => laneEnd <= start);
+        if (laneIndex === -1) {
+          laneIndex = laneEnds.length;
+          laneEnds.push(end);
+        } else {
+          laneEnds[laneIndex] = end;
+        }
+        return { reservation, laneIndex, start, end };
+      });
+
+      const laneCount = Math.max(laneEnds.length, 1);
+      for (const item of assigned) {
+        const overlapCount = assigned.filter((other) => (
+          other.reservation.id !== item.reservation.id
+          && item.start < other.end
+          && item.end > other.start
+        )).length + 1;
+        layouts.push({
+          reservation: item.reservation,
+          laneIndex: item.laneIndex,
+          laneCount,
+          overlapCount,
+        });
+      }
+    };
+
+    for (const reservation of sorted) {
+      const start = dateToMinutes(reservation.start_time);
+      const end = dateToMinutes(reservation.end_time);
+      if (group.length > 0 && start >= groupEnd) {
+        flushGroup();
+        group = [];
+        groupEnd = -Infinity;
+      }
+      group.push(reservation);
+      groupEnd = Math.max(groupEnd, end);
+    }
+    flushGroup();
+
+    return layouts;
+  }, []);
+
   const headerLabel = viewMode === 'day'
     ? `${currentDate.getFullYear()}年${currentDate.getMonth() + 1}月${currentDate.getDate()}日(${WEEKDAY_LABELS[currentDate.getDay()]})`
     : `${weekDates[0].getMonth() + 1}/${weekDates[0].getDate()} 〜 ${weekDates[6].getMonth() + 1}/${weekDates[6].getDate()}`;
@@ -249,6 +318,15 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     return weeklySchedules.find((s) => s.day_of_week === dow);
   }, [weeklySchedules]);
 
+  const isHolidayDate = useCallback((date: Date): boolean => {
+    return getBusinessHoursForDate(date)?.source === 'holiday';
+  }, [getBusinessHoursForDate]);
+
+  const getWeekDateLabel = useCallback((date: Date): string => {
+    const holidaySuffix = isHolidayDate(date) ? '祝' : '';
+    return `${date.getMonth() + 1}/${date.getDate()}(${WEEKDAY_LABELS[date.getDay()]}${holidaySuffix})`;
+  }, [isHolidayDate]);
+
   // ----- 施術者休みチェック -----
   const getPractitionerDayOff = useCallback((practitionerId: number, date: Date): PractitionerDayStatus | null => {
     const dateStr = formatDate(date);
@@ -258,6 +336,14 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     if (status && !status.is_working) return status;
     return null;
   }, [practitionerStatuses]);
+
+  const getPractitionerDayOffLabel = useCallback((dayOff: PractitionerDayStatus): string => {
+    if (dayOff.reason) return dayOff.reason;
+    if (dayOff.source === 'holiday_schedule' || dayOff.source === 'holiday_default') return '祝日休み';
+    if (dayOff.source === 'holiday') return '祝日休診';
+    if (dayOff.source === 'weekly') return '定休日';
+    return '休み';
+  }, []);
 
   // ----- 施術者の時間帯休みを取得 -----
   const getUnavailableTimesForColumn = useCallback((practitionerId: number, date: Date) => {
@@ -312,15 +398,6 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     const openMin = openH * 60 + openM;
     const closeMin = closeH * 60 + closeM;
     const overlays: React.ReactNode[] = [];
-
-    // 祝日/オーバーライドでの時短営業ラベル
-    if (label && isOpen) {
-      overlays.push(
-        <div key="label" className="absolute left-0 right-0 text-center pointer-events-none" style={{ top: headerH - 2, zIndex: 13 }}>
-          <span className="text-xs text-orange-600 bg-orange-50/90 px-1 rounded">{label}</span>
-        </div>
-      );
-    }
 
     // 営業開始前
     if (openMin > dayStart) {
@@ -467,18 +544,18 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
         {dayOff ? (
           /* 休みの施術者: グレーアウト＋クリック無効 */
           <div
-            className="absolute inset-0 flex items-center justify-center"
+            className="absolute inset-0 flex items-start justify-center pt-2"
             style={{
               top: headerH,
               bottom: 0,
-              zIndex: 4,
+              zIndex: 8,
               background: BLOCKED_HATCH_BG,
               backgroundColor: BLOCKED_BASE_BG,
             }}
-            title={dayOff.reason ? `休み: ${dayOff.reason}` : '休み'}
+            title={getPractitionerDayOffLabel(dayOff)}
           >
-            <span className="text-gray-500 font-bold text-xs bg-white/80 px-2 py-1 rounded shadow-sm">
-              {dayOff.reason || '休み'}
+            <span className="text-gray-600 font-bold text-[10px] bg-white/90 px-2 py-0.5 rounded shadow-sm whitespace-nowrap">
+              {getPractitionerDayOffLabel(dayOff)}
             </span>
           </div>
         ) : (
@@ -565,13 +642,17 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             </div>
           );
         })}
-        {getReservationsForColumn(practitionerId, date).map((r) => {
+        {getReservationLayouts(getReservationsForColumn(practitionerId, date)).map(({ reservation: r, laneIndex, laneCount, overlapCount }) => {
           const startMin = dateToMinutes(r.start_time);
           const endMin = dateToMinutes(r.end_time);
           const top = ((startMin - dayStart) / SLOT_INTERVAL) * slotHeight;
+          const hasOverlap = overlapCount > 1;
           const isTarget = isRescheduling && reschedulingReservation?.id === r.id;
           const adjustedEndMin = isTarget ? endMin + rescheduleDurationOffset : endMin;
           const height = ((adjustedEndMin - startMin) / SLOT_INTERVAL) * slotHeight;
+          const laneGapPercent = laneCount > 1 ? 1.5 : 0;
+          const laneWidthPercent = laneCount > 1 ? (100 - laneGapPercent * (laneCount - 1)) / laneCount : 100;
+          const laneLeftPercent = laneCount > 1 ? laneIndex * (laneWidthPercent + laneGapPercent) : 0;
           const originalDuration = Math.round((new Date(r.end_time).getTime() - new Date(r.start_time).getTime()) / 60000);
           const targetDate = pendingRescheduleTarget?.date ?? new Date(r.start_time);
           const targetPractitionerId = pendingRescheduleTarget?.practitionerId ?? r.practitioner_id;
@@ -589,14 +670,20 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             })
             : false;
           const disablePlus = plusExceedsDayEnd || plusWouldConflict;
+          const title = hasOverlap
+            ? `${r.patient?.name || '飛び込み'} / ダブルブッキング: 同じ時間帯に${overlapCount}件の予約があります${r.conflict_note ? ` / ${r.conflict_note}` : ''}`
+            : (r.conflict_note || undefined);
           return (
             <div
               key={r.id}
-              className={`absolute left-0.5 right-0.5 rounded px-1 text-white shadow-sm ${isTarget ? 'ring-2 ring-blue-400 animate-pulse pointer-events-auto cursor-grab active:cursor-grabbing overflow-visible' : 'overflow-hidden'} ${isRescheduling ? '' : 'cursor-pointer hover:opacity-90'}`}
+              className={`absolute rounded px-1 text-white shadow-sm ${hasOverlap ? 'ring-2 ring-red-200 border border-red-700' : ''} ${isTarget ? 'ring-2 ring-blue-400 animate-pulse pointer-events-auto cursor-grab active:cursor-grabbing overflow-visible' : 'overflow-hidden'} ${isRescheduling ? '' : 'cursor-pointer hover:opacity-90'}`}
               style={{
+                left: laneCount > 1 ? `${laneLeftPercent}%` : 2,
+                right: laneCount > 1 ? undefined : 2,
+                width: laneCount > 1 ? `${laneWidthPercent}%` : undefined,
                 top: top + headerH,
                 height: Math.max(height, slotHeight),
-                backgroundColor: getBlockColor(r),
+                backgroundColor: getBlockColor(r, hasOverlap),
                 zIndex: isTarget ? 30 : 2,
                 fontSize: 10,
                 lineHeight: '14px',
@@ -604,6 +691,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 ...(isRescheduling && !isTarget ? { opacity: 0.6 } : {}),
               }}
               draggable={isTarget && isRescheduling}
+              title={title}
               onDragStart={(e) => {
                 if (!isTarget || !isRescheduling) return;
                 e.dataTransfer.setData('text/plain', `reschedule-${r.id}`);
@@ -623,9 +711,14 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               onClick={(e) => { e.stopPropagation(); if (!isRescheduling) onReservationClick(r); }}
             >
               <div className="flex items-center gap-0.5 truncate">
-                {r.conflict_note ? <span title="⚠ ダブルブッキング">⚠️</span> : r.series_id ? <span>🔄</span> : <span>{CHANNEL_ICONS[r.channel]}</span>}
+                {hasOverlap || r.conflict_note ? <span title="ダブルブッキング">⚠️</span> : r.series_id ? <span>🔄</span> : <span>{CHANNEL_ICONS[r.channel]}</span>}
                 <span className="font-medium truncate">{r.patient?.name || '飛び込み'}</span>
               </div>
+              {hasOverlap && height >= slotHeight * 1.5 && (
+                <div className="truncate text-[9px] font-bold bg-white/20 rounded px-0.5 leading-[12px]">
+                  重複 {laneIndex + 1}/{overlapCount}
+                </div>
+              )}
               {height >= slotHeight * 2 && (
                 <div className="truncate opacity-90">
                   {r.menu?.name || ''}
@@ -931,16 +1024,19 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             {/* Week columns — one per day, sub-columns per practitioner */}
             {weekDates.map((date, di) => {
               const isToday = formatDate(date) === formatDate(getTodayJST());
+              const holiday = isHolidayDate(date);
+              const holidayLabel = getBusinessHoursForDate(date)?.label || undefined;
               return (
                 <div key={`week-${di}`} className="relative" style={{ flex: 1, minWidth: weekVisiblePractitioners.length * weekPractitionerMinWidth, borderRight: '1.5px solid #1f2937' }}>
                   {/* Date + Practitioner headers — sticky top */}
                   <div className={`sticky top-0 z-[15] ${isToday ? 'bg-blue-50' : 'bg-gray-50'}`} style={{ height: WEEK_HEADER_HEIGHT }}>
                     {/* Date header */}
                     <div
-                      className={`text-center text-xs font-semibold border-b px-1 ${isToday ? 'text-blue-700' : 'text-gray-700'}`}
+                      className={`text-center text-xs font-semibold border-b px-1 ${holiday ? 'text-red-600' : isToday ? 'text-blue-700' : 'text-gray-700'}`}
                       style={{ height: 20, lineHeight: '20px' }}
+                      title={holidayLabel}
                     >
-                      {date.getMonth() + 1}/{date.getDate()}({WEEKDAY_LABELS[date.getDay()]})
+                      {getWeekDateLabel(date)}
                     </div>
                     {/* Practitioner sub-column headers */}
                     <div className="flex border-b" style={{ height: WEEK_HEADER_HEIGHT - 20 }}>

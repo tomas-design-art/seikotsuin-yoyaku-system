@@ -11,7 +11,7 @@ class PractitionerSchedule(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     practitioner_id = Column(Integer, ForeignKey("practitioners.id", ondelete="CASCADE"), nullable=False)
-    day_of_week = Column(Integer, nullable=False)  # 0=日, 1=月 ... 6=土
+    day_of_week = Column(Integer, nullable=False)  # 0=日, 1=月 ... 6=土, 7=祝日
     is_working = Column(Boolean, nullable=False, default=True)
     start_time = Column(String(5), nullable=False, default="09:00")  # HH:MM
     end_time = Column(String(5), nullable=False, default="20:00")    # HH:MM

@@ -18,7 +18,8 @@ import {
 } from '../../api/client';
 import { extractErrorMessage } from '../../utils/errorUtils';
 
-const WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土'];
+const HOLIDAY_DAY_OF_WEEK = 7;
+const WEEKDAY_LABELS = ['日', '月', '火', '水', '木', '金', '土', '平日祝'];
 
 export default function PractitionerScheduleManager() {
     const [practitioners, setPractitioners] = useState<Practitioner[]>([]);
@@ -56,6 +57,9 @@ export default function PractitionerScheduleManager() {
     const [utReason, setUtReason] = useState('');
     const [clinicStartTime, setClinicStartTime] = useState('09:00');
     const [clinicEndTime, setClinicEndTime] = useState('20:00');
+    const [holidayMode, setHolidayMode] = useState('closed');
+    const [holidayStartTime, setHolidayStartTime] = useState('09:00');
+    const [holidayEndTime, setHolidayEndTime] = useState('13:00');
 
     useEffect(() => {
         getPractitioners().then((res) => {
@@ -70,10 +74,37 @@ export default function PractitionerScheduleManager() {
             const s = res.data ?? [];
             const bhStart = s.find((x) => x.key === 'business_hour_start');
             const bhEnd = s.find((x) => x.key === 'business_hour_end');
+            const hMode = s.find((x) => x.key === 'holiday_mode');
+            const hStart = s.find((x) => x.key === 'holiday_start_time');
+            const hEnd = s.find((x) => x.key === 'holiday_end_time');
             if (bhStart?.value) { setClinicStartTime(bhStart.value); setUtStartTime(bhStart.value); }
             if (bhEnd?.value) { setClinicEndTime(bhEnd.value); setUtEndTime(bhEnd.value); }
+            if (hMode?.value) setHolidayMode(hMode.value);
+            if (hStart?.value) setHolidayStartTime(hStart.value);
+            if (hEnd?.value) setHolidayEndTime(hEnd.value);
         }).catch(() => { });
     }, []);
+
+    const getClinicScheduleForDay = useCallback((dayOfWeek: number) => {
+        const clinic = clinicSchedules.find((c) => c.day_of_week === dayOfWeek);
+        if (clinic) {
+            return { is_open: clinic.is_open, start_time: clinic.open_time, end_time: clinic.close_time };
+        }
+        return { is_open: true, start_time: clinicStartTime, end_time: clinicEndTime };
+    }, [clinicSchedules, clinicStartTime, clinicEndTime]);
+
+    const getHolidayClinicBounds = useCallback(() => {
+        if (holidayMode === 'custom') {
+            return { is_open: true, start_time: holidayStartTime, end_time: holidayEndTime };
+        }
+        if (holidayMode === 'same_as_saturday') {
+            return getClinicScheduleForDay(6);
+        }
+        if (holidayMode === 'same_as_sunday') {
+            return getClinicScheduleForDay(0);
+        }
+        return { is_open: false, start_time: holidayStartTime, end_time: holidayEndTime };
+    }, [getClinicScheduleForDay, holidayMode, holidayStartTime, holidayEndTime]);
 
     const loadData = useCallback(async () => {
         if (!selectedPractitionerId) return;
@@ -87,20 +118,21 @@ export default function PractitionerScheduleManager() {
 
         // Build editable defaults (fill missing days with clinic schedule)
         const existing = defaultsRes.data ?? [];
-        const full = Array.from({ length: 7 }, (_, i) => {
+        const full = Array.from({ length: 8 }, (_, i) => {
             const found = existing.find((s) => s.day_of_week === i);
             if (found) {
                 return { day_of_week: i, is_working: found.is_working, start_time: found.start_time, end_time: found.end_time };
             }
-            // 院営業スケジュールをフォールバックに使用
-            const clinic = clinicSchedules.find((c) => c.day_of_week === i);
-            if (clinic) {
-                return { day_of_week: i, is_working: clinic.is_open, start_time: clinic.open_time, end_time: clinic.close_time };
+            if (i === HOLIDAY_DAY_OF_WEEK) {
+                const holiday = getHolidayClinicBounds();
+                return { day_of_week: i, is_working: holiday.is_open, start_time: holiday.start_time, end_time: holiday.end_time };
             }
-            return { day_of_week: i, is_working: true, start_time: '09:00', end_time: '20:00' };
+            // 院営業スケジュールをフォールバックに使用
+            const clinic = getClinicScheduleForDay(i);
+            return { day_of_week: i, is_working: clinic.is_open, start_time: clinic.start_time, end_time: clinic.end_time };
         });
         setEditDefaults(full);
-    }, [selectedPractitionerId, clinicSchedules]);
+    }, [selectedPractitionerId, getClinicScheduleForDay, getHolidayClinicBounds]);
 
     useEffect(() => {
         loadData();
@@ -110,6 +142,13 @@ export default function PractitionerScheduleManager() {
         if (!selectedPractitionerId) return;
         setSaving(true);
         try {
+            const invalid = editDefaults.find((d) => d.is_working && d.end_time <= d.start_time);
+            if (invalid) {
+                setMessage({ text: `${WEEKDAY_LABELS[invalid.day_of_week]}の終了時刻は開始時刻より後にしてください`, type: 'error' });
+                setSaving(false);
+                setTimeout(() => setMessage(null), 3000);
+                return;
+            }
             await updatePractitionerDefaults(selectedPractitionerId, { schedules: editDefaults });
             setMessage({ text: 'デフォルトスケジュールを保存しました', type: 'success' });
             await loadData();
@@ -258,7 +297,7 @@ export default function PractitionerScheduleManager() {
                     {/* デフォルト出勤パターン */}
                     <div className="bg-white rounded-xl shadow p-5">
                         <h3 className="text-lg font-semibold text-gray-700 mb-4">
-                            {selectedName} — 曜日別デフォルト
+                            {selectedName} — 曜日別・平日祝デフォルト
                         </h3>
                         <div className="overflow-x-auto">
                             <table className="w-full text-sm">
@@ -271,49 +310,59 @@ export default function PractitionerScheduleManager() {
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {editDefaults.map((d, idx) => (
-                                        <tr key={d.day_of_week} className={`border-t ${d.day_of_week === 0 ? 'bg-red-50' : d.day_of_week === 6 ? 'bg-blue-50' : ''}`}>
-                                            <td className="px-3 py-2 font-medium">{WEEKDAY_LABELS[d.day_of_week]}</td>
-                                            <td className="px-3 py-2 text-center">
-                                                <input
-                                                    type="checkbox"
-                                                    checked={d.is_working}
-                                                    onChange={(e) => {
-                                                        const next = [...editDefaults];
-                                                        next[idx] = { ...next[idx], is_working: e.target.checked };
-                                                        setEditDefaults(next);
-                                                    }}
-                                                    className="w-5 h-5 accent-blue-500"
-                                                />
-                                            </td>
-                                            <td className="px-3 py-2 text-center">
-                                                <input
-                                                    type="time"
-                                                    value={d.start_time}
-                                                    disabled={!d.is_working}
-                                                    onChange={(e) => {
-                                                        const next = [...editDefaults];
-                                                        next[idx] = { ...next[idx], start_time: e.target.value };
-                                                        setEditDefaults(next);
-                                                    }}
-                                                    className="border rounded px-2 py-1 text-sm disabled:opacity-40"
-                                                />
-                                            </td>
-                                            <td className="px-3 py-2 text-center">
-                                                <input
-                                                    type="time"
-                                                    value={d.end_time}
-                                                    disabled={!d.is_working}
-                                                    onChange={(e) => {
-                                                        const next = [...editDefaults];
-                                                        next[idx] = { ...next[idx], end_time: e.target.value };
-                                                        setEditDefaults(next);
-                                                    }}
-                                                    className="border rounded px-2 py-1 text-sm disabled:opacity-40"
-                                                />
-                                            </td>
-                                        </tr>
-                                    ))}
+                                    {editDefaults.map((d, idx) => {
+                                        const isHoliday = d.day_of_week === HOLIDAY_DAY_OF_WEEK;
+                                        const bounds = isHoliday ? getHolidayClinicBounds() : getClinicScheduleForDay(d.day_of_week);
+                                        const rowClass = isHoliday ? 'bg-orange-50' : d.day_of_week === 0 ? 'bg-red-50' : d.day_of_week === 6 ? 'bg-blue-50' : '';
+                                        return (
+                                            <tr key={d.day_of_week} className={`border-t ${rowClass}`}>
+                                                <td className="px-3 py-2 font-medium">{WEEKDAY_LABELS[d.day_of_week]}</td>
+                                                <td className="px-3 py-2 text-center">
+                                                    <input
+                                                        type="checkbox"
+                                                        checked={d.is_working}
+                                                        disabled={isHoliday && !bounds.is_open}
+                                                        onChange={(e) => {
+                                                            const next = [...editDefaults];
+                                                            next[idx] = { ...next[idx], is_working: e.target.checked };
+                                                            setEditDefaults(next);
+                                                        }}
+                                                        className="w-5 h-5 accent-blue-500"
+                                                    />
+                                                </td>
+                                                <td className="px-3 py-2 text-center">
+                                                    <input
+                                                        type="time"
+                                                        value={d.start_time}
+                                                        min={bounds.start_time}
+                                                        max={bounds.end_time}
+                                                        disabled={!d.is_working || (isHoliday && !bounds.is_open)}
+                                                        onChange={(e) => {
+                                                            const next = [...editDefaults];
+                                                            next[idx] = { ...next[idx], start_time: e.target.value };
+                                                            setEditDefaults(next);
+                                                        }}
+                                                        className="border rounded px-2 py-1 text-sm disabled:opacity-40"
+                                                    />
+                                                </td>
+                                                <td className="px-3 py-2 text-center">
+                                                    <input
+                                                        type="time"
+                                                        value={d.end_time}
+                                                        min={bounds.start_time}
+                                                        max={bounds.end_time}
+                                                        disabled={!d.is_working || (isHoliday && !bounds.is_open)}
+                                                        onChange={(e) => {
+                                                            const next = [...editDefaults];
+                                                            next[idx] = { ...next[idx], end_time: e.target.value };
+                                                            setEditDefaults(next);
+                                                        }}
+                                                        className="border rounded px-2 py-1 text-sm disabled:opacity-40"
+                                                    />
+                                                </td>
+                                            </tr>
+                                        );
+                                    })}
                                 </tbody>
                             </table>
                         </div>

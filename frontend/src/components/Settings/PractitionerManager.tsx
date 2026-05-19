@@ -13,6 +13,7 @@ export default function PractitionerManager() {
   const [editingId, setEditingId] = useState<number | null>(null);
   const [name, setName] = useState('');
   const [role, setRole] = useState('');
+  const [dailyReportCode, setDailyReportCode] = useState('');
   const [editingWasInactive, setEditingWasInactive] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -50,13 +51,15 @@ export default function PractitionerManager() {
     e.preventDefault();
     setError(null);
     try {
+      const code = dailyReportCode.trim() || null;
       if (editingId) {
-        await updatePractitioner(editingId, { name, role, is_active: editingWasInactive ? true : undefined });
+        await updatePractitioner(editingId, { name, role, daily_report_code: code, is_active: editingWasInactive ? true : undefined });
       } else {
-        await createPractitioner({ name, role, display_order: practitioners.length });
+        await createPractitioner({ name, role, daily_report_code: code, display_order: practitioners.length });
       }
       setName('');
       setRole(roles[0] || '');
+      setDailyReportCode('');
       setEditingId(null);
       setEditingWasInactive(false);
       setShowForm(false);
@@ -70,6 +73,7 @@ export default function PractitionerManager() {
     setEditingId(p.id);
     setName(p.name);
     setRole(p.role);
+    setDailyReportCode(p.daily_report_code || '');
     setEditingWasInactive(!p.is_active);
     setShowForm(true);
   };
@@ -111,7 +115,7 @@ export default function PractitionerManager() {
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold">施術者管理</h1>
         <button
-          onClick={() => { setShowForm(true); setEditingId(null); setName(''); setRole(roles[0] || ''); setEditingWasInactive(false); }}
+          onClick={() => { setShowForm(true); setEditingId(null); setName(''); setRole(roles[0] || ''); setDailyReportCode(''); setEditingWasInactive(false); }}
           className="flex items-center gap-1 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
         >
           <Plus size={16} /> 追加
@@ -139,6 +143,15 @@ export default function PractitionerManager() {
               ))}
             </select>
           </div>
+          <div>
+            <label className="block text-sm font-medium mb-1">日計表コード</label>
+            <input
+              value={dailyReportCode}
+              onChange={(e) => setDailyReportCode(e.target.value.slice(0, 4))}
+              maxLength={4}
+              className="w-full border rounded px-3 py-2"
+            />
+          </div>
           <div className="flex gap-2">
             <button type="submit" className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600">
               {editingId ? (editingWasInactive ? '更新して再有効化' : '更新') : '追加'}
@@ -161,6 +174,7 @@ export default function PractitionerManager() {
               <div>
                 <span className="font-medium">{p.name}</span>
                 <span className="ml-2 text-sm text-gray-500">({p.role})</span>
+                {p.daily_report_code && <span className="ml-2 text-xs bg-blue-50 text-blue-700 px-2 py-0.5 rounded">日計表: {p.daily_report_code}</span>}
                 {!p.is_active && <span className="ml-2 text-xs bg-gray-200 px-2 py-0.5 rounded">無効</span>}
                 {p.is_active && !p.is_visible && <span className="ml-2 text-xs bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded">非表示</span>}
               </div>

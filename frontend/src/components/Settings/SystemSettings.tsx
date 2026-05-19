@@ -13,10 +13,12 @@ const SETTING_LABELS: Record<string, string> = {
   business_days: '営業曜日（0=日,1=月...6=土）',
   slot_interval_minutes: 'タイムテーブル刻み（分）',
   notification_sound: '通知音',
+  staff_pin: '患者ページPIN（4桁）',
 };
 
 // 認証系の設定キーは汎用リストから除外
 const AUTH_KEYS = ['admin_username', 'admin_password_hash'];
+const INTERNAL_PREFIXES = ['staff_pin_failures:', 'staff_pin_lock_until:'];
 
 export default function SystemSettings() {
   const [settings, setSettings] = useState<Setting[]>([]);
@@ -46,6 +48,10 @@ export default function SystemSettings() {
   }, []);
 
   const handleSave = async (key: string) => {
+    if (key === 'staff_pin' && !/^\d{4}$/.test(editValues[key] || '')) {
+      setError('患者ページPINは4桁の数字で入力してください');
+      return;
+    }
     setSaving(key);
     setError(null);
     try {
@@ -92,7 +98,9 @@ export default function SystemSettings() {
     }
   };
 
-  const displaySettings = settings.filter((s) => !AUTH_KEYS.includes(s.key));
+  const displaySettings = settings.filter((s) => (
+    !AUTH_KEYS.includes(s.key) && !INTERNAL_PREFIXES.some((prefix) => s.key.startsWith(prefix))
+  ));
 
   return (
     <div className="max-w-2xl mx-auto p-6">
@@ -142,6 +150,9 @@ export default function SystemSettings() {
             <input
               value={editValues[s.key] || ''}
               onChange={(e) => setEditValues({ ...editValues, [s.key]: e.target.value })}
+              maxLength={s.key === 'staff_pin' ? 4 : undefined}
+              inputMode={s.key === 'staff_pin' ? 'numeric' : undefined}
+              pattern={s.key === 'staff_pin' ? '\\d{4}' : undefined}
               className="flex-1 border rounded px-3 py-2 text-sm"
             />
             <button

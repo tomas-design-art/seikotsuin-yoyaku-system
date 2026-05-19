@@ -59,3 +59,14 @@ cd backend
 pip install -r requirements.txt
 pytest tests/ -v
 ```
+
+## 日計表エクスポート API
+
+外部の日計表自動転記エージェント向けに、本日分の確定済み予約を取得できます。既存のスタッフ/管理者JWTを `Authorization: Bearer ...` で指定します。
+
+```bash
+curl -H "Authorization: Bearer <staff_or_admin_token>" \
+	"http://localhost:8000/api/reservations/daily-report?date=2026-05-05&cutoff_time=2026-05-05T13:00:00%2B09:00"
+```
+
+Postman では `GET http://localhost:8000/api/reservations/daily-report` を作成し、Headers に `Authorization: Bearer <staff_or_admin_token>`、Query Params に `date=YYYY-MM-DD` と `cutoff_time=YYYY-MM-DDTHH:mm:ss+09:00` を設定してください。`date` 未指定時は本日JST、`cutoff_time` 未指定時は現在時刻JSTが使われます。レスポンスは `CONFIRMED` かつ指定日の `cutoff_time` 以前の予約だけを返し、キャンセル・仮予約・未来予約は含みません。

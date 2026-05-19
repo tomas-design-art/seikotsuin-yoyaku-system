@@ -23,7 +23,7 @@ class PractitionerScheduleResponse(BaseModel):
 
 
 class PractitionerScheduleBulkItem(BaseModel):
-    day_of_week: int  # 0-6
+    day_of_week: int  # 0-6, 7=祝日
     is_working: bool
     start_time: str = "09:00"
     end_time: str = "20:00"
@@ -62,7 +62,7 @@ class PractitionerDayStatus(BaseModel):
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     reason: Optional[str] = None
-    source: str  # "override" | "default" | "fallback"
+    source: str  # "override" | "default" | "fallback" | "clinic" | "holiday" | "holiday_schedule" | "holiday_default"
 
 
 # --- 振替候補 ---

@@ -660,10 +660,8 @@ async def analyze_with_llm(message: str) -> dict:
         return result
 
     model = settings.gemini_model
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model}"
-        f":generateContent?key={settings.gemini_api_key}"
-    )
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    headers = {"x-goog-api-key": settings.gemini_api_key}
     payload = {
         "contents": [
             {
@@ -678,7 +676,7 @@ async def analyze_with_llm(message: str) -> dict:
     error_detail: str | None = None
     try:
         async with httpx.AsyncClient() as client:
-            resp = await client.post(url, json=payload, timeout=30)
+            resp = await client.post(url, json=payload, headers=headers, timeout=30)
             resp.raise_for_status()
             data = resp.json()
             raw_text = data["candidates"][0]["content"]["parts"][0]["text"]

@@ -14,6 +14,8 @@ from app.models.practitioner_schedule import PractitionerSchedule, ScheduleOverr
 from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation import Reservation
+from app.models.setting import Setting
+from app.models.weekly_schedule import WeeklySchedule
 from app.schemas.practitioner_schedule import (
     PractitionerScheduleResponse,
     PractitionerScheduleBulkUpdate,
@@ -37,6 +39,49 @@ from app.services.reservation_service import build_reservation_response
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/practitioner-schedules", tags=["practitioner-schedules"])
+
+HOLIDAY_DAY_OF_WEEK = 7
+
+
+async def _get_setting(db: AsyncSession, key: str, default: str = "") -> str:
+    result = await db.execute(select(Setting).where(Setting.key == key))
+    setting = result.scalar_one_or_none()
+    return setting.value if setting else default
+
+
+async def _get_weekly_schedule(db: AsyncSession, day_of_week: int) -> WeeklySchedule | None:
+    result = await db.execute(
+        select(WeeklySchedule).where(WeeklySchedule.day_of_week == day_of_week)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_clinic_bounds_for_practitioner_default(
+    db: AsyncSession,
+    day_of_week: int,
+) -> tuple[bool, str, str]:
+    if day_of_week == HOLIDAY_DAY_OF_WEEK:
+        holiday_mode = await _get_setting(db, "holiday_mode", "closed")
+        if holiday_mode == "closed":
+            return False, "", ""
+        if holiday_mode == "custom":
+            start = await _get_setting(db, "holiday_start_time", "09:00")
+            end = await _get_setting(db, "holiday_end_time", "13:00")
+            return True, start, end
+        if holiday_mode == "same_as_saturday":
+            day_of_week = 6
+        elif holiday_mode == "same_as_sunday":
+            day_of_week = 0
+        else:
+            return False, "", ""
+
+    weekly = await _get_weekly_schedule(db, day_of_week)
+    if weekly:
+        return weekly.is_open, weekly.open_time, weekly.close_time
+
+    start = await _get_setting(db, "business_hour_start", "09:00")
+    end = await _get_setting(db, "business_hour_end", "20:00")
+    return True, start, end
 
 
 # ===== デフォルト出勤パターン =====
@@ -70,7 +115,22 @@ async def update_default_schedules(
     )
 
     new_schedules = []
+    seen_days: set[int] = set()
     for item in data.schedules:
+        if item.day_of_week < 0 or item.day_of_week > 7:
+            raise HTTPException(status_code=400, detail="day_of_week は 0〜7 の範囲で指定してください")
+        if item.day_of_week in seen_days:
+            raise HTTPException(status_code=400, detail="同じ曜日の勤務設定が重複しています")
+        if item.is_working and item.end_time <= item.start_time:
+            raise HTTPException(status_code=400, detail="終了時刻は開始時刻より後にしてください")
+        if item.day_of_week == HOLIDAY_DAY_OF_WEEK:
+            clinic_open, clinic_start, clinic_end = await _get_clinic_bounds_for_practitioner_default(db, item.day_of_week)
+            if item.is_working and not clinic_open:
+                raise HTTPException(status_code=400, detail="院が休診の日は出勤にできません")
+            if item.is_working and (item.start_time < clinic_start or item.end_time > clinic_end):
+                raise HTTPException(status_code=400, detail="祝日の勤務時間は祝日営業時間内で設定してください")
+        seen_days.add(item.day_of_week)
+
         sched = PractitionerSchedule(
             practitioner_id=practitioner_id,
             day_of_week=item.day_of_week,

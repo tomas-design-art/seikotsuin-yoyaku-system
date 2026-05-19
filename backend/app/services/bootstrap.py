@@ -2,16 +2,17 @@ from importlib import import_module
 
 from passlib.context import CryptContext
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database import Base, async_session, engine
+from app.database import async_session
 from app.models.setting import Setting
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
 def _import_all_models() -> None:
-    # Ensure SQLAlchemy metadata is fully populated before create_all.
+    # Keep model imports explicit so runtime checks fail early on mapping errors.
     model_modules = [
         "app.models.audit_log",
         "app.models.chat_session",
@@ -25,6 +26,7 @@ def _import_all_models() -> None:
         "app.models.practitioner_unavailable_time",
         "app.models.reservation",
         "app.models.reservation_color",
+        "app.models.reservation_series",
         "app.models.setting",
         "app.models.shadow_log",
         "app.models.weekly_schedule",
@@ -66,13 +68,13 @@ async def seed_initial_settings(db: AsyncSession) -> None:
         existing = result.scalar_one_or_none()
         if existing is None:
             db.add(Setting(key=key, value=value))
-    await db.commit()
+            try:
+                await db.commit()
+            except IntegrityError:
+                await db.rollback()
 
 
 async def initialize_database() -> None:
     _import_all_models()
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-
     async with async_session() as db:
         await seed_initial_settings(db)

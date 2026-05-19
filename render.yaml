@@ -1,0 +1,80 @@
+# Render Blueprint for coco-yoyaku-system
+#
+# このファイルは Render のサービス設定を Git 管理下に置くためのもの。
+# 既存サービスに Blueprint を紐付けるか、新規 Blueprint として読み込ませる。
+#
+# 重要な再発防止ポイント:
+#   1. startCommand に必ず `alembic upgrade head` を含める。
+#      これを忘れるとモデルと DB がズレてアプリ起動不能になる
+#      (UndefinedColumnError など)。
+#   2. branch は明示。staging サービスは staging のみ、main サービスは main のみ。
+#   3. Native Python ビルドを使う場合、Python バージョンは 3.11 に固定する
+#      (Python 3.14 等の最新版に勝手に上がるのを防ぐ)。
+
+services:
+  # ─────────────────────────────────
+  # Production backend (main branch)
+  # ─────────────────────────────────
+  - type: web
+    name: coco-backend
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: main
+    autoDeploy: true
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --access-log
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DATABASE_URL
+        sync: false   # Render ダッシュボードで本番 DB を設定
+      - key: SECRET_KEY
+        sync: false
+      - key: ENVIRONMENT
+        value: production
+
+  # ─────────────────────────────────
+  # Staging backend (staging branch)
+  # ─────────────────────────────────
+  - type: web
+    name: coco-backend-staging
+    runtime: python
+    plan: starter
+    region: oregon
+    branch: staging
+    autoDeploy: true
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --access-log
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: DATABASE_URL
+        sync: false   # Render ダッシュボードで staging DB を設定
+      - key: SECRET_KEY
+        sync: false
+      - key: ENVIRONMENT
+        value: staging
+
+  # ─────────────────────────────────
+  # Production frontend (main branch)
+  # ─────────────────────────────────
+  - type: web
+    name: coco-frontend
+    runtime: node
+    plan: starter
+    region: oregon
+    branch: main
+    autoDeploy: true
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    startCommand: node server.js
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: VITE_API_BASE_URL
+        sync: false

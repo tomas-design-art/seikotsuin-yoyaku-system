@@ -209,7 +209,8 @@ async def _ai_parse(message: str) -> dict:
         import httpx
 
         model = settings.gemini_model
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={settings.gemini_api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        headers = {"x-goog-api-key": settings.gemini_api_key}
 
         payload = {
             "contents": [
@@ -225,7 +226,7 @@ async def _ai_parse(message: str) -> dict:
         }
 
         async with httpx.AsyncClient() as client:
-            response = await client.post(url, json=payload, timeout=30)
+            response = await client.post(url, json=payload, headers=headers, timeout=30)
             response.raise_for_status()
             data = response.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"]

@@ -6,7 +6,13 @@ from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
 
-_INSECURE_DEFAULTS = {"dev-secret-key", "your-secret-key", "changeme", ""}
+_INSECURE_DEFAULTS = {
+    "dev-secret-key",
+    "your-secret-key",
+    "changeme",
+    "CHANGE_ME_GENERATE_WITH_OPENSSL",
+    "",
+}
 
 # backend/.env → プロジェクトルート/.env の順で探す
 _ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
