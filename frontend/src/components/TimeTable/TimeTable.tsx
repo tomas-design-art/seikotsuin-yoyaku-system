@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
-import { ChevronLeft, ChevronRight, Minus, Plus } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Minus, Plus, Calendar as CalendarIcon } from 'lucide-react';
 import type { Practitioner, Reservation, ReservationColor, WeeklySchedule, PractitionerDayStatus, BusinessHoursDay } from '../../types';
 import { CHANNEL_ICONS } from '../../types';
 import { generateTimeSlots, dateToMinutes, DAY_START, DAY_END, SLOT_INTERVAL, formatDate, getWeekDates, WEEKDAY_LABELS, getTodayJST, getNowJSTMinutes, timeToMinutes } from '../../utils/timeUtils';
@@ -61,6 +61,12 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   const rescheduleDragAnchorMinutesRef = useRef(0);
   const gridRef = useRef<HTMLDivElement>(null);
   const [slotHeight, setSlotHeight] = useState(DEFAULT_SLOT_HEIGHT);
+  const [showCalendar, setShowCalendar] = useState(false);
+  const [calendarMonth, setCalendarMonth] = useState<Date>(() => {
+    const t = getTodayJST();
+    return new Date(t.getFullYear(), t.getMonth(), 1);
+  });
+  const calendarRef = useRef<HTMLDivElement>(null);
 
   // 営業時間に基づく動的スロット
   const slots = useMemo(() => generateTimeSlots(dayStart, dayEnd), [dayStart, dayEnd]);
@@ -84,6 +90,18 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
     const timer = setInterval(() => setNowMinutes(getNowJSTMinutes()), 60_000);
     return () => clearInterval(timer);
   }, []);
+
+  // カレンダーポップアップの外クリックで閉じる
+  useEffect(() => {
+    if (!showCalendar) return;
+    const handler = (e: MouseEvent) => {
+      if (calendarRef.current && !calendarRef.current.contains(e.target as Node)) {
+        setShowCalendar(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, [showCalendar]);
 
   const weekDates = useMemo(() => getWeekDates(currentDate), [currentDate]);
 
@@ -850,6 +868,97 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             <span className="hidden max-[430px]:inline">{compactHeaderLabel}</span>
           </span>
           <button onClick={goNext} className="p-1 hover:bg-gray-100 rounded"><ChevronRight size={18} /></button>
+          {/* カレンダー日付ジャンプ */}
+          <div className="relative" ref={calendarRef}>
+            <button
+              onClick={() => {
+                setCalendarMonth(new Date(currentDate.getFullYear(), currentDate.getMonth(), 1));
+                setShowCalendar(v => !v);
+              }}
+              className="p-1 hover:bg-gray-100 rounded text-gray-500"
+              title="カレンダーで日付を選択"
+            >
+              <CalendarIcon size={16} />
+            </button>
+            {showCalendar && (() => {
+              const today = getTodayJST();
+              const year = calendarMonth.getFullYear();
+              const month = calendarMonth.getMonth();
+              const firstDow = new Date(year, month, 1).getDay(); // 0=日
+              const daysInMonth = new Date(year, month + 1, 0).getDate();
+              // 現在表示中の週（weekDates[0]〜weekDates[6]）
+              const weekStartStr = weekDates[0] ? `${weekDates[0].getFullYear()}-${weekDates[0].getMonth()}-${weekDates[0].getDate()}` : '';
+              const weekEndStr = weekDates[6] ? `${weekDates[6].getFullYear()}-${weekDates[6].getMonth()}-${weekDates[6].getDate()}` : '';
+              const cells: (number | null)[] = [
+                ...Array(firstDow).fill(null),
+                ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
+              ];
+              // 6行分になるよう末尾を埋める
+              while (cells.length % 7 !== 0) cells.push(null);
+              const isInCurrentWeek = (d: number) => {
+                if (!weekDates[0] || !weekDates[6]) return false;
+                const dt = new Date(year, month, d);
+                return dt >= weekDates[0] && dt <= weekDates[6];
+              };
+              const isToday = (d: number) =>
+                year === today.getFullYear() && month === today.getMonth() && d === today.getDate();
+              return (
+                <div className="absolute top-full left-0 mt-1 z-50 bg-white border border-gray-200 rounded-lg shadow-xl p-3 w-60 select-none">
+                  {/* 月ヘッダー */}
+                  <div className="flex items-center justify-between mb-2">
+                    <button
+                      onClick={() => setCalendarMonth(m => new Date(m.getFullYear(), m.getMonth() - 1, 1))}
+                      className="p-1 hover:bg-gray-100 rounded"
+                    >
+                      <ChevronLeft size={14} />
+                    </button>
+                    <span className="text-xs font-semibold text-gray-800">{year}年{month + 1}月</span>
+                    <button
+                      onClick={() => setCalendarMonth(m => new Date(m.getFullYear(), m.getMonth() + 1, 1))}
+                      className="p-1 hover:bg-gray-100 rounded"
+                    >
+                      <ChevronRight size={14} />
+                    </button>
+                  </div>
+                  {/* 曜日ヘッダー */}
+                  <div className="grid grid-cols-7 mb-1">
+                    {['日','月','火','水','木','金','土'].map((lbl, i) => (
+                      <div key={lbl} className={`text-center text-[10px] font-medium pb-0.5 ${i === 0 ? 'text-red-500' : i === 6 ? 'text-blue-500' : 'text-gray-400'}`}>{lbl}</div>
+                    ))}
+                  </div>
+                  {/* 日グリッド */}
+                  <div className="grid grid-cols-7 gap-y-0.5">
+                    {cells.map((d, idx) => {
+                      if (d === null) return <div key={`empty-${idx}`} />;
+                      const inWeek = isInCurrentWeek(d);
+                      const tod = isToday(d);
+                      const dow = (firstDow + d - 1) % 7;
+                      return (
+                        <button
+                          key={d}
+                          onClick={() => {
+                            const selected = new Date(year, month, d);
+                            setCurrentDate(selected);
+                            setShowCalendar(false);
+                          }}
+                          className={[
+                            'text-[11px] w-7 h-7 mx-auto rounded-full flex items-center justify-center transition-colors',
+                            tod ? 'bg-blue-500 text-white font-bold' :
+                            inWeek ? 'bg-blue-100 text-blue-800 font-semibold' :
+                            dow === 0 ? 'text-red-500 hover:bg-gray-100' :
+                            dow === 6 ? 'text-blue-500 hover:bg-gray-100' :
+                            'text-gray-700 hover:bg-gray-100',
+                          ].join(' ')}
+                        >
+                          {d}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
           <button onClick={goToday} className="ml-1 md:ml-2 px-2 md:px-3 py-1 text-xs md:text-sm bg-blue-500 text-white rounded hover:bg-blue-600">今日</button>
           {/* Zoom controls */}
           <div className="flex items-center gap-0.5 ml-2 border-l pl-2 border-gray-200">
