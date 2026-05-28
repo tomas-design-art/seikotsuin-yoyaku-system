@@ -1,10 +1,10 @@
 import { useState, useCallback } from 'react';
-import { initAudio, playNotificationSound, playAlertSound, playWarningSound } from '../utils/soundUtils';
+import { initAudio, playNotificationSound, playAlertSound, playWarningSound, playIncomingReservationSound } from '../utils/soundUtils';
 
 interface ToastNotification {
   id: string;
   message: string;
-  type: 'info' | 'warning' | 'error';
+  type: 'info' | 'warning' | 'error' | 'incoming';
   persistent: boolean;
 }
 
@@ -19,7 +19,7 @@ export function useNotification() {
   }, []);
 
   const addToast = useCallback(
-    (message: string, type: 'info' | 'warning' | 'error' = 'info') => {
+    (message: string, type: 'info' | 'warning' | 'error' | 'incoming' = 'info') => {
       const id = Date.now().toString();
       const persistent = type === 'error';
       setToasts((prev) => [...prev, { id, message, type, persistent }]);
@@ -36,6 +36,8 @@ export function useNotification() {
           playAlertSound();
         } else if (type === 'warning') {
           playWarningSound();
+        } else if (type === 'incoming') {
+          playIncomingReservationSound();
         } else {
           playNotificationSound();
         }

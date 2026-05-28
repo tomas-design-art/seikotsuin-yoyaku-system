@@ -106,6 +106,12 @@ function AppContent() {
       addToast(msg, 'warning');
     } else if (event.event_type === 'hotpepper_sync_reminder') {
       addToast(msg, 'warning');
+    } else if (
+      event.event_type === 'new_reservation' &&
+      ['HOTPEPPER', 'CHATBOT', 'WEB'].includes(event.data.channel as string)
+    ) {
+      // 自動予約（ホットペッパー・ホームページ）: 着信音付きで通知
+      addToast(msg, 'incoming');
     } else {
       addToast(msg, 'info');
     }

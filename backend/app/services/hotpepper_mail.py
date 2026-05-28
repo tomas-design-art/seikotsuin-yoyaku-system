@@ -485,6 +485,7 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
         f"{parsed['start_time'].strftime('%m/%d %H:%M')}-{parsed['end_time'].strftime('%H:%M')} "
         f"{parsed.get('menu_name') or '(メニュー不明)'}",
         reservation.id,
+        extra_data={"channel": "HOTPEPPER"},
     )
 
     await db.commit()

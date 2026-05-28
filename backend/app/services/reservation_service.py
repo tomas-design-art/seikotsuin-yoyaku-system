@@ -367,6 +367,7 @@ async def create_reservation(
         db, "new_reservation",
         f"新規予約: {patient_name} {data.start_time.strftime('%H:%M')}-{data.end_time.strftime('%H:%M')}",
         reservation.id,
+        extra_data={"channel": data.channel},
     )
     # HP枠押さえリマインド（HOTPEPPER以外のチャネルで登録時）
     if data.channel != "HOTPEPPER":
