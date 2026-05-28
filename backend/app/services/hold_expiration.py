@@ -68,12 +68,14 @@ async def expire_chat_sessions():
 async def remind_hotpepper_sync():
     """HP未押さえ予約のリマインド通知（30分間隔）"""
     async with async_session() as db:
+        now = now_jst()
         result = await db.execute(
             select(Reservation)
             .where(
                 Reservation.hotpepper_synced == False,
                 Reservation.channel != "HOTPEPPER",
                 Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+                Reservation.start_time >= now,
             )
             .options(selectinload(Reservation.patient))
             .order_by(Reservation.start_time)
@@ -127,6 +129,53 @@ async def cleanup_old_notifications():
                 deleted2,
                 unread_retention_days,
             )
+
+
+async def dismiss_stale_hotpepper_reminders():
+    """過去の予約に結びついた hotpepper_sync_reminder を自動既読化
+
+    過去に手動運用で記録された大量の未同期リマインド通知を定期的に清潔する。
+    reservation.start_time が現在時刻以前の予約に結びついた通知を既読にする。
+    """
+    async with async_session() as db:
+        now = now_jst()
+        # 過去の予約に結びついた未読の hotpepper系通知を一括既読化
+        result = await db.execute(
+            select(NotificationLog)
+            .join(Reservation, NotificationLog.reservation_id == Reservation.id)
+            .where(
+                NotificationLog.event_type.in_([
+                    "hotpepper_sync_reminder", "hotpepper_sync", "hotpepper_hold_reminder"
+                ]),
+                NotificationLog.is_read == False,
+                Reservation.start_time < now,
+            )
+        )
+        stale = result.scalars().all()
+        if stale:
+            for n in stale:
+                n.is_read = True
+            await db.commit()
+            logger.info("Auto-dismissed %s stale HP sync notifications", len(stale))
+
+        # reservation_id なしの古い hotpepper_sync_reminder も既読（30日以前）
+        cutoff = now - timedelta(days=30)
+        result2 = await db.execute(
+            select(NotificationLog).where(
+                NotificationLog.event_type.in_([
+                    "hotpepper_sync_reminder", "hotpepper_sync", "hotpepper_hold_reminder"
+                ]),
+                NotificationLog.is_read == False,
+                NotificationLog.reservation_id == None,
+                NotificationLog.created_at < cutoff,
+            )
+        )
+        old_orphans = result2.scalars().all()
+        if old_orphans:
+            for n in old_orphans:
+                n.is_read = True
+            await db.commit()
+            logger.info("Auto-dismissed %s orphan HP sync notifications (>30d)", len(old_orphans))
 
 
 async def poll_hotpepper_mail_job():
@@ -229,6 +278,7 @@ def start_hold_expiration_job():
     scheduler.add_job(expire_holds, "interval", minutes=1, id="hold_expiration")
     scheduler.add_job(expire_chat_sessions, "interval", minutes=10, id="chat_session_expiration")
     scheduler.add_job(remind_hotpepper_sync, "interval", minutes=30, id="hotpepper_sync_reminder")
+    scheduler.add_job(dismiss_stale_hotpepper_reminders, "interval", hours=1, id="hp_stale_dismiss")
     scheduler.add_job(
         poll_hotpepper_mail_job,
         "interval",
