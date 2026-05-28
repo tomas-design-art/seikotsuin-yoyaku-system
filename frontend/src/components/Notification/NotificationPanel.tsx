@@ -5,11 +5,20 @@ import { getNotifications, markNotificationRead } from '../../api/client';
 
 interface NotificationPanelProps {
   onClose: () => void;
+  dismissedIds?: Set<number>;
 }
 
-export default function NotificationPanel({ onClose }: NotificationPanelProps) {
+export default function NotificationPanel({ onClose, dismissedIds }: NotificationPanelProps) {
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [hiddenIds, setHiddenIds] = useState<Set<number>>(new Set());
+
+  const persistHiddenIds = (next: Set<number>) => {
+    try {
+      localStorage.setItem('notification_hidden_ids_v1', JSON.stringify(Array.from(next)));
+    } catch {
+      // ignore storage errors
+    }
+  };
 
   useEffect(() => {
     try {
@@ -22,17 +31,20 @@ export default function NotificationPanel({ onClose }: NotificationPanelProps) {
     }
   }, []);
 
+  // RPA完了などで外部からdismissされたIDを反映
+  useEffect(() => {
+    if (!dismissedIds || dismissedIds.size === 0) return;
+    setHiddenIds((prev) => {
+      const next = new Set(prev);
+      dismissedIds.forEach((id) => next.add(id));
+      persistHiddenIds(next);
+      return next;
+    });
+  }, [dismissedIds]);
+
   useEffect(() => {
     getNotifications().then((res) => setNotifications(res.data ?? [])).catch(() => setNotifications([]));
   }, []);
-
-  const persistHiddenIds = (next: Set<number>) => {
-    try {
-      localStorage.setItem('notification_hidden_ids_v1', JSON.stringify(Array.from(next)));
-    } catch {
-      // ignore storage errors
-    }
-  };
 
   const handleHideNotification = async (id: number) => {
     const next = new Set(hiddenIds);
