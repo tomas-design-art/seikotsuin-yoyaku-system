@@ -40,13 +40,16 @@ class ParseEmailResponse(BaseModel):
 
 @router.get("/pending-sync")
 async def pending_sync(db: AsyncSession = Depends(get_db)):
-    """HotPepper側未押さえの予約一覧"""
+    """HotPepper側未押さえの予約一覧（現在時刻以降の未来予約のみ）"""
+    from app.utils.datetime_jst import now_jst
+    now = now_jst()
     result = await db.execute(
         select(Reservation)
         .where(
             Reservation.hotpepper_synced == False,
             Reservation.channel != "HOTPEPPER",
             Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.start_time >= now,
         )
         .options(
             selectinload(Reservation.patient),
