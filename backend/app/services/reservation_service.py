@@ -131,6 +131,9 @@ def build_reservation_response(reservation: Reservation) -> dict:
         resp["patient"] = {
             "id": reservation.patient.id,
             "name": reservation.patient.name,
+            "last_name": reservation.patient.last_name,
+            "first_name": reservation.patient.first_name,
+            "last_name_kana": reservation.patient.last_name_kana,
             "patient_number": reservation.patient.patient_number,
         }
     if reservation.menu:
