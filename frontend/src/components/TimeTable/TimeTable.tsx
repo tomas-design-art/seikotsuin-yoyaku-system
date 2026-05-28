@@ -886,9 +886,6 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
               const month = calendarMonth.getMonth();
               const firstDow = new Date(year, month, 1).getDay(); // 0=日
               const daysInMonth = new Date(year, month + 1, 0).getDate();
-              // 現在表示中の週（weekDates[0]〜weekDates[6]）
-              const weekStartStr = weekDates[0] ? `${weekDates[0].getFullYear()}-${weekDates[0].getMonth()}-${weekDates[0].getDate()}` : '';
-              const weekEndStr = weekDates[6] ? `${weekDates[6].getFullYear()}-${weekDates[6].getMonth()}-${weekDates[6].getDate()}` : '';
               const cells: (number | null)[] = [
                 ...Array(firstDow).fill(null),
                 ...Array.from({ length: daysInMonth }, (_, i) => i + 1),
