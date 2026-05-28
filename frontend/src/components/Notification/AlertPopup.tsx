@@ -3,7 +3,7 @@ import { X } from 'lucide-react';
 interface Toast {
   id: string;
   message: string;
-  type: 'info' | 'warning' | 'error';
+  type: 'info' | 'warning' | 'error' | 'incoming';
   persistent: boolean;
 }
 
@@ -23,6 +23,8 @@ export default function AlertPopup({ toasts, onDismiss }: AlertPopupProps) {
             ? 'bg-red-500'
             : toast.type === 'warning'
             ? 'bg-yellow-500'
+            : toast.type === 'incoming'
+            ? 'bg-green-600'
             : 'bg-blue-500';
 
         return (

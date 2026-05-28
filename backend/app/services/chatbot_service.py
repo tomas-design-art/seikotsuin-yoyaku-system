@@ -260,6 +260,7 @@ async def tool_create_reservation(
         "new_reservation",
         f"チャットボット予約: {patient_name} {start_dt.strftime('%m/%d %H:%M')}-{end_dt.strftime('%H:%M')} {menu.name}",
         reservation.id,
+        extra_data={"channel": "CHATBOT"},
     )
     await create_notification(
         db,

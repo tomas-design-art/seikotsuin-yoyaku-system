@@ -51,3 +51,10 @@ export async function playAlertSound(): Promise<void> {
 export async function playWarningSound(): Promise<void> {
   await playTone(600, 0.5, 0.4);
 }
+
+/** 自動予約着信音（ホットペッパー・ホームページ予約）: メール受信音風の3音チャイム */
+export function playIncomingReservationSound(): void {
+  playTone(660, 0.3, 0.45);
+  setTimeout(() => playTone(880, 0.3, 0.45), 180);
+  setTimeout(() => playTone(1100, 0.55, 0.45), 360);
+}
