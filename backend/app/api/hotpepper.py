@@ -62,14 +62,47 @@ async def pending_sync(db: AsyncSession = Depends(get_db)):
 @router.post("/{reservation_id}/mark-synced")
 async def mark_synced(reservation_id: int, db: AsyncSession = Depends(get_db)):
     """HP側押さえ済みマーク"""
+    from app.api.sse import broadcast_event
+    from app.models.notification_log import NotificationLog
     result = await db.execute(
-        select(Reservation).where(Reservation.id == reservation_id)
+        select(Reservation)
+        .where(Reservation.id == reservation_id)
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+        )
     )
     reservation = result.scalar_one_or_none()
     if not reservation:
         raise HTTPException(status_code=404, detail="予約が見つかりません")
     reservation.hotpepper_synced = True
+
+    # 関連するHP押さえリマインド通知を既読に
+    notif_result = await db.execute(
+        select(NotificationLog).where(
+            NotificationLog.reservation_id == reservation_id,
+            NotificationLog.event_type.in_(["hotpepper_sync_reminder", "hotpepper_sync"]),
+            NotificationLog.is_read == False,
+        )
+    )
+    related_notifs = notif_result.scalars().all()
+    dismissed_ids = []
+    for n in related_notifs:
+        n.is_read = True
+        dismissed_ids.append(n.id)
+
     await db.commit()
+
+    # RPA完了をSSEで通知（既読にしたID付き）
+    patient_name = reservation.patient.name if reservation.patient else "(患者名不明)"
+    practitioner_name = reservation.practitioner.name if reservation.practitioner else ""
+    time_str = reservation.start_time.strftime('%m/%d %H:%M') if reservation.start_time else ""
+    await broadcast_event("hotpepper_synced", {
+        "reservation_id": reservation_id,
+        "message": f"HP枠押さえ完了: {patient_name} {time_str} ({practitioner_name})",
+        "dismissed_notification_ids": dismissed_ids,
+    })
+
     return {"status": "ok", "reservation_id": reservation_id}
 
 

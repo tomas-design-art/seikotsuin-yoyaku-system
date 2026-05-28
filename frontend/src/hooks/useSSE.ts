@@ -66,6 +66,10 @@ export function useSSE(onEvent: (event: SSEEvent) => void) {
       onEventRef.current({ event_type: 'hotpepper_sync_reminder', data: JSON.parse(e.data) });
     });
 
+    es.addEventListener('hotpepper_synced', (e) => {
+      onEventRef.current({ event_type: 'hotpepper_synced', data: JSON.parse(e.data) });
+    });
+
     es.onerror = () => {
       es.close();
       // Reconnect after 5 seconds

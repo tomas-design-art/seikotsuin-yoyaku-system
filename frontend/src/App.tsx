@@ -58,6 +58,7 @@ function AppContent() {
 
   const [showReservationForm, setShowReservationForm] = useState(false);
   const [showNotificationPanel, setShowNotificationPanel] = useState(false);
+  const [dismissedNotifIds, setDismissedNotifIds] = useState<Set<number>>(new Set());
   const [selectedReservation, setSelectedReservation] = useState<Reservation | null>(null);
   const [refreshKey, setRefreshKey] = useState(0);
   const [formInitialData, setFormInitialData] = useState<{
@@ -84,7 +85,7 @@ function AppContent() {
   const [seriesExtensionTarget, setSeriesExtensionTarget] = useState<SeriesResponse | null>(null);
   const [isTimeTableFullscreen, setIsTimeTableFullscreen] = useState(false);
 
-  const { toasts, unreadCount, audioInitialized, enableAudio, addToast, removeToast, clearUnread } = useNotification();
+  const { toasts, unreadCount, audioInitialized, enableAudio, disableAudio, addToast, removeToast, clearUnread } = useNotification();
 
   const handleSSEEvent = useCallback((event: { event_type: string; data: Record<string, unknown> }) => {
     const msg = (event.data.message as string) || event.event_type;
@@ -106,6 +107,17 @@ function AppContent() {
       addToast(msg, 'warning');
     } else if (event.event_type === 'hotpepper_sync_reminder') {
       addToast(msg, 'warning');
+    } else if (event.event_type === 'hotpepper_synced') {
+      // RPA完了通知 + 関連リマインドをパネルから消去
+      addToast(msg, 'info');
+      const ids = event.data.dismissed_notification_ids as number[] | undefined;
+      if (ids && ids.length > 0) {
+        setDismissedNotifIds((prev) => {
+          const next = new Set(prev);
+          ids.forEach((id) => next.add(id));
+          return next;
+        });
+      }
     } else if (
       event.event_type === 'new_reservation' &&
       ['HOTPEPPER', 'CHATBOT', 'WEB'].includes(event.data.channel as string)
@@ -335,9 +347,9 @@ function AppContent() {
                 </div>
               )}
               <button
-                onClick={enableAudio}
-                className={`p-2 rounded-full ${audioInitialized ? 'text-green-500' : 'text-gray-400 hover:text-gray-600'}`}
-                title={audioInitialized ? '通知音ON' : 'クリックして通知音を有効化'}
+                onClick={audioInitialized ? disableAudio : enableAudio}
+                className={`p-2 rounded-full ${audioInitialized ? 'text-green-500 hover:text-red-400' : 'text-gray-400 hover:text-gray-600'}`}
+                title={audioInitialized ? '通知音ON（クリックでOFF）' : 'クリックして通知音を有効化'}
               >
                 {audioInitialized ? <Volume2 size={18} /> : <VolumeX size={18} />}
               </button>
@@ -439,7 +451,10 @@ function AppContent() {
       )}
 
       {showNotificationPanel && (
-        <NotificationPanel onClose={() => setShowNotificationPanel(false)} />
+        <NotificationPanel
+          onClose={() => setShowNotificationPanel(false)}
+          dismissedIds={dismissedNotifIds}
+        />
       )}
 
       {/* Reschedule error */}

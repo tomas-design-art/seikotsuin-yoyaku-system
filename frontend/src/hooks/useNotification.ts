@@ -1,5 +1,7 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { initAudio, playNotificationSound, playAlertSound, playWarningSound, playIncomingReservationSound } from '../utils/soundUtils';
+
+const AUDIO_PREF_KEY = 'notification_audio_enabled';
 
 interface ToastNotification {
   id: string;
@@ -11,11 +13,31 @@ interface ToastNotification {
 export function useNotification() {
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
-  const [audioInitialized, setAudioInitialized] = useState(false);
+  // localStorage から初期値を復元
+  const [audioInitialized, setAudioInitialized] = useState<boolean>(
+    () => localStorage.getItem(AUDIO_PREF_KEY) === 'true'
+  );
+
+  // リロード後: 設定ONなら最初のユーザー操作で AudioContext を自動復元
+  useEffect(() => {
+    if (!audioInitialized) return;
+    const handler = () => {
+      initAudio();
+      document.removeEventListener('click', handler, { capture: true });
+    };
+    document.addEventListener('click', handler, { capture: true, once: true });
+    return () => document.removeEventListener('click', handler, { capture: true });
+  }, [audioInitialized]);
 
   const enableAudio = useCallback(() => {
     initAudio();
     setAudioInitialized(true);
+    localStorage.setItem(AUDIO_PREF_KEY, 'true');
+  }, []);
+
+  const disableAudio = useCallback(() => {
+    setAudioInitialized(false);
+    localStorage.setItem(AUDIO_PREF_KEY, 'false');
   }, []);
 
   const addToast = useCallback(
@@ -59,6 +81,7 @@ export function useNotification() {
     unreadCount,
     audioInitialized,
     enableAudio,
+    disableAudio,
     addToast,
     removeToast,
     clearUnread,
