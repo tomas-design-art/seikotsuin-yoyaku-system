@@ -17,6 +17,7 @@ import NotificationBell from './components/Notification/NotificationBell';
 import AlertPopup from './components/Notification/AlertPopup';
 import NotificationPanel from './components/Notification/NotificationPanel';
 import SeriesExtensionModal from './components/Notification/SeriesExtensionModal';
+import ScheduleConflictAlertModal from './components/Notification/ScheduleConflictAlertModal';
 import HotPepperSync from './components/HotPepperSync';
 import PublicReserve from './components/PublicReserve';
 import AdminLoginModal from './components/Auth/AdminLoginModal';
@@ -24,7 +25,7 @@ import PinLogin from './components/Auth/PinLogin';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { useSSE } from './hooks/useSSE';
 import { useNotification } from './hooks/useNotification';
-import { rescheduleReservation, getSeries, getPendingSeriesAlerts } from './api/client';
+import { rescheduleReservation, getSeries, getPendingSeriesAlerts, getScheduleConflictAlerts, getReservation } from './api/client';
 import { extractErrorMessage } from './utils/errorUtils';
 import type { Reservation, SeriesResponse } from './types';
 
@@ -84,6 +85,9 @@ function AppContent() {
   // Series extension modal state
   const [seriesExtensionTarget, setSeriesExtensionTarget] = useState<SeriesResponse | null>(null);
   const [isTimeTableFullscreen, setIsTimeTableFullscreen] = useState(false);
+  // 休暇かぶり予約アラート: モーダル表示 / 再フェッチtick
+  const [showConflictAlertModal, setShowConflictAlertModal] = useState(false);
+  const [conflictAlertTick, setConflictAlertTick] = useState(0);
 
   const { toasts, unreadCount, audioInitialized, enableAudio, disableAudio, addToast, removeToast, clearUnread } = useNotification();
 
@@ -103,6 +107,11 @@ function AppContent() {
       }
     } else if (event.event_type === 'conflict_detected') {
       addToast(msg, 'error');
+    } else if (event.event_type === 'schedule_conflict_alert') {
+      // 休暇かぶり予約 — モーダル表示 + 再フェッチtickを進める
+      addToast(msg, 'warning');
+      setConflictAlertTick((t) => t + 1);
+      setShowConflictAlertModal(true);
     } else if (event.event_type === 'hold_expired') {
       addToast(msg, 'warning');
     } else if (event.event_type === 'hotpepper_sync_reminder') {
@@ -139,6 +148,14 @@ function AppContent() {
         const alerts = res.data ?? [];
         if (alerts.length > 0) {
           setSeriesExtensionTarget(alerts[0]); // 最新1件をモーダル表示
+        }
+      })
+      .catch(() => { /* ignore */ });
+    // 起動時: 休暇かぶり予約があればモーダル表示
+    getScheduleConflictAlerts()
+      .then((res) => {
+        if ((res.data ?? []).length > 0) {
+          setShowConflictAlertModal(true);
         }
       })
       .catch(() => { /* ignore */ });
@@ -485,6 +502,20 @@ function AppContent() {
           series={seriesExtensionTarget}
           onClose={() => setSeriesExtensionTarget(null)}
           onAction={refresh}
+        />
+      )}
+
+      {/* 休暇かぶり予約アラート モーダル */}
+      {showConflictAlertModal && (
+        <ScheduleConflictAlertModal
+          refreshTick={conflictAlertTick}
+          onClose={() => setShowConflictAlertModal(false)}
+          onOpenReservation={(reservationId) => {
+            getReservation(reservationId).then((res) => {
+              setSelectedReservation(res.data);
+              setShowConflictAlertModal(false);
+            }).catch(() => { /* ignore */ });
+          }}
         />
       )}
 

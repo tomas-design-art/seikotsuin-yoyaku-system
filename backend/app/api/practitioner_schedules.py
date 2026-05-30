@@ -36,11 +36,30 @@ from app.services.schedule_service import (
 from app.services.conflict_detector import ACTIVE_STATUSES
 from app.services.notification_service import create_notification
 from app.services.reservation_service import build_reservation_response
+from app.services.schedule_conflict_alerts import collect_schedule_conflict_alerts
+from app.api.sse import broadcast_event
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/practitioner-schedules", tags=["practitioner-schedules"])
 
 HOLIDAY_DAY_OF_WEEK = 7
+
+
+async def _notify_schedule_conflicts_if_any(db: AsyncSession) -> int:
+    """休暇／時間帯休み登録後に被り予約があれば SSE で通知。
+    返り値: 検出した被り件数 (frontend 直接呼び出し用)
+    """
+    try:
+        alerts = await collect_schedule_conflict_alerts(db)
+    except Exception:  # noqa: BLE001
+        logger.exception("collect_schedule_conflict_alerts failed")
+        return 0
+    if alerts:
+        await broadcast_event(
+            "schedule_conflict_alert",
+            {"event_type": "schedule_conflict_alert", "count": len(alerts), "alerts": alerts[:20]},
+        )
+    return len(alerts)
 
 
 async def _get_setting(db: AsyncSession, key: str, default: str = "") -> str:
@@ -193,6 +212,8 @@ async def create_override(
         existing.reason = data.reason
         await db.commit()
         await db.refresh(existing)
+        if not data.is_working:
+            await _notify_schedule_conflicts_if_any(db)
         return existing
 
     override = ScheduleOverride(
@@ -204,6 +225,9 @@ async def create_override(
     db.add(override)
     await db.commit()
     await db.refresh(override)
+    # 休暇登録なら被り予約をチェックして通知
+    if not data.is_working:
+        await _notify_schedule_conflicts_if_any(db)
     return override
 
 
@@ -398,6 +422,7 @@ async def create_unavailable_time(
     db.add(ut)
     await db.commit()
     await db.refresh(ut)
+    await _notify_schedule_conflicts_if_any(db)
     return ut
 
 
@@ -416,3 +441,18 @@ async def delete_unavailable_time(
     await db.delete(ut)
     await db.commit()
     return {"ok": True}
+
+
+# ===== 休暇かぶり予約アラート（動的計算） =====
+
+@router.get("/conflict-alerts")
+async def get_schedule_conflict_alerts(
+    db: AsyncSession = Depends(get_db),
+):
+    """施術者の休暇／時間帯休みと重なってしまっている既存予約を返す。
+
+    - 解消されると次回呼び出しで自動的に消える（記録テーブル無し）
+    - フロントは画面起動時と SSE `schedule_conflict_alert` 受信時に呼び出す
+    """
+    alerts = await collect_schedule_conflict_alerts(db)
+    return alerts

@@ -13,6 +13,8 @@ from app.models.reservation_series import ReservationSeries
 from app.models.chat_session import ChatSession
 from app.models.notification_log import NotificationLog
 from app.services.notification_service import create_notification
+from app.services.schedule_conflict_alerts import collect_schedule_conflict_alerts
+from app.api.sse import broadcast_event
 from app.utils.datetime_jst import now_jst
 
 logger = logging.getLogger(__name__)
@@ -274,6 +276,39 @@ async def check_series_expiration():
                 logger.info("Notified %s expiring series", notified_count)
 
 
+async def check_schedule_conflicts_morning():
+    """毎朝、職員休暇日に被ってしまっている既存予約を検出して通知する。
+
+    動的計算なので解消されれば翌朝には自然と消える。
+    啓発のため毎朝 9:00 に通知を出し続ける。
+    """
+    async with async_session() as db:
+        try:
+            alerts = await collect_schedule_conflict_alerts(db)
+        except Exception:  # noqa: BLE001
+            logger.exception("morning schedule conflict scan failed")
+            return
+        if not alerts:
+            logger.info("morning schedule conflict scan: no conflicts")
+            return
+        head_message = alerts[0]["message"]
+        summary = (
+            f"{head_message}（他 {len(alerts) - 1} 件）" if len(alerts) > 1 else head_message
+        )
+        await create_notification(
+            db,
+            "schedule_conflict_alert",
+            summary,
+            extra_data={"count": len(alerts)},
+        )
+        await db.commit()
+        await broadcast_event(
+            "schedule_conflict_alert",
+            {"event_type": "schedule_conflict_alert", "count": len(alerts), "alerts": alerts[:20]},
+        )
+        logger.info("morning schedule conflict scan: %d alerts pushed", len(alerts))
+
+
 def start_hold_expiration_job():
     scheduler.add_job(expire_holds, "interval", minutes=1, id="hold_expiration")
     scheduler.add_job(expire_chat_sessions, "interval", minutes=10, id="chat_session_expiration")
@@ -287,9 +322,10 @@ def start_hold_expiration_job():
     )
     scheduler.add_job(cleanup_old_notifications, "cron", hour=3, minute=0, id="notification_cleanup")
     scheduler.add_job(check_series_expiration, "cron", hour=10, minute=0, id="series_expiration_check")
+    scheduler.add_job(check_schedule_conflicts_morning, "cron", hour=9, minute=0, id="schedule_conflict_morning")
     scheduler.start()
     logger.info(
-        "Background jobs started (HOLD expiration, chat session expiration, HP sync reminder, HotPepper mail poll, notification cleanup, series expiration check)"
+        "Background jobs started (HOLD expiration, chat session expiration, HP sync reminder, HotPepper mail poll, notification cleanup, series expiration check, schedule conflict morning check)"
     )
 
 

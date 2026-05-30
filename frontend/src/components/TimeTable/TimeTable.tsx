@@ -560,9 +560,11 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
         }}
       >
         {dayOff ? (
-          /* 休みの施術者: グレーアウト＋クリック無効 */
+          /* 休みの施術者: グレーアウト表示。
+             ※ 予約が後から休みに被ったケースで既存予約のクリック編集を可能にするため
+                オーバーレイは pointer-events-none。予約ブロック側は z-index で上に出す。 */
           <div
-            className="absolute inset-0 flex items-start justify-center pt-2"
+            className="absolute inset-0 flex items-start justify-center pt-2 pointer-events-none"
             style={{
               top: headerH,
               bottom: 0,
@@ -702,7 +704,9 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                 top: top + headerH,
                 height: Math.max(height, slotHeight),
                 backgroundColor: getBlockColor(r, hasOverlap),
-                zIndex: isTarget ? 30 : 2,
+                // 施術者休み(z=8) / 時間帯休み(z=4) / 勤務時間外(z=3) のオーバーレイより上に出して
+                // 「後から休みを入れて被ってしまった既存予約」も常にクリック編集できるようにする
+                zIndex: isTarget ? 30 : 9,
                 fontSize: 10,
                 lineHeight: '14px',
                 ...getBlockExtraStyle(r),
@@ -919,7 +923,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                   </div>
                   {/* 曜日ヘッダー */}
                   <div className="grid grid-cols-7 mb-1">
-                    {['日','月','火','水','木','金','土'].map((lbl, i) => (
+                    {['日', '月', '火', '水', '木', '金', '土'].map((lbl, i) => (
                       <div key={lbl} className={`text-center text-[10px] font-medium pb-0.5 ${i === 0 ? 'text-red-500' : i === 6 ? 'text-blue-500' : 'text-gray-400'}`}>{lbl}</div>
                     ))}
                   </div>
@@ -941,10 +945,10 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                           className={[
                             'text-[11px] w-7 h-7 mx-auto rounded-full flex items-center justify-center transition-colors',
                             tod ? 'bg-blue-500 text-white font-bold' :
-                            inWeek ? 'bg-blue-100 text-blue-800 font-semibold' :
-                            dow === 0 ? 'text-red-500 hover:bg-gray-100' :
-                            dow === 6 ? 'text-blue-500 hover:bg-gray-100' :
-                            'text-gray-700 hover:bg-gray-100',
+                              inWeek ? 'bg-blue-100 text-blue-800 font-semibold' :
+                                dow === 0 ? 'text-red-500 hover:bg-gray-100' :
+                                  dow === 6 ? 'text-blue-500 hover:bg-gray-100' :
+                                    'text-gray-700 hover:bg-gray-100',
                           ].join(' ')}
                         >
                           {d}

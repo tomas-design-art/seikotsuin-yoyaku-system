@@ -331,6 +331,23 @@ export const createUnavailableTime = (data: {
 export const deleteUnavailableTime = (id: number) =>
   api.delete(`/practitioner-schedules/unavailable-times/${id}`);
 
+// ---- 休暇かぶり予約アラート ----
+export type ScheduleConflictAlert = {
+  kind: 'override' | 'unavailable_time';
+  source_id: number;
+  practitioner_id: number;
+  practitioner_name: string;
+  date: string;
+  reservation_id: number;
+  patient_name: string;
+  start_time: string;
+  end_time: string;
+  reason: string | null;
+  message: string;
+};
+export const getScheduleConflictAlerts = () =>
+  api.get<ScheduleConflictAlert[]>('/practitioner-schedules/conflict-alerts');
+
 // ---- Notifications ----
 export const getNotifications = () => api.get<Notification[]>('/notifications/');
 export const markNotificationRead = (id: number) =>
