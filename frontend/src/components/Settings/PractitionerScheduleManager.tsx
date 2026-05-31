@@ -262,6 +262,33 @@ export default function PractitionerScheduleManager() {
     );
     const pastCount = pastOverrides.length + pastUnavailableTimes.length;
 
+    // 履歴を年月別（YYYY-MM）に振り分ける。新しい月が上に来るよう降順。
+    const historyByMonth = useMemo(() => {
+        const map = new Map<string, { overrides: ScheduleOverride[]; unavailableTimes: UnavailableTime[] }>();
+        for (const o of pastOverrides) {
+            const key = o.date.slice(0, 7);
+            if (!map.has(key)) map.set(key, { overrides: [], unavailableTimes: [] });
+            map.get(key)!.overrides.push(o);
+        }
+        for (const ut of pastUnavailableTimes) {
+            const key = ut.date.slice(0, 7);
+            if (!map.has(key)) map.set(key, { overrides: [], unavailableTimes: [] });
+            map.get(key)!.unavailableTimes.push(ut);
+        }
+        return Array.from(map.entries())
+            .sort((a, b) => b[0].localeCompare(a[0]))
+            .map(([key, v]) => {
+                const [y, m] = key.split('-');
+                return {
+                    key,
+                    label: `${y}年${parseInt(m, 10)}月`,
+                    count: v.overrides.length + v.unavailableTimes.length,
+                    overrides: v.overrides,
+                    unavailableTimes: v.unavailableTimes,
+                };
+            });
+    }, [pastOverrides, pastUnavailableTimes]);
+
     const handleCreateUnavailableTime = async () => {
         if (!selectedPractitionerId || !utDate || !utStartTime || !utEndTime) return;
         try {
@@ -611,83 +638,91 @@ export default function PractitionerScheduleManager() {
                                 {pastCount === 0 ? (
                                     <p className="text-sm text-gray-400">過去の記録はありません</p>
                                 ) : (
-                                    <>
-                                        {pastOverrides.length > 0 && (
-                                            <div>
-                                                <h4 className="text-sm font-semibold text-gray-500 mb-2">臨時休み / 臨時出勤</h4>
-                                                <table className="w-full text-sm">
-                                                    <thead>
-                                                        <tr className="bg-gray-50">
-                                                            <th className="px-3 py-2 text-left">日付</th>
-                                                            <th className="px-3 py-2 text-center">タイプ</th>
-                                                            <th className="px-3 py-2 text-left">理由</th>
-                                                            <th className="px-3 py-2"></th>
-                                                        </tr>
-                                                    </thead>
-                                                    <tbody>
-                                                        {pastOverrides.map((o) => (
-                                                            <tr key={o.id} className="border-t text-gray-400">
-                                                                <td className="px-3 py-2">{o.date}</td>
-                                                                <td className="px-3 py-2 text-center">
-                                                                    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${o.is_working ? 'bg-green-50 text-green-500' : 'bg-red-50 text-red-500'}`}>
-                                                                        {o.is_working ? '臨時出勤' : '臨時休み'}
-                                                                    </span>
-                                                                </td>
-                                                                <td className="px-3 py-2">{o.reason || '-'}</td>
-                                                                <td className="px-3 py-2 text-right">
-                                                                    <button
-                                                                        onClick={() => handleDeleteOverride(o.id)}
-                                                                        className="text-gray-300 hover:text-red-500"
-                                                                        title="記録を削除"
-                                                                    >
-                                                                        <Trash2 size={16} />
-                                                                    </button>
-                                                                </td>
-                                                            </tr>
-                                                        ))}
-                                                    </tbody>
-                                                </table>
+                                    historyByMonth.map((month) => (
+                                        <div key={month.key} className="border border-gray-100 rounded-lg overflow-hidden">
+                                            <div className="bg-gray-50 px-4 py-2 flex items-center gap-2 border-b border-gray-100">
+                                                <span className="text-sm font-bold text-gray-600">{month.label}</span>
+                                                <span className="text-xs text-gray-400">{month.count}件</span>
                                             </div>
-                                        )}
+                                            <div className="p-4 space-y-4">
+                                                {month.overrides.length > 0 && (
+                                                    <div>
+                                                        <h4 className="text-xs font-semibold text-gray-500 mb-2">臨時休み / 臨時出勤</h4>
+                                                        <table className="w-full text-sm">
+                                                            <thead>
+                                                                <tr className="bg-gray-50">
+                                                                    <th className="px-3 py-2 text-left">日付</th>
+                                                                    <th className="px-3 py-2 text-center">タイプ</th>
+                                                                    <th className="px-3 py-2 text-left">理由</th>
+                                                                    <th className="px-3 py-2"></th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody>
+                                                                {month.overrides.map((o) => (
+                                                                    <tr key={o.id} className="border-t text-gray-400">
+                                                                        <td className="px-3 py-2">{o.date}</td>
+                                                                        <td className="px-3 py-2 text-center">
+                                                                            <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${o.is_working ? 'bg-green-50 text-green-500' : 'bg-red-50 text-red-500'}`}>
+                                                                                {o.is_working ? '臨時出勤' : '臨時休み'}
+                                                                            </span>
+                                                                        </td>
+                                                                        <td className="px-3 py-2">{o.reason || '-'}</td>
+                                                                        <td className="px-3 py-2 text-right">
+                                                                            <button
+                                                                                onClick={() => handleDeleteOverride(o.id)}
+                                                                                className="text-gray-300 hover:text-red-500"
+                                                                                title="記録を削除"
+                                                                            >
+                                                                                <Trash2 size={16} />
+                                                                            </button>
+                                                                        </td>
+                                                                    </tr>
+                                                                ))}
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                )}
 
-                                        {pastUnavailableTimes.length > 0 && (
-                                            <div>
-                                                <h4 className="text-sm font-semibold text-gray-500 mb-2">時間帯休み</h4>
-                                                <table className="w-full text-sm">
-                                                    <thead>
-                                                        <tr className="bg-gray-50">
-                                                            <th className="px-3 py-2 text-left">日付</th>
-                                                            <th className="px-3 py-2 text-center">時間帯</th>
-                                                            <th className="px-3 py-2 text-left">理由</th>
-                                                            <th className="px-3 py-2"></th>
-                                                        </tr>
-                                                    </thead>
-                                                    <tbody>
-                                                        {pastUnavailableTimes.map((ut) => (
-                                                            <tr key={ut.id} className="border-t text-gray-400">
-                                                                <td className="px-3 py-2">{ut.date}</td>
-                                                                <td className="px-3 py-2 text-center">
-                                                                    <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-500">
-                                                                        {ut.start_time} 〜 {ut.end_time}
-                                                                    </span>
-                                                                </td>
-                                                                <td className="px-3 py-2">{ut.reason || '-'}</td>
-                                                                <td className="px-3 py-2 text-right">
-                                                                    <button
-                                                                        onClick={() => handleDeleteUnavailableTime(ut.id)}
-                                                                        className="text-gray-300 hover:text-red-500"
-                                                                        title="記録を削除"
-                                                                    >
-                                                                        <Trash2 size={16} />
-                                                                    </button>
-                                                                </td>
-                                                            </tr>
-                                                        ))}
-                                                    </tbody>
-                                                </table>
+                                                {month.unavailableTimes.length > 0 && (
+                                                    <div>
+                                                        <h4 className="text-xs font-semibold text-gray-500 mb-2">時間帯休み</h4>
+                                                        <table className="w-full text-sm">
+                                                            <thead>
+                                                                <tr className="bg-gray-50">
+                                                                    <th className="px-3 py-2 text-left">日付</th>
+                                                                    <th className="px-3 py-2 text-center">時間帯</th>
+                                                                    <th className="px-3 py-2 text-left">理由</th>
+                                                                    <th className="px-3 py-2"></th>
+                                                                </tr>
+                                                            </thead>
+                                                            <tbody>
+                                                                {month.unavailableTimes.map((ut) => (
+                                                                    <tr key={ut.id} className="border-t text-gray-400">
+                                                                        <td className="px-3 py-2">{ut.date}</td>
+                                                                        <td className="px-3 py-2 text-center">
+                                                                            <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-500">
+                                                                                {ut.start_time} 〜 {ut.end_time}
+                                                                            </span>
+                                                                        </td>
+                                                                        <td className="px-3 py-2">{ut.reason || '-'}</td>
+                                                                        <td className="px-3 py-2 text-right">
+                                                                            <button
+                                                                                onClick={() => handleDeleteUnavailableTime(ut.id)}
+                                                                                className="text-gray-300 hover:text-red-500"
+                                                                                title="記録を削除"
+                                                                            >
+                                                                                <Trash2 size={16} />
+                                                                            </button>
+                                                                        </td>
+                                                                    </tr>
+                                                                ))}
+                                                            </tbody>
+                                                        </table>
+                                                    </div>
+                                                )}
                                             </div>
-                                        )}
-                                    </>
+                                        </div>
+                                    ))
                                 )}
                             </div>
                         )}
