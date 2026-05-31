@@ -24,6 +24,7 @@ from app.models.patient import Patient
 from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation import Reservation
+from app.models.line_user_state import LineUserState
 from app.models.setting import Setting
 from app.schemas.reservation import ReservationCreate
 from app.services.conflict_detector import check_conflict
@@ -463,6 +464,49 @@ async def _suggest_alternatives(
 
 async def _find_or_create_line_patient(db: AsyncSession, user_id: str, name: str | None) -> Patient:
     return await find_or_create_patient(db, name=name, line_id=user_id)
+
+
+async def _get_or_create_shadow_timetable_patient(db: AsyncSession, user_id: str) -> Patient:
+    """シャドーモードのタイムテーブル登録専用ダミー患者を返す。
+
+    Bot通知や解析には実文面を残すが、stagingの予約ボードには実患者名やline_idを残さない。
+    同じLINEユーザーには同じ「シャドーN」を再利用する。
+    """
+    state_result = await db.execute(
+        select(LineUserState).where(LineUserState.line_user_id == user_id)
+    )
+    state = state_result.scalar_one_or_none()
+    if not state:
+        state = LineUserState(line_user_id=user_id, current_step="idle", context_data={})
+        db.add(state)
+        await db.flush()
+
+    context = dict(state.context_data) if isinstance(state.context_data, dict) else {}
+    shadow_patient_id = context.get("shadow_patient_id")
+    if shadow_patient_id:
+        patient = await db.get(Patient, int(shadow_patient_id))
+        if patient and str(patient.name or "").startswith("シャドー"):
+            return patient
+
+    existing_result = await db.execute(select(Patient).where(Patient.name.like("シャドー%")))
+    max_number = 0
+    for patient in existing_result.scalars().all():
+        match = re.fullmatch(r"シャドー(\d+)", patient.name or "")
+        if match:
+            max_number = max(max_number, int(match.group(1)))
+
+    alias_name = f"シャドー{max_number + 1}"
+    patient = await create_new_patient(
+        db,
+        name=alias_name,
+        line_id=None,
+        notes="LINE shadow timetable dummy patient",
+    )
+    context["shadow_patient_id"] = patient.id
+    context["shadow_patient_name"] = alias_name
+    state.context_data = context
+    await db.flush()
+    return patient
 
 
 async def _find_line_patient(db: AsyncSession, user_id: str) -> Patient | None:
@@ -1062,7 +1106,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                 await reply_to_line(reply_token, "希望枠は満席のため確定できません。代替案を選択してください。")
             return
 
-        patient = await _find_or_create_line_patient(db, user_id, req.get("customer_name"))
+        patient = await _get_or_create_shadow_timetable_patient(db, user_id)
         start_dt = datetime.fromisoformat(req["start_time_iso"])
         end_dt = datetime.fromisoformat(req["end_time_iso"])
 
@@ -1080,7 +1124,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                     start_time=start_dt,
                     end_time=end_dt,
                     channel="LINE",
-                    notes=f"LINE シャドーモード確定 (RID:{rid})",
+                    notes=f"LINE シャドーモード確定 (RID:{rid}) / dummy_patient={patient.name}",
                 ),
             )
         except HTTPException as e:
@@ -1115,19 +1159,27 @@ async def _handle_postback(event: dict, db: AsyncSession):
         await set_user_mode(db, user_id, "idle", rid)
 
         if reservation_status == "CONFIRMED":
-            await push_message(
-                user_id,
-                f"ご予約を確定しました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\nご来院をお待ちしております。",
+            simulated_reply = (
+                f"ご予約を確定しました。\n"
+                f"{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\n"
+                f"ご来院をお待ちしております。"
             )
-            admin_ok_text = f"予約システムに登録し予約完了しました。{date_label} {time_label}〜{duration_minutes}分です。"
+            admin_ok_text = (
+                f"予約システムに登録し予約完了しました。{date_label} {time_label}〜{duration_minutes}分です。"
+                f"\nタイムテーブル表示名: {patient.name}"
+                f"\n[シャドー送信なし/患者返信想定]\n{simulated_reply}"
+            )
         else:
-            await push_message(
-                user_id,
-                f"ご予約リクエストを受け付けました。\n{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\n最終確認後にご案内します。",
+            simulated_reply = (
+                f"ご予約リクエストを受け付けました。\n"
+                f"{start_dt.strftime('%Y/%m/%d %H:%M')}〜{end_dt.strftime('%H:%M')}\n"
+                f"最終確認後にご案内します。"
             )
             admin_ok_text = (
                 f"予約システムには登録しましたが、ステータスは{reservation_status}です。"
                 f" {date_label} {time_label}〜{duration_minutes}分。最終確認をお願いします。"
+                f"\nタイムテーブル表示名: {patient.name}"
+                f"\n[シャドー送信なし/患者返信想定]\n{simulated_reply}"
             )
 
         await push_message(settings.line_admin_user_id, admin_ok_text)
@@ -1149,7 +1201,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
             return
 
         alt = alternatives[alt_index]
-        patient = await _find_or_create_line_patient(db, user_id, req.get("customer_name"))
+        patient = await _get_or_create_shadow_timetable_patient(db, user_id)
 
         # 代案の日時で予約作成
         alt_date = date.fromisoformat(alt["date"])
@@ -1174,7 +1226,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
                     start_time=alt_start_dt,
                     end_time=alt_end_dt,
                     channel="LINE",
-                    notes=f"LINE シャドーモード代案{alt_index + 1} (RID:{rid})",
+                    notes=f"LINE シャドーモード代案{alt_index + 1} (RID:{rid}) / dummy_patient={patient.name}",
                 ),
             )
         except HTTPException as e:
@@ -1209,22 +1261,28 @@ async def _handle_postback(event: dict, db: AsyncSession):
         await set_user_mode(db, user_id, "idle", rid)
 
         if reservation_status == "CONFIRMED":
-            await push_message(
-                user_id,
-                f"ご予約を確定しました。\n{alt_start_dt.strftime('%Y/%m/%d %H:%M')}〜{alt_end_dt.strftime('%H:%M')}\nご来院をお待ちしております。",
+            simulated_reply = (
+                f"ご予約を確定しました。\n"
+                f"{alt_start_dt.strftime('%Y/%m/%d %H:%M')}〜{alt_end_dt.strftime('%H:%M')}\n"
+                f"ご来院をお待ちしております。"
             )
             admin_ok_text = (
                 f"予約システムに登録し予約完了しました。"
                 f"{alt_date_label} {alt_time_label}〜{alt_duration_minutes}分です。"
+                f"\nタイムテーブル表示名: {patient.name}"
+                f"\n[シャドー送信なし/患者返信想定]\n{simulated_reply}"
             )
         else:
-            await push_message(
-                user_id,
-                f"ご予約リクエストを受け付けました。\n{alt_start_dt.strftime('%Y/%m/%d %H:%M')}〜{alt_end_dt.strftime('%H:%M')}\n最終確認後にご案内します。",
+            simulated_reply = (
+                f"ご予約リクエストを受け付けました。\n"
+                f"{alt_start_dt.strftime('%Y/%m/%d %H:%M')}〜{alt_end_dt.strftime('%H:%M')}\n"
+                f"最終確認後にご案内します。"
             )
             admin_ok_text = (
                 f"予約システムには登録しましたが、ステータスは{reservation_status}です。"
                 f" {alt_date_label} {alt_time_label}〜{alt_duration_minutes}分。最終確認をお願いします。"
+                f"\nタイムテーブル表示名: {patient.name}"
+                f"\n[シャドー送信なし/患者返信想定]\n{simulated_reply}"
             )
 
         await push_message(settings.line_admin_user_id, admin_ok_text)

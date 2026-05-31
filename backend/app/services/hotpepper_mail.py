@@ -402,7 +402,11 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
         logger.info(f"重複スキップ: source_ref={parsed['reservation_number']} は登録済み")
         return {"status": "skipped", "reason": "duplicate", "reservation_number": parsed["reservation_number"]}
 
-    patient = await _find_or_create_patient(db, parsed["patient_name"], reading=parsed.get("patient_reading"))
+    # ── シャドーモード: ダミー患者で登録（本番 shadow_mode=False では通らない） ──
+    if settings.shadow_mode:
+        patient = await _get_or_create_hotpepper_dummy_patient(db)
+    else:
+        patient = await _find_or_create_patient(db, parsed["patient_name"], reading=parsed.get("patient_reading"))
     hotpepper_color_id = await _resolve_hotpepper_color_id(db)
 
     # 手動登録済みの同一患者・同一時間枠があれば、HP由来情報をリンクして重複作成しない
@@ -663,6 +667,30 @@ async def _find_or_create_patient(db: AsyncSession, name: str, reading: str | No
     """患者を名前で検索（チャネル横断マッチング）。見つからなければ新規作成。"""
     from app.services.patient_match import find_or_create_patient
     return await find_or_create_patient(db, name=name, reading=reading)
+
+
+async def _get_or_create_hotpepper_dummy_patient(db: AsyncSession) -> Patient:
+    """シャドーモード専用: ホットペッパーN のダミー患者を新規作成して返す。
+
+    毎回新規（HP予約番号単位で別患者）。既存の「ホットペッパーN」の最大番号を探してインクリメント。
+    本番では shadow_mode=False のため絶対に呼ばれない。
+    """
+    import re
+    from app.services.patient_match import create_new_patient
+
+    existing_result = await db.execute(
+        select(Patient).where(Patient.name.like("ホットペッパー%"))
+    )
+    existing = existing_result.scalars().all()
+    max_number = 0
+    for p in existing:
+        m = re.fullmatch(r"ホットペッパー(\d+)", p.name or "")
+        if m:
+            max_number = max(max_number, int(m.group(1)))
+    alias_name = f"ホットペッパー{max_number + 1}"
+    patient = await create_new_patient(db, name=alias_name, line_id=None)
+    logger.info(f"[shadow] HPダミー患者作成: {alias_name}")
+    return patient
 
 
 async def _find_existing_manual_match(
