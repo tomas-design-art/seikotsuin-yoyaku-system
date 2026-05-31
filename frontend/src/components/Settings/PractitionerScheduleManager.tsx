@@ -1,5 +1,5 @@
-import { useState, useEffect, useCallback } from 'react';
-import { Save, Plus, Trash2, AlertTriangle, ArrowRight, X, Clock } from 'lucide-react';
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import { Save, Plus, Trash2, AlertTriangle, ArrowRight, X, Clock, History, ChevronDown, ChevronRight } from 'lucide-react';
 import type { Practitioner, ScheduleOverride, AffectedReservation, WeeklySchedule, UnavailableTime } from '../../types';
 import {
     getPractitioners,
@@ -60,6 +60,9 @@ export default function PractitionerScheduleManager() {
     const [holidayMode, setHolidayMode] = useState('closed');
     const [holidayStartTime, setHolidayStartTime] = useState('09:00');
     const [holidayEndTime, setHolidayEndTime] = useState('13:00');
+
+    // 履歴（過去日付）の開閉
+    const [showHistory, setShowHistory] = useState(false);
 
     useEffect(() => {
         getPractitioners().then((res) => {
@@ -233,6 +236,31 @@ export default function PractitionerScheduleManager() {
     };
 
     const selectedName = practitioners.find((p) => p.id === selectedPractitionerId)?.name || '';
+
+    // 今日（ローカル日付, YYYY-MM-DD）。ISO日付文字列同士は辞書順比較で日付比較が成立する。
+    const todayStr = useMemo(() => {
+        const d = new Date();
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    }, []);
+
+    // 当日以降は通常リスト、過去日付は履歴に振り分ける（データは保持したまま表示のみ切替）。
+    const activeOverrides = useMemo(
+        () => overrides.filter((o) => o.date >= todayStr).sort((a, b) => a.date.localeCompare(b.date)),
+        [overrides, todayStr]
+    );
+    const pastOverrides = useMemo(
+        () => overrides.filter((o) => o.date < todayStr).sort((a, b) => b.date.localeCompare(a.date)),
+        [overrides, todayStr]
+    );
+    const activeUnavailableTimes = useMemo(
+        () => unavailableTimes.filter((ut) => ut.date >= todayStr).sort((a, b) => a.date.localeCompare(b.date) || a.start_time.localeCompare(b.start_time)),
+        [unavailableTimes, todayStr]
+    );
+    const pastUnavailableTimes = useMemo(
+        () => unavailableTimes.filter((ut) => ut.date < todayStr).sort((a, b) => b.date.localeCompare(a.date) || a.start_time.localeCompare(b.start_time)),
+        [unavailableTimes, todayStr]
+    );
+    const pastCount = pastOverrides.length + pastUnavailableTimes.length;
 
     const handleCreateUnavailableTime = async () => {
         if (!selectedPractitionerId || !utDate || !utStartTime || !utEndTime) return;
@@ -426,8 +454,8 @@ export default function PractitionerScheduleManager() {
                             </button>
                         </div>
 
-                        {/* 一覧 */}
-                        {overrides.length === 0 ? (
+                        {/* 一覧（当日以降のみ。過去分は下部の履歴へ） */}
+                        {activeOverrides.length === 0 ? (
                             <p className="text-sm text-gray-400">臨時スケジュールはありません</p>
                         ) : (
                             <table className="w-full text-sm">
@@ -440,7 +468,7 @@ export default function PractitionerScheduleManager() {
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {overrides.map((o) => (
+                                    {activeOverrides.map((o) => (
                                         <tr key={o.id} className="border-t">
                                             <td className="px-3 py-2">{o.date}</td>
                                             <td className="px-3 py-2 text-center">
@@ -525,8 +553,8 @@ export default function PractitionerScheduleManager() {
                             </button>
                         </div>
 
-                        {/* 一覧 */}
-                        {unavailableTimes.length === 0 ? (
+                        {/* 一覧（当日以降のみ。過去分は下部の履歴へ） */}
+                        {activeUnavailableTimes.length === 0 ? (
                             <p className="text-sm text-gray-400">時間帯休みはありません</p>
                         ) : (
                             <table className="w-full text-sm">
@@ -539,7 +567,7 @@ export default function PractitionerScheduleManager() {
                                     </tr>
                                 </thead>
                                 <tbody>
-                                    {unavailableTimes.map((ut) => (
+                                    {activeUnavailableTimes.map((ut) => (
                                         <tr key={ut.id} className="border-t">
                                             <td className="px-3 py-2">{ut.date}</td>
                                             <td className="px-3 py-2 text-center">
@@ -560,6 +588,108 @@ export default function PractitionerScheduleManager() {
                                     ))}
                                 </tbody>
                             </table>
+                        )}
+                    </div>
+
+                    {/* 履歴（過去日付のスケジュール） */}
+                    <div className="bg-white rounded-xl shadow p-5">
+                        <button
+                            onClick={() => setShowHistory((v) => !v)}
+                            className="w-full flex items-center justify-between text-left"
+                        >
+                            <span className="text-lg font-semibold text-gray-700 flex items-center gap-2">
+                                <History size={18} />
+                                {selectedName} — 履歴（過去のスケジュール）
+                                <span className="text-sm font-normal text-gray-400">{pastCount}件</span>
+                            </span>
+                            {showHistory ? <ChevronDown size={20} className="text-gray-400" /> : <ChevronRight size={20} className="text-gray-400" />}
+                        </button>
+                        <p className="text-xs text-gray-400 mt-1">日付が過ぎた臨時休み・臨時出勤・時間帯休みの記録です（自動的にここへ移動します）</p>
+
+                        {showHistory && (
+                            <div className="mt-4 space-y-6">
+                                {pastCount === 0 ? (
+                                    <p className="text-sm text-gray-400">過去の記録はありません</p>
+                                ) : (
+                                    <>
+                                        {pastOverrides.length > 0 && (
+                                            <div>
+                                                <h4 className="text-sm font-semibold text-gray-500 mb-2">臨時休み / 臨時出勤</h4>
+                                                <table className="w-full text-sm">
+                                                    <thead>
+                                                        <tr className="bg-gray-50">
+                                                            <th className="px-3 py-2 text-left">日付</th>
+                                                            <th className="px-3 py-2 text-center">タイプ</th>
+                                                            <th className="px-3 py-2 text-left">理由</th>
+                                                            <th className="px-3 py-2"></th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {pastOverrides.map((o) => (
+                                                            <tr key={o.id} className="border-t text-gray-400">
+                                                                <td className="px-3 py-2">{o.date}</td>
+                                                                <td className="px-3 py-2 text-center">
+                                                                    <span className={`px-2 py-0.5 rounded-full text-xs font-medium ${o.is_working ? 'bg-green-50 text-green-500' : 'bg-red-50 text-red-500'}`}>
+                                                                        {o.is_working ? '臨時出勤' : '臨時休み'}
+                                                                    </span>
+                                                                </td>
+                                                                <td className="px-3 py-2">{o.reason || '-'}</td>
+                                                                <td className="px-3 py-2 text-right">
+                                                                    <button
+                                                                        onClick={() => handleDeleteOverride(o.id)}
+                                                                        className="text-gray-300 hover:text-red-500"
+                                                                        title="記録を削除"
+                                                                    >
+                                                                        <Trash2 size={16} />
+                                                                    </button>
+                                                                </td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        )}
+
+                                        {pastUnavailableTimes.length > 0 && (
+                                            <div>
+                                                <h4 className="text-sm font-semibold text-gray-500 mb-2">時間帯休み</h4>
+                                                <table className="w-full text-sm">
+                                                    <thead>
+                                                        <tr className="bg-gray-50">
+                                                            <th className="px-3 py-2 text-left">日付</th>
+                                                            <th className="px-3 py-2 text-center">時間帯</th>
+                                                            <th className="px-3 py-2 text-left">理由</th>
+                                                            <th className="px-3 py-2"></th>
+                                                        </tr>
+                                                    </thead>
+                                                    <tbody>
+                                                        {pastUnavailableTimes.map((ut) => (
+                                                            <tr key={ut.id} className="border-t text-gray-400">
+                                                                <td className="px-3 py-2">{ut.date}</td>
+                                                                <td className="px-3 py-2 text-center">
+                                                                    <span className="px-2 py-0.5 rounded-full text-xs font-medium bg-amber-50 text-amber-500">
+                                                                        {ut.start_time} 〜 {ut.end_time}
+                                                                    </span>
+                                                                </td>
+                                                                <td className="px-3 py-2">{ut.reason || '-'}</td>
+                                                                <td className="px-3 py-2 text-right">
+                                                                    <button
+                                                                        onClick={() => handleDeleteUnavailableTime(ut.id)}
+                                                                        className="text-gray-300 hover:text-red-500"
+                                                                        title="記録を削除"
+                                                                    >
+                                                                        <Trash2 size={16} />
+                                                                    </button>
+                                                                </td>
+                                                            </tr>
+                                                        ))}
+                                                    </tbody>
+                                                </table>
+                                            </div>
+                                        )}
+                                    </>
+                                )}
+                            </div>
                         )}
                     </div>
                 </>
