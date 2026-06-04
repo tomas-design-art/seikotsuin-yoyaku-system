@@ -51,9 +51,9 @@ export default function HotPepperSync() {
     }
   };
 
-  // 新しい予約を上に表示（start_time 降順）
+  // 直近の予約を上に表示（start_time 昇順: 今日に近いものから処理する）
   const sorted = [...pendingSync].sort(
-    (a, b) => new Date(b.start_time).getTime() - new Date(a.start_time).getTime()
+    (a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
   );
 
   return (
