@@ -65,8 +65,16 @@ async def pending_sync(db: AsyncSession = Depends(get_db)):
     return [build_reservation_response(r) for r in reservations]
 
 
+class MarkSyncedRequest(BaseModel):
+    synced_by: str = "human"  # 'rpa' | 'human'
+
+
 @router.post("/{reservation_id}/mark-synced")
-async def mark_synced(reservation_id: int, db: AsyncSession = Depends(get_db)):
+async def mark_synced(
+    reservation_id: int,
+    body: MarkSyncedRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+):
     """HP側押さえ済みマーク"""
     from app.api.sse import broadcast_event
     from app.models.notification_log import NotificationLog
@@ -81,6 +89,13 @@ async def mark_synced(reservation_id: int, db: AsyncSession = Depends(get_db)):
     reservation = result.scalar_one_or_none()
     if not reservation:
         raise HTTPException(status_code=404, detail="予約が見つかりません")
+
+    synced_by_value = body.synced_by if body else "human"
+    if synced_by_value not in ("rpa", "human"):
+        raise HTTPException(status_code=400, detail="synced_by は 'rpa' か 'human'")
+    # rpa マーク済みなら上書きしない（rpa > human の優先度）
+    if reservation.synced_by != "rpa":
+        reservation.synced_by = synced_by_value
     reservation.hotpepper_synced = True
 
     # 関連するHP押さえリマインド通知を既読に
@@ -110,6 +125,41 @@ async def mark_synced(reservation_id: int, db: AsyncSession = Depends(get_db)):
     })
 
     return {"status": "ok", "reservation_id": reservation_id}
+
+
+@router.get("/reconcile-queue")
+async def reconcile_queue(
+    days: int = 7,
+    db: AsyncSession = Depends(get_db),
+):
+    """RPAによる『直近◯日の取りこぼし救済』用キュー。
+
+    pending-sync と違い hotpepper_synced は無視する。
+    synced_by='rpa' or 'legacy' は除外（RPAが触ったものは確定済み扱い）。
+    残るのは: NULL（未同期・新規予約相当）/ 'human'（人間ポチ消し・要再確認）。
+    RPA側はこのキューとローカル台帳を突き合わせて未処理分だけをRPAする。
+    """
+    from app.utils.datetime_jst import now_jst
+    now = now_jst()
+    horizon = now + timedelta(days=days)
+    result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.channel != "HOTPEPPER",
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.start_time >= now,
+            Reservation.start_time <= horizon,
+            (Reservation.synced_by.is_(None)) | (Reservation.synced_by == "human"),
+        )
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+        )
+        .order_by(Reservation.start_time)
+    )
+    reservations = result.scalars().all()
+    return [build_reservation_response(r) for r in reservations]
 
 
 @router.post("/parse-email", response_model=ParseEmailResponse)

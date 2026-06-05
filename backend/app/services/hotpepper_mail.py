@@ -419,6 +419,7 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
     if existing_manual:
         existing_manual.source_ref = parsed["reservation_number"]
         existing_manual.hotpepper_synced = True
+        existing_manual.synced_by = "rpa"
         existing_manual.color_id = hotpepper_color_id
         existing_manual.notes = (existing_manual.notes or "") + " / HPメール照合: 手動登録済み予約にリンク"
 
@@ -466,6 +467,7 @@ async def _handle_created(db: AsyncSession, parsed: dict) -> dict:
         source_ref=parsed["reservation_number"],
         notes=notes,
         hotpepper_synced=True,
+        synced_by="rpa",
     )
     db.add(reservation)
     await db.flush()

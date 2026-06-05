@@ -44,7 +44,7 @@ export default function HotPepperSync() {
   const markSynced = async (id: number) => {
     setError(null);
     try {
-      await api.post(`/hotpepper/${id}/mark-synced`);
+      await api.post(`/hotpepper/${id}/mark-synced`, { synced_by: 'human' });
       setPendingSync((prev) => prev.filter((r) => r.id !== id));
     } catch (err) {
       setError(extractErrorMessage(err, 'HP同期更新に失敗しました'));
