@@ -21,16 +21,15 @@ export function useNotification() {
   // リロード後: 設定ONなら最初のユーザー操作で AudioContext を自動復元
   useEffect(() => {
     if (!audioInitialized) return;
-    const handler = () => {
-      initAudio();
-      document.removeEventListener('click', handler, { capture: true });
+    const handler = async () => {
+      await initAudio();
     };
     document.addEventListener('click', handler, { capture: true, once: true });
     return () => document.removeEventListener('click', handler, { capture: true });
   }, [audioInitialized]);
 
-  const enableAudio = useCallback(() => {
-    initAudio();
+  const enableAudio = useCallback(async () => {
+    await initAudio();
     setAudioInitialized(true);
     localStorage.setItem(AUDIO_PREF_KEY, 'true');
   }, []);

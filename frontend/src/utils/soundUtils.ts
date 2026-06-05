@@ -4,20 +4,29 @@
 
 let audioContext: AudioContext | null = null;
 
-export function initAudio(): void {
+export async function initAudio(): Promise<void> {
   if (!audioContext) {
     audioContext = new AudioContext();
   }
   if (audioContext.state === 'suspended') {
-    audioContext.resume();
+    await audioContext.resume();
   }
 }
 
-async function playTone(frequency: number, duration: number, volume = 0.3): Promise<void> {
+async function ensureRunning(): Promise<boolean> {
   if (!audioContext) {
-    initAudio();
+    await initAudio();
   }
-  if (!audioContext) return;
+  // suspended のまま resume が間に合っていないケースを再度チェック
+  if (audioContext && audioContext.state === 'suspended') {
+    await audioContext.resume();
+  }
+  return audioContext?.state === 'running';
+}
+
+async function playTone(frequency: number, duration: number, volume = 0.3): Promise<void> {
+  const ready = await ensureRunning();
+  if (!ready || !audioContext) return;
 
   const oscillator = audioContext.createOscillator();
   const gainNode = audioContext.createGain();
@@ -53,8 +62,8 @@ export async function playWarningSound(): Promise<void> {
 }
 
 /** 自動予約着信音（ホットペッパー・ホームページ予約）: メール受信音風の3音チャイム */
-export function playIncomingReservationSound(): void {
-  playTone(660, 0.3, 0.45);
+export async function playIncomingReservationSound(): Promise<void> {
+  await playTone(660, 0.3, 0.45);
   setTimeout(() => playTone(880, 0.3, 0.45), 180);
   setTimeout(() => playTone(1100, 0.55, 0.45), 360);
 }
