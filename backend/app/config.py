@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     hotpepper_poll_max_retries: int = 3
     hotpepper_poll_retry_base_seconds: int = 2
     hotpepper_poll_search_days: int = 1  # IMAP検索対象の過去N日分（既読/未読問わず）
+    rpa_horizon_days: int = 90  # RPA転記対象の上限日数（SalonBoardカレンダー上限）
     notification_retention_days: int = 30
     notification_unread_retention_days: int = 30
     chatbot_allowed_origins: str = ""

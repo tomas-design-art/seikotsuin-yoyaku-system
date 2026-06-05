@@ -1,6 +1,7 @@
 """HotPepper関連API"""
 import logging
 import json
+from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -40,9 +41,10 @@ class ParseEmailResponse(BaseModel):
 
 @router.get("/pending-sync")
 async def pending_sync(db: AsyncSession = Depends(get_db)):
-    """HotPepper側未押さえの予約一覧（現在時刻以降の未来予約のみ）"""
+    """HotPepper側未押さえの予約一覧（現在時刻〜90日先まで／SalonBoardカレンダー上限）"""
     from app.utils.datetime_jst import now_jst
     now = now_jst()
+    horizon = now + timedelta(days=app_settings.rpa_horizon_days)
     result = await db.execute(
         select(Reservation)
         .where(
@@ -50,6 +52,7 @@ async def pending_sync(db: AsyncSession = Depends(get_db)):
             Reservation.channel != "HOTPEPPER",
             Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
             Reservation.start_time >= now,
+            Reservation.start_time <= horizon,
         )
         .options(
             selectinload(Reservation.patient),
