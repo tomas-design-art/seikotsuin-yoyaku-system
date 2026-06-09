@@ -179,7 +179,9 @@ async def web_reserve(body: WebReserveRequest, db: AsyncSession = Depends(get_db
     target_date = desired_dt.date()
     target_time = desired_dt.time().replace(second=0, microsecond=0)
 
-    practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(db, target_date, target_time, duration)
+    practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(
+        db, target_date, target_time, duration, prefer_director=True
+    )
     if not practitioner:
         scored = await score_candidates(db, target_date, target_time, duration, max_results=5)
         iso_alternatives = [
@@ -334,7 +336,9 @@ async def web_chatbot_message(body: WebChatMessageRequest, db: AsyncSession = De
     target_date = date.fromisoformat(draft["date"])
     hh, mm = map(int, str(draft["time"]).split(":"))
     duration = int(draft.get("duration_minutes") or 60)
-    practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(db, target_date, time(hh, mm), duration)
+    practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(
+        db, target_date, time(hh, mm), duration, prefer_director=True
+    )
 
     if practitioner:
         response = (

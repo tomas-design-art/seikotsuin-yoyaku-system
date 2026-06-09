@@ -376,6 +376,7 @@ async def find_best_practitioner(
     target_date: date,
     start_time: time,
     duration_minutes: int,
+    prefer_director: bool = False,
 ) -> tuple[Practitioner | None, datetime, datetime, int, int]:
     """
     指定スロットで最適な施術者を選択。
@@ -418,7 +419,11 @@ async def find_best_practitioner(
         sc = _score(slot_start, slot_start, 0, gb, ga, info.load, max_load)
         ranked_candidates.append((sc, info.practitioner, gb, ga))
 
-    ranked_candidates.sort(key=lambda item: item[0], reverse=True)
+    if prefer_director:
+        # 院長 (role == "院長") を最優先、その中でスコア順。それ以外はスコア順
+        ranked_candidates.sort(key=lambda item: (item[1].role == "院長", item[0]), reverse=True)
+    else:
+        ranked_candidates.sort(key=lambda item: item[0], reverse=True)
 
     # ── DB直接問合せによる最終安全チェック ──
     for _, candidate_prac, gap_before, gap_after in ranked_candidates:
