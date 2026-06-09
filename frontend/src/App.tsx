@@ -89,6 +89,17 @@ function AppContent() {
   const [showConflictAlertModal, setShowConflictAlertModal] = useState(false);
   const [conflictAlertTick, setConflictAlertTick] = useState(0);
 
+  // おもてなし制御（操作中の再読み込み保留用）
+  const pendingRefreshRef = useRef(false);
+  const isOperating = showReservationForm || !!reschedulingReservation || !!selectedReservation || showAdminLogin;
+
+  useEffect(() => {
+    if (!isOperating && pendingRefreshRef.current) {
+      pendingRefreshRef.current = false;
+      setRefreshKey((k) => k + 1);
+    }
+  }, [isOperating]);
+
   const { toasts, unreadCount, audioInitialized, enableAudio, disableAudio, addToast, removeToast, clearUnread } = useNotification();
 
   const handleSSEEvent = useCallback((event: { event_type: string; data: Record<string, unknown> }) => {
@@ -136,8 +147,13 @@ function AppContent() {
     } else {
       addToast(msg, 'info');
     }
-    setRefreshKey((k) => k + 1);
-  }, [addToast]);
+
+    if (showReservationForm || !!reschedulingReservation || !!selectedReservation || showAdminLogin) {
+      pendingRefreshRef.current = true;
+    } else {
+      setRefreshKey((k) => k + 1);
+    }
+  }, [addToast, showReservationForm, reschedulingReservation, selectedReservation, showAdminLogin]);
 
   useSSE(handleSSEEvent);
 

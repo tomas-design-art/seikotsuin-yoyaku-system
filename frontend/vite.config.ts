@@ -10,6 +10,17 @@ export default defineConfig({
     port: 5173,
     allowedHosts: true,
     proxy: {
+      '/api/sse': {
+        target: apiProxyTarget,
+        changeOrigin: true,
+        configure: (proxy) => {
+          proxy.on('proxyRes', (proxyRes, req, res) => {
+            // プロキシでバッファリングを無効化するために、ヘッダーを上書き・追加
+            proxyRes.headers['cache-control'] = 'no-cache, no-transform';
+            proxyRes.headers['connection'] = 'keep-alive';
+          });
+        }
+      },
       '/api': {
         target: apiProxyTarget,
         changeOrigin: true,
