@@ -60,6 +60,9 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   const [isDraggingRescheduleTarget, setIsDraggingRescheduleTarget] = useState(false);
   const rescheduleDragAnchorMinutesRef = useRef(0);
   const gridRef = useRef<HTMLDivElement>(null);
+  // 自動更新（SSE/refreshKey）でデータを再取得した際、閲覧中のスクロール位置を維持するための保持値
+  const pendingScrollRestoreRef = useRef<number | null>(null);
+  const prevRefreshKeyRef = useRef(refreshKey);
   const [slotHeight, setSlotHeight] = useState(DEFAULT_SLOT_HEIGHT);
   const [showCalendar, setShowCalendar] = useState(false);
   const [calendarMonth, setCalendarMonth] = useState<Date>(() => {
@@ -179,6 +182,15 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   useEffect(() => {
     const startDate = viewMode === 'day' ? currentDate : weekDates[0];
     const endDate = viewMode === 'day' ? currentDate : weekDates[6];
+
+    // refreshKey の変化（＝SSE/手動更新による再読み込み）のときだけ、
+    // 現在のスクロール位置を保存して再描画後に復元する。
+    // 日付・表示モード切替時は意図的な遷移なので位置は維持しない。
+    if (prevRefreshKeyRef.current !== refreshKey) {
+      pendingScrollRestoreRef.current = gridRef.current?.scrollTop ?? null;
+      prevRefreshKeyRef.current = refreshKey;
+    }
+
     getReservations({
       start_date: formatDate(startDate),
       end_date: formatDate(endDate),
@@ -193,6 +205,14 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
       end_date: formatDate(endDate),
     }).then((res) => setBusinessHours(res.data ?? [])).catch(() => { });
   }, [currentDate, viewMode, weekDates, refreshKey, activePractitionerIds, reloadPractitionerStatuses]);
+
+  // データ再取得後にスクロール位置を復元（自動更新で見ていた場所を固定）
+  useEffect(() => {
+    if (pendingScrollRestoreRef.current != null && gridRef.current) {
+      gridRef.current.scrollTop = pendingScrollRestoreRef.current;
+      pendingScrollRestoreRef.current = null;
+    }
+  }, [reservations]);
 
   // 施術者トグル
   const togglePractitioner = (id: number) => {

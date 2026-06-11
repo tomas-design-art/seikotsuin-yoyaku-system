@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback } from 'react';
+import { apiBaseURL } from '../api/client';
 
 interface SSEEvent {
   event_type: string;
@@ -15,7 +16,11 @@ export function useSSE(onEvent: (event: SSEEvent) => void) {
       eventSourceRef.current.close();
     }
 
-    const es = new EventSource('/api/sse/events');
+    // SSE は通常 API と同じオリジン（VITE_API_URL / 既定は /api）へ接続する。
+    // ここを相対パス固定にすると、フロントとバックエンドが別ドメインの本番構成で
+    // 静的配信サーバーに繋がってしまい、イベントが一切届かなくなる。
+    const sseUrl = `${apiBaseURL.replace(/\/$/, '')}/sse/events`;
+    const es = new EventSource(sseUrl, { withCredentials: true });
 
     const eventTypes = [
       'new_reservation',
