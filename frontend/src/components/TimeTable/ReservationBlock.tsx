@@ -44,7 +44,7 @@ export default function ReservationBlock({ reservation, onClick, defaultColorCod
         top,
         height: Math.max(height, SLOT_HEIGHT),
         backgroundColor: bgColor,
-        zIndex: 2,
+        zIndex: 9,
         ...(isCancelReq ? { opacity: 0.7, textDecoration: 'line-through', border: '1.5px dashed #6B7280' } : {}),
       }}
       onClick={() => onClick(reservation)}

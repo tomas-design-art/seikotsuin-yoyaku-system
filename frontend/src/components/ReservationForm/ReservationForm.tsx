@@ -244,7 +244,7 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
     setSubmitting(true);
     try {
       if (initialData?.isSingleClick) {
-        const blockAllToday = window.confirm(`本日の担当${practitionerName}の予約枠を全て止めますか？\nOK: 一括ブロック / キャンセル: 選択枠のみブロック`);
+        const blockAllToday = window.confirm(`本日の担当${practitionerName}の予約枠を【終日（1日丸ごと）】止めますか？\n「OK」で本日を終日休み（臨時休み）にします。`);
         if (blockAllToday) {
           await createScheduleOverride({
             practitioner_id: practitionerId,
@@ -259,16 +259,19 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
         }
       }
 
-      await createUnavailableTime({
-        practitioner_id: practitionerId,
-        date,
-        start_time: startTime,
-        end_time: endTime,
-        reason: '枠オサエ',
-      });
-      onSuccess();
-      onClose();
-      resetFormState();
+      const blockThisSlot = window.confirm(`選択された時間帯（${startTime}〜${endTime}）のみを【時間帯休み（枠オサエ）】に設定しますか？\n（「キャンセル」を押すと、何もせずに新規登録に戻ります）`);
+      if (blockThisSlot) {
+        await createUnavailableTime({
+          practitioner_id: practitionerId,
+          date,
+          start_time: startTime,
+          end_time: endTime,
+          reason: '枠オサエ',
+        });
+        onSuccess();
+        onClose();
+        resetFormState();
+      }
     } catch (err: unknown) {
       setError(extractErrorMessage(err, '枠オサエの登録に失敗しました'));
     } finally {
