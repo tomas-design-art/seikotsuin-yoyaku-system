@@ -17,57 +17,37 @@ export function useSSE(onEvent: (event: SSEEvent) => void) {
 
     const es = new EventSource('/api/sse/events');
 
-    es.addEventListener('new_reservation', (e) => {
-      onEventRef.current({ event_type: 'new_reservation', data: JSON.parse(e.data) });
-    });
+    const eventTypes = [
+      'new_reservation',
+      'conflict_detected',
+      'schedule_conflict_alert',
+      'cancel_requested',
+      'change_requested',
+      'reservation_confirmed',
+      'reservation_rejected',
+      'reservation_transferred',
+      'reservation_updated',
+      'cancel_approved',
+      'change_approved',
+      'hold_expired',
+      'hotpepper_import',
+      'line_proposal',
+      'hotpepper_sync_reminder',
+      'hotpepper_hold_reminder',
+      'hotpepper_synced',
+      'unavailable_time_updated',
+      'date_override_updated'
+    ];
 
-    es.addEventListener('conflict_detected', (e) => {
-      onEventRef.current({ event_type: 'conflict_detected', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('cancel_requested', (e) => {
-      onEventRef.current({ event_type: 'cancel_requested', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('change_requested', (e) => {
-      onEventRef.current({ event_type: 'change_requested', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('reservation_confirmed', (e) => {
-      onEventRef.current({ event_type: 'reservation_confirmed', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('cancel_approved', (e) => {
-      onEventRef.current({ event_type: 'cancel_approved', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('change_approved', (e) => {
-      onEventRef.current({ event_type: 'change_approved', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('hold_expired', (e) => {
-      onEventRef.current({ event_type: 'hold_expired', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('hotpepper_import', (e) => {
-      onEventRef.current({ event_type: 'hotpepper_import', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('line_proposal', (e) => {
-      onEventRef.current({ event_type: 'line_proposal', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('hotpepper_sync_reminder', (e) => {
-      onEventRef.current({ event_type: 'hotpepper_sync_reminder', data: JSON.parse(e.data) });
-    });
-
-    // Backward compatibility: old event type
-    es.addEventListener('hotpepper_hold_reminder', (e) => {
-      onEventRef.current({ event_type: 'hotpepper_sync_reminder', data: JSON.parse(e.data) });
-    });
-
-    es.addEventListener('hotpepper_synced', (e) => {
-      onEventRef.current({ event_type: 'hotpepper_synced', data: JSON.parse(e.data) });
+    eventTypes.forEach((eventType) => {
+      es.addEventListener(eventType, (e) => {
+        try {
+          const parsedData = e.data ? JSON.parse(e.data) : {};
+          onEventRef.current({ event_type: eventType, data: parsedData });
+        } catch (err) {
+          console.error(`Failed to parse SSE ${eventType} event data:`, err);
+        }
+      });
     });
 
     es.onerror = () => {

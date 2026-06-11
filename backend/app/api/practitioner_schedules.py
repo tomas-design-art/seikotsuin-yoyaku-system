@@ -420,6 +420,10 @@ async def create_unavailable_time(
         reason=data.reason,
     )
     db.add(ut)
+    await create_notification(
+        db, "unavailable_time_updated",
+        f"時間帯休み登録: {data.date} {data.start_time}-{data.end_time}",
+    )
     await db.commit()
     await db.refresh(ut)
     await _notify_schedule_conflicts_if_any(db)
@@ -438,6 +442,10 @@ async def delete_unavailable_time(
     ut = result.scalar_one_or_none()
     if not ut:
         raise HTTPException(status_code=404, detail="時間帯休みが見つかりません")
+    await create_notification(
+        db, "unavailable_time_updated",
+        f"時間帯休み削除: {ut.date} {ut.start_time}-{ut.end_time}",
+    )
     await db.delete(ut)
     await db.commit()
     return {"ok": True}

@@ -1246,6 +1246,13 @@ async def update_reservation(
 
     for key, value in update_data.items():
         setattr(reservation, key, value)
+
+    patient_name = reservation.patient.name if reservation.patient else "不明"
+    await create_notification(
+        db, "reservation_updated",
+        f"予約変更: {patient_name} #{reservation_id}",
+        reservation_id,
+    )
     await db.commit()
     result2 = await db.execute(
         select(Reservation)

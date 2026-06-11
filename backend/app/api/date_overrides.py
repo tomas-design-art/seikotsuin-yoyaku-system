@@ -7,6 +7,7 @@ from app.database import get_db
 from app.models.date_override import DateOverride
 from app.schemas.date_override import DateOverrideCreate, DateOverrideUpdate, DateOverrideResponse
 from app.api.auth import require_admin
+from app.services.notification_service import create_notification
 
 router = APIRouter(prefix="/api/date-overrides", tags=["date-overrides"])
 
@@ -34,6 +35,10 @@ async def create_date_override(data: DateOverrideCreate, db: AsyncSession = Depe
         label=data.label,
     )
     db.add(override)
+    await create_notification(
+        db, "date_override_updated",
+        f"臨時営業設定登録: {data.date}",
+    )
     await db.commit()
     await db.refresh(override)
     return override
@@ -50,6 +55,10 @@ async def update_date_override(override_id: int, data: DateOverrideUpdate, db: A
     override.open_time = data.open_time
     override.close_time = data.close_time
     override.label = data.label
+    await create_notification(
+        db, "date_override_updated",
+        f"臨時営業設定変更: {override.date}",
+    )
     await db.commit()
     await db.refresh(override)
     return override
@@ -62,6 +71,10 @@ async def delete_date_override(override_id: int, db: AsyncSession = Depends(get_
     if not override:
         raise HTTPException(status_code=404, detail="オーバーライドが見つかりません")
 
+    await create_notification(
+        db, "date_override_updated",
+        f"臨時営業設定削除: {override.date}",
+    )
     await db.delete(override)
     await db.commit()
     return {"ok": True}
