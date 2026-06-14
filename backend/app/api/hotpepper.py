@@ -141,7 +141,9 @@ async def reconcile_queue(
     """
     from app.utils.datetime_jst import now_jst
     now = now_jst()
-    horizon = now + timedelta(days=days)
+    # RPA worker 暴走防止: days はカレンダー上限以内にクランプ
+    effective_days = max(1, min(days, app_settings.rpa_horizon_days))
+    horizon = now + timedelta(days=effective_days)
     result = await db.execute(
         select(Reservation)
         .where(
@@ -160,6 +162,364 @@ async def reconcile_queue(
     )
     reservations = result.scalars().all()
     return [build_reservation_response(r) for r in reservations]
+
+
+def _interleave_by_patient(reservations: list[Reservation]) -> list[Reservation]:
+    """同一患者の連続を可能な限り避けつつ、ほぼ start_time 昇順を保つ並べ替え。
+
+    繰り返し予約の患者が同じ列に固まる現象を緩和し、別患者のRPAを織り交ぜる。
+    アルゴリズム: start_time でソート後、隣接 i と i+1 が同一 patient_id なら
+    後続に別 patient_id があれば前にスワップする貪欲法。
+    """
+    if not reservations:
+        return reservations
+    arr = sorted(reservations, key=lambda r: (r.start_time, r.id))
+    n = len(arr)
+    for i in range(n - 1):
+        cur_pid = arr[i].patient_id
+        if cur_pid is None:
+            continue
+        if arr[i + 1].patient_id != cur_pid:
+            continue
+        # i+1 が同一患者 → i+2..n-1 で別患者を探して i+1 と入れ替え
+        for j in range(i + 2, n):
+            if arr[j].patient_id != cur_pid:
+                arr[i + 1], arr[j] = arr[j], arr[i + 1]
+                break
+    return arr
+
+
+@router.get("/rpa-queue")
+async def rpa_queue(
+    days: int = 30,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+):
+    """RPA worker 専用の最適化キュー。
+
+    /pending-sync との違い:
+    - `days` をクランプ（最小1, 最大 rpa_horizon_days=90）して暴走防止
+    - `limit` で1回のRPAバッチサイズを制限（最大200）
+    - 同一患者が連続しないよう並べ替え（繰り返し予約の固まりを分散）
+    - 繰り返し予約か単発予約かでHP側に差を出さないため series_id/series_info を含めない
+    - HP転記に必要な最小フィールドのみ返す（個人情報最小化）
+    """
+    from app.utils.datetime_jst import now_jst
+    now = now_jst()
+    effective_days = max(1, min(days, app_settings.rpa_horizon_days))
+    effective_limit = max(1, min(limit, 200))
+    horizon = now + timedelta(days=effective_days)
+
+    result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.hotpepper_synced == False,
+            Reservation.channel != "HOTPEPPER",
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.start_time >= now,
+            Reservation.start_time <= horizon,
+            (Reservation.synced_by.is_(None)) | (Reservation.synced_by == "human"),
+        )
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+        )
+        .order_by(Reservation.start_time)
+    )
+    reservations = list(result.scalars().all())
+    ordered = _interleave_by_patient(reservations)[:effective_limit]
+
+    items = []
+    for r in ordered:
+        items.append({
+            "id": r.id,
+            "start_time": r.start_time.isoformat() if r.start_time else None,
+            "end_time": r.end_time.isoformat() if r.end_time else None,
+            "practitioner_id": r.practitioner_id,
+            "practitioner_name": r.practitioner.name if r.practitioner else None,
+            "patient_name": r.patient.name if r.patient else None,
+            "menu_name": r.menu.name if r.menu else None,
+            "duration_minutes": (
+                int((r.end_time - r.start_time).total_seconds() // 60)
+                if r.start_time and r.end_time else None
+            ),
+            "channel": r.channel,
+        })
+    return {
+        "total_returned": len(items),
+        "days_horizon": effective_days,
+        "limit_applied": effective_limit,
+        "items": items,
+    }
+
+
+@router.get("/stats")
+async def hotpepper_stats(db: AsyncSession = Depends(get_db)):
+    """HP同期の集計値（シリーズ vs 単発の内訳など）。
+
+    UI影響を出さないため `/pending-sync` 本体には触らず、別エンドポイントで提供。
+    AI/開発者が「シリーズ予約だけ詰まっているか」を即座に確認できる。
+    """
+    from app.utils.datetime_jst import now_jst
+    from sqlalchemy import func as sql_func
+
+    now = now_jst()
+    horizon_90 = now + timedelta(days=app_settings.rpa_horizon_days)
+
+    base_filters = [
+        Reservation.hotpepper_synced == False,
+        Reservation.channel != "HOTPEPPER",
+        Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+        Reservation.start_time >= now,
+    ]
+
+    # 90日内の合計と、シリーズ有無別の内訳
+    total_90 = (await db.execute(
+        select(sql_func.count(Reservation.id))
+        .where(*base_filters, Reservation.start_time <= horizon_90)
+    )).scalar() or 0
+    series_90 = (await db.execute(
+        select(sql_func.count(Reservation.id))
+        .where(*base_filters, Reservation.start_time <= horizon_90, Reservation.series_id.isnot(None))
+    )).scalar() or 0
+    standalone_90 = total_90 - series_90
+
+    # 直近ウィンドウ別件数
+    horizon_30 = now + timedelta(days=30)
+    horizon_7 = now + timedelta(days=7)
+    pending_30 = (await db.execute(
+        select(sql_func.count(Reservation.id))
+        .where(*base_filters, Reservation.start_time <= horizon_30)
+    )).scalar() or 0
+    pending_7 = (await db.execute(
+        select(sql_func.count(Reservation.id))
+        .where(*base_filters, Reservation.start_time <= horizon_7)
+    )).scalar() or 0
+
+    # horizon を超える未押さえ件数（リマインダー値との差分検証用）
+    total_all_future = (await db.execute(
+        select(sql_func.count(Reservation.id))
+        .where(*base_filters)
+    )).scalar() or 0
+
+    return {
+        "now": now.isoformat(),
+        "horizon_days": app_settings.rpa_horizon_days,
+        "pending_within_90d": total_90,
+        "pending_within_30d": pending_30,
+        "pending_within_7d": pending_7,
+        "pending_beyond_horizon": max(0, total_all_future - total_90),
+        "series_within_90d": series_90,
+        "standalone_within_90d": standalone_90,
+        "series_ratio_pct": (round(series_90 * 100 / total_90, 1) if total_90 else 0.0),
+    }
+
+
+@router.get("/health")
+async def hotpepper_health(db: AsyncSession = Depends(get_db)):
+    """HP/RPA系の自己診断ダッシュボード（AI/開発者向け）。
+
+    rpa_call_logs と pending予約から「RPA workerが生きているか」「詰まりの傾向」を
+    1リクエストで返す。運用画面には出さない。
+    """
+    from app.utils.datetime_jst import now_jst
+    from sqlalchemy import func as sql_func
+    from app.models.rpa_call_log import RpaCallLog
+
+    now = now_jst()
+    horizon_90 = now + timedelta(days=app_settings.rpa_horizon_days)
+    last_24h = now - timedelta(hours=24)
+
+    base_filters = [
+        Reservation.hotpepper_synced == False,
+        Reservation.channel != "HOTPEPPER",
+        Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+        Reservation.start_time >= now,
+    ]
+
+    pending_total = (await db.execute(
+        select(sql_func.count(Reservation.id)).where(*base_filters)
+    )).scalar() or 0
+    pending_90 = (await db.execute(
+        select(sql_func.count(Reservation.id))
+        .where(*base_filters, Reservation.start_time <= horizon_90)
+    )).scalar() or 0
+    pending_7 = (await db.execute(
+        select(sql_func.count(Reservation.id))
+        .where(*base_filters, Reservation.start_time <= now + timedelta(days=7))
+    )).scalar() or 0
+
+    # 最も古い (created_at が古い) pending 予約を1件
+    oldest_q = await db.execute(
+        select(Reservation)
+        .where(*base_filters, Reservation.start_time <= horizon_90)
+        .options(selectinload(Reservation.patient))
+        .order_by(Reservation.created_at.asc())
+        .limit(1)
+    )
+    oldest = oldest_q.scalar_one_or_none()
+    oldest_summary = None
+    if oldest is not None:
+        age_days = (now - oldest.created_at).days if oldest.created_at else None
+        oldest_summary = {
+            "id": oldest.id,
+            "created_at": oldest.created_at.isoformat() if oldest.created_at else None,
+            "start_time": oldest.start_time.isoformat() if oldest.start_time else None,
+            "age_days": age_days,
+            "is_series": oldest.series_id is not None,
+        }
+
+    # RPA worker 呼び出し履歴（直近24h）
+    call_counts: dict[str, int] = {}
+    rows = (await db.execute(
+        select(RpaCallLog.endpoint, sql_func.count(RpaCallLog.id))
+        .where(RpaCallLog.timestamp >= last_24h)
+        .group_by(RpaCallLog.endpoint)
+    )).all()
+    for endpoint, cnt in rows:
+        call_counts[endpoint] = int(cnt)
+
+    # rpa-queue / pending-sync 最終呼び出し
+    last_queue_row = (await db.execute(
+        select(RpaCallLog)
+        .where(RpaCallLog.endpoint.in_([
+            "/api/hotpepper/rpa-queue",
+            "/api/hotpepper/pending-sync",
+            "/api/hotpepper/reconcile-queue",
+        ]))
+        .order_by(RpaCallLog.timestamp.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    last_queue_info = None
+    if last_queue_row is not None:
+        last_queue_info = {
+            "endpoint": last_queue_row.endpoint,
+            "timestamp": last_queue_row.timestamp.isoformat() if last_queue_row.timestamp else None,
+            "status_code": last_queue_row.status_code,
+            "response_count": last_queue_row.response_count,
+            "duration_ms": last_queue_row.duration_ms,
+            "minutes_since": (
+                int((now - last_queue_row.timestamp).total_seconds() // 60)
+                if last_queue_row.timestamp else None
+            ),
+        }
+
+    # mark-synced 呼び出し回数（直近24h、synced_by 別）
+    mark_rows = (await db.execute(
+        select(RpaCallLog)
+        .where(
+            RpaCallLog.endpoint.like("/api/hotpepper/%/mark-synced"),
+            RpaCallLog.timestamp >= last_24h,
+        )
+    )).scalars().all()
+    mark_counts = {"rpa": 0, "human": 0, "unknown": 0}
+    for r in mark_rows:
+        synced_by = None
+        if isinstance(r.body_summary, dict):
+            synced_by = r.body_summary.get("synced_by")
+        if synced_by == "rpa":
+            mark_counts["rpa"] += 1
+        elif synced_by == "human":
+            mark_counts["human"] += 1
+        else:
+            mark_counts["unknown"] += 1
+
+    # 詰まり候補（7日以内開始 & created 7日以上前）
+    stuck_q = await db.execute(
+        select(Reservation)
+        .where(
+            *base_filters,
+            Reservation.start_time <= now + timedelta(days=7),
+            Reservation.created_at <= now - timedelta(days=7),
+        )
+        .options(selectinload(Reservation.patient))
+        .order_by(Reservation.start_time.asc())
+        .limit(10)
+    )
+    stuck_candidates = []
+    for r in stuck_q.scalars().all():
+        stuck_candidates.append({
+            "id": r.id,
+            "start_time": r.start_time.isoformat() if r.start_time else None,
+            "age_days": ((now - r.created_at).days if r.created_at else None),
+            "is_series": r.series_id is not None,
+        })
+
+    # RPA 死亡判定（rpa-queue/pending-sync が直近1hに無い）
+    rpa_alive = False
+    if last_queue_info and last_queue_info.get("minutes_since") is not None:
+        rpa_alive = last_queue_info["minutes_since"] < 60
+
+    return {
+        "now": now.isoformat(),
+        "pending_total_future": pending_total,
+        "pending_within_90d": pending_90,
+        "pending_within_7d": pending_7,
+        "oldest_pending": oldest_summary,
+        "rpa_call_counts_last_24h": call_counts,
+        "last_queue_call": last_queue_info,
+        "mark_synced_calls_last_24h": mark_counts,
+        "rpa_worker_alive": rpa_alive,
+        "stuck_candidates": stuck_candidates,
+    }
+
+
+@router.get("/diagnose/{reservation_id}")
+async def hotpepper_diagnose(reservation_id: int, db: AsyncSession = Depends(get_db)):
+    """特定予約が pending-sync に残っている理由を返す診断 API。"""
+    from app.utils.datetime_jst import now_jst
+
+    now = now_jst()
+    result = await db.execute(
+        select(Reservation)
+        .where(Reservation.id == reservation_id)
+        .options(selectinload(Reservation.patient), selectinload(Reservation.practitioner))
+    )
+    reservation = result.scalar_one_or_none()
+    if not reservation:
+        raise HTTPException(status_code=404, detail="予約が見つかりません")
+
+    reasons = []
+    if not reservation.hotpepper_synced:
+        reasons.append("hotpepper_synced=false")
+    if reservation.synced_by is None:
+        reasons.append("synced_by=null")
+    elif reservation.synced_by == "human":
+        reasons.append("synced_by=human（要再確認）")
+    if reservation.channel == "HOTPEPPER":
+        reasons.append("channel=HOTPEPPER（同期対象外）")
+    if reservation.start_time and reservation.start_time < now:
+        reasons.append("start_time が過去（pending-sync 対象外）")
+    horizon_90 = now + timedelta(days=app_settings.rpa_horizon_days)
+    if reservation.start_time and reservation.start_time > horizon_90:
+        reasons.append(f"start_time が horizon({app_settings.rpa_horizon_days}日)を超える")
+
+    currently_in_pending = (
+        not reservation.hotpepper_synced
+        and reservation.channel != "HOTPEPPER"
+        and reservation.status in ("CONFIRMED", "PENDING", "HOLD")
+        and reservation.start_time is not None
+        and reservation.start_time >= now
+        and reservation.start_time <= horizon_90
+    )
+
+    age_days = (now - reservation.created_at).days if reservation.created_at else None
+
+    return {
+        "reservation_id": reservation_id,
+        "currently_in_pending_sync": currently_in_pending,
+        "reasons": reasons,
+        "hotpepper_synced": reservation.hotpepper_synced,
+        "synced_by": reservation.synced_by,
+        "channel": reservation.channel,
+        "status": reservation.status,
+        "start_time": reservation.start_time.isoformat() if reservation.start_time else None,
+        "created_at": reservation.created_at.isoformat() if reservation.created_at else None,
+        "age_days": age_days,
+        "series_id": reservation.series_id,
+        "is_series": reservation.series_id is not None,
+    }
 
 
 @router.post("/parse-email", response_model=ParseEmailResponse)
