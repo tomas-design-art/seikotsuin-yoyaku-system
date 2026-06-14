@@ -38,11 +38,11 @@ type PendingRescheduleTarget = {
 const OPERATOR_STORAGE_KEY = 'operator';
 const OPERATOR_CANDIDATES = ['上田', '出口', '時田'];
 
-function NavLink({ to, children, locked }: { to: string; children: React.ReactNode; locked?: boolean }) {
+function NavLink({ to, children, locked, onClick }: { to: string; children: React.ReactNode; locked?: boolean; onClick?: () => void }) {
   const location = useLocation();
   const active = location.pathname === to || (to !== '/' && location.pathname.startsWith(to));
   return (
-    <Link to={to} className={`px-3 py-2 rounded text-sm font-medium flex items-center gap-1 ${active ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:bg-gray-100'}`}>
+    <Link to={to} onClick={onClick} className={`px-3 py-2 rounded text-sm font-medium flex items-center gap-1 whitespace-nowrap ${active ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:bg-gray-100'}`}>
       {children}
       {locked && <Lock size={12} className="text-gray-400" />}
     </Link>
@@ -88,6 +88,10 @@ function AppContent() {
   // 休暇かぶり予約アラート: モーダル表示 / 再フェッチtick
   const [showConflictAlertModal, setShowConflictAlertModal] = useState(false);
   const [conflictAlertTick, setConflictAlertTick] = useState(0);
+
+  // モバイル: ハンバーガーメニュー開閉
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const closeMobileMenu = useCallback(() => setMobileMenuOpen(false), []);
 
   // おもてなし制御（操作中の再読み込み保留用）
   const pendingRefreshRef = useRef(false);
@@ -321,6 +325,11 @@ function AppContent() {
     }
   }, [location.pathname, isTimeTableFullscreen, exitTimeTableFullscreen]);
 
+  // ルート変更時にモバイルメニューを閉じる
+  useEffect(() => {
+    setMobileMenuOpen(false);
+  }, [location.pathname]);
+
   const showAppHeader = !(location.pathname === '/timetable' && isTimeTableFullscreen);
 
   const handleOperatorSwitch = () => {
@@ -337,10 +346,11 @@ function AppContent() {
       {/* Header */}
       {showAppHeader && (
         <header className="bg-white shadow-sm border-b z-20">
-          <div className="flex items-center justify-between px-4 py-2">
-            <div className="flex items-center gap-4">
-              <h1 className="text-lg font-bold text-gray-900">🦴 予約管理</h1>
-              <nav className="flex items-center gap-1">
+          <div className="flex items-center justify-between px-4 py-2 gap-2">
+            <div className="flex items-center gap-4 min-w-0 flex-1">
+              <h1 className="text-lg font-bold text-gray-900 whitespace-nowrap shrink-0">🦴 予約管理</h1>
+              {/* デスクトップ用ナビ (md以上で表示) */}
+              <nav className="hidden md:flex items-center gap-1 flex-wrap">
                 <NavLink to="/timetable"><Calendar size={16} className="inline mr-1" />タイムテーブル</NavLink>
                 <NavLink to="/patients" locked={role !== 'staff' && role !== 'admin'}><Users size={16} className="inline mr-1" />患者</NavLink>
                 <AdminNavLink to="/settings/practitioners" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
@@ -369,12 +379,12 @@ function AppContent() {
               </nav>
             </div>
             <div className="flex items-center gap-2">
-              <div className="flex items-center gap-1 text-sm text-gray-700 bg-gray-100 px-2 py-1 rounded">
+              <div className="hidden sm:flex items-center gap-1 text-sm text-gray-700 bg-gray-100 px-2 py-1 rounded">
                 <Users size={14} />
                 <span>{operatorName || '未選択'}</span>
               </div>
               {isAdmin && (
-                <div className="flex items-center gap-1 text-sm text-green-700 bg-green-50 px-2 py-1 rounded">
+                <div className="hidden sm:flex items-center gap-1 text-sm text-green-700 bg-green-50 px-2 py-1 rounded">
                   <Unlock size={14} />
                   <span>管理者</span>
                 </div>
@@ -397,8 +407,64 @@ function AppContent() {
               >
                 <LogOut size={18} />
               </button>
+              {/* モバイル用ハンバーガーボタン (md未満で表示) */}
+              <button
+                onClick={() => setMobileMenuOpen((v) => !v)}
+                className="md:hidden p-2 rounded text-gray-600 hover:bg-gray-100"
+                title={mobileMenuOpen ? 'メニューを閉じる' : 'メニューを開く'}
+                aria-expanded={mobileMenuOpen}
+                aria-label="ナビゲーションメニュー"
+              >
+                {mobileMenuOpen ? <X size={20} /> : <MenuIcon size={20} />}
+              </button>
             </div>
           </div>
+
+          {/* モバイル用ドロップダウンメニュー */}
+          {mobileMenuOpen && (
+            <div className="md:hidden border-t bg-white shadow-inner">
+              <nav className="flex flex-col px-3 py-2 gap-1">
+                {/* スマホでは省略していた操作者・管理者バッジもここに表示 */}
+                <div className="flex items-center gap-2 px-1 pb-2 border-b mb-2 sm:hidden">
+                  <div className="flex items-center gap-1 text-sm text-gray-700 bg-gray-100 px-2 py-1 rounded">
+                    <Users size={14} />
+                    <span>{operatorName || '未選択'}</span>
+                  </div>
+                  {isAdmin && (
+                    <div className="flex items-center gap-1 text-sm text-green-700 bg-green-50 px-2 py-1 rounded">
+                      <Unlock size={14} />
+                      <span>管理者</span>
+                    </div>
+                  )}
+                </div>
+                <NavLink to="/timetable" onClick={closeMobileMenu}><Calendar size={16} className="inline mr-1" />タイムテーブル</NavLink>
+                <NavLink to="/patients" locked={role !== 'staff' && role !== 'admin'} onClick={closeMobileMenu}><Users size={16} className="inline mr-1" />患者</NavLink>
+                <AdminNavLink to="/settings/practitioners" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
+                  <Stethoscope size={16} className="inline mr-1" />施術者
+                </AdminNavLink>
+                <AdminNavLink to="/settings/menus" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
+                  <MenuIcon size={16} className="inline mr-1" />メニュー
+                </AdminNavLink>
+                <AdminNavLink to="/settings/colors" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
+                  <Palette size={16} className="inline mr-1" />色設定
+                </AdminNavLink>
+                <AdminNavLink to="/settings/chatbot" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
+                  <Bot size={16} className="inline mr-1" />チャットボット
+                </AdminNavLink>
+                <AdminNavLink to="/settings/schedule" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
+                  <CalendarDays size={16} className="inline mr-1" />院営業スケジュール
+                </AdminNavLink>
+                <NavLink to="/settings/practitioner-schedules" onClick={closeMobileMenu}><CalendarDays size={16} className="inline mr-1" />職員勤務スケジュール</NavLink>
+                <AdminNavLink to="/settings/audit-logs" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
+                  <Settings size={16} className="inline mr-1" />監査ログ
+                </AdminNavLink>
+                <AdminNavLink to="/settings" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
+                  <Settings size={16} className="inline mr-1" />設定
+                </AdminNavLink>
+                <NavLink to="/hotpepper" onClick={closeMobileMenu}>🔥 HP同期</NavLink>
+              </nav>
+            </div>
+          )}
         </header>
       )}
 
@@ -575,11 +641,12 @@ function PatientAccessGate() {
   return <PatientList />;
 }
 
-function AdminNavLink({ to, isAdmin, onRequireAdmin, children }: {
+function AdminNavLink({ to, isAdmin, onRequireAdmin, children, onNavigate }: {
   to: string;
   isAdmin: boolean;
   onRequireAdmin: (path: string) => void;
   children: React.ReactNode;
+  onNavigate?: () => void;
 }) {
   const location = useLocation();
   const active = location.pathname === to || (to !== '/' && location.pathname.startsWith(to));
@@ -588,14 +655,16 @@ function AdminNavLink({ to, isAdmin, onRequireAdmin, children }: {
     if (!isAdmin) {
       e.preventDefault();
       onRequireAdmin(to);
+      return;
     }
+    onNavigate?.();
   };
 
   return (
     <Link
       to={isAdmin ? to : '#'}
       onClick={handleClick}
-      className={`px-3 py-2 rounded text-sm font-medium flex items-center gap-1 ${active ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:bg-gray-100'}`}
+      className={`px-3 py-2 rounded text-sm font-medium flex items-center gap-1 whitespace-nowrap ${active ? 'bg-blue-100 text-blue-700' : 'text-gray-600 hover:bg-gray-100'}`}
     >
       {children}
       {!isAdmin && <Lock size={12} className="text-gray-400" />}
