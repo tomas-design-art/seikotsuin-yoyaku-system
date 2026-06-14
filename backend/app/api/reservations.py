@@ -114,6 +114,66 @@ async def _safe_log_action(
         logger.warning("audit_log_write_failed operator=%s action=%s err=%s", operator, action, e)
 
 
+def _audit_snapshot_from_dict(d: dict | None) -> dict:
+    """`build_reservation_response` 由来の dict から監査ログ用の最小スナップショットを作る。
+
+    後から「いつ・誰の・どの時間枠の予約か」を必ず追えるようにする。
+    （患者氏名/予約時刻はセンシティブ情報のため、監査ログ閲覧者＝管理者前提）
+    """
+    if not d:
+        return {}
+    snap: dict = {}
+    try:
+        start = d.get("start_time")
+        end = d.get("end_time")
+        if hasattr(start, "astimezone"):
+            snap["start_time"] = start.astimezone(_JST).isoformat()
+        elif isinstance(start, str):
+            snap["start_time"] = start
+        if hasattr(end, "astimezone"):
+            snap["end_time"] = end.astimezone(_JST).isoformat()
+        elif isinstance(end, str):
+            snap["end_time"] = end
+        snap["practitioner_name"] = d.get("practitioner_name")
+        patient = d.get("patient") or {}
+        if isinstance(patient, dict):
+            snap["patient_name"] = patient.get("name")
+            snap["patient_id"] = patient.get("id")
+        menu = d.get("menu") or {}
+        if isinstance(menu, dict):
+            snap["menu_name"] = menu.get("name")
+        snap["channel"] = d.get("channel")
+        snap["status"] = d.get("status")
+    except Exception:  # noqa: BLE001
+        pass
+    return snap
+
+
+def _audit_snapshot_from_model(r) -> dict:
+    """Reservation ORM から監査ログ用スナップショットを作る。"""
+    if r is None:
+        return {}
+    snap: dict = {}
+    try:
+        if r.start_time:
+            snap["start_time"] = r.start_time.astimezone(_JST).isoformat()
+        if r.end_time:
+            snap["end_time"] = r.end_time.astimezone(_JST).isoformat()
+        snap["practitioner_id"] = r.practitioner_id
+        if getattr(r, "practitioner", None):
+            snap["practitioner_name"] = r.practitioner.name
+        if getattr(r, "patient", None):
+            snap["patient_name"] = r.patient.name
+            snap["patient_id"] = r.patient.id
+        if getattr(r, "menu", None):
+            snap["menu_name"] = r.menu.name
+        snap["channel"] = r.channel
+        snap["status"] = r.status
+    except Exception:  # noqa: BLE001
+        pass
+    return snap
+
+
 @router.get("/conflicts")
 async def list_conflicts(db: AsyncSession = Depends(get_db)):
     """競合予約一覧"""
@@ -283,7 +343,11 @@ async def create_reservation_endpoint(
         _operator_label(x_operator),
         created.get("id"),
     )
-    await _safe_log_action(db, x_operator, "CREATE_RESERVATION", created.get("id"))
+    await _safe_log_action(
+        db, x_operator, "CREATE_RESERVATION",
+        target_id=created.get("id"),
+        detail=_audit_snapshot_from_dict(created),
+    )
     return created
 
 
@@ -1210,11 +1274,18 @@ async def update_reservation(
     x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     result = await db.execute(
-        select(Reservation).where(Reservation.id == reservation_id)
+        select(Reservation)
+        .where(Reservation.id == reservation_id)
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+        )
     )
     reservation = result.scalar_one_or_none()
     if not reservation:
         raise HTTPException(status_code=404, detail="予約が見つかりません")
+    before_snapshot = _audit_snapshot_from_model(reservation)
 
     update_data = data.model_dump(exclude_unset=True)
 
@@ -1270,7 +1341,11 @@ async def update_reservation(
         _operator_label(x_operator),
         reservation_id,
     )
-    await _safe_log_action(db, x_operator, "UPDATE_RESERVATION", reservation_id)
+    after_snapshot = _audit_snapshot_from_model(reservation)
+    await _safe_log_action(
+        db, x_operator, "UPDATE_RESERVATION", reservation_id,
+        detail={"before": before_snapshot, "after": after_snapshot},
+    )
     return build_reservation_response(reservation)
 
 
@@ -1369,7 +1444,10 @@ async def cancel_request(
         _operator_label(x_operator),
         reservation_id,
     )
-    await _safe_log_action(db, x_operator, "CANCEL_REQUEST", reservation_id)
+    await _safe_log_action(
+        db, x_operator, "CANCEL_REQUEST", reservation_id,
+        detail=_audit_snapshot_from_model(reservation),
+    )
     return build_reservation_response(reservation)
 
 
@@ -1409,7 +1487,10 @@ async def cancel_approve(
         _operator_label(x_operator),
         reservation_id,
     )
-    await _safe_log_action(db, x_operator, "CANCEL_APPROVE", reservation_id)
+    await _safe_log_action(
+        db, x_operator, "CANCEL_APPROVE", reservation_id,
+        detail=_audit_snapshot_from_model(reservation),
+    )
     return build_reservation_response(reservation)
 
 
@@ -1457,6 +1538,18 @@ async def reschedule(
     db: AsyncSession = Depends(get_db),
     x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
+    before_result = await db.execute(
+        select(Reservation)
+        .where(Reservation.id == reservation_id)
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+        )
+    )
+    before_reservation = before_result.scalar_one_or_none()
+    before_snapshot = _audit_snapshot_from_model(before_reservation)
+
     response = await reschedule_reservation(
         db, reservation_id,
         body.new_start_time, body.new_end_time,
@@ -1467,5 +1560,9 @@ async def reschedule(
         _operator_label(x_operator),
         reservation_id,
     )
-    await _safe_log_action(db, x_operator, "RESCHEDULE_RESERVATION", reservation_id)
+    after_snapshot = _audit_snapshot_from_dict(response if isinstance(response, dict) else None)
+    await _safe_log_action(
+        db, x_operator, "RESCHEDULE_RESERVATION", reservation_id,
+        detail={"before": before_snapshot, "after": after_snapshot},
+    )
     return response

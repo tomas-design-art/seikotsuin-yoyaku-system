@@ -2,8 +2,9 @@
 import logging
 import zoneinfo
 from datetime import date, datetime
+from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from sqlalchemy import select, and_, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -37,9 +38,47 @@ from app.services.conflict_detector import ACTIVE_STATUSES
 from app.services.notification_service import create_notification
 from app.services.reservation_service import build_reservation_response
 from app.services.schedule_conflict_alerts import collect_schedule_conflict_alerts
+from app.services.audit_log_service import log_action
 from app.api.sse import broadcast_event
 
 logger = logging.getLogger(__name__)
+
+
+def _operator_label(x_operator: Optional[str]) -> str:
+    if not x_operator:
+        return "unknown"
+    raw = x_operator.strip()
+    if not raw:
+        return "unknown"
+    try:
+        from urllib.parse import unquote
+        decoded = unquote(raw)
+        if decoded:
+            raw = decoded
+    except Exception:
+        pass
+    return raw[:64]
+
+
+async def _safe_log_action(
+    db: AsyncSession,
+    x_operator: Optional[str],
+    action: str,
+    target_id: int | None = None,
+    detail: dict | None = None,
+) -> None:
+    try:
+        await log_action(
+            db,
+            operator=_operator_label(x_operator),
+            action=action,
+            target_id=target_id,
+            detail=detail,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "audit_log_write_failed action=%s err=%s", action, e
+        )
 router = APIRouter(prefix="/api/practitioner-schedules", tags=["practitioner-schedules"])
 
 HOLIDAY_DAY_OF_WEEK = 7
@@ -195,6 +234,7 @@ async def list_overrides(
 async def create_override(
     data: ScheduleOverrideCreate,
     db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """臨時休み/出勤を登録（スタッフ共通・権限不要）"""
     # 同一施術者・同日のオーバーライドがあれば更新
@@ -212,6 +252,16 @@ async def create_override(
         existing.reason = data.reason
         await db.commit()
         await db.refresh(existing)
+        await _safe_log_action(
+            db, x_operator, "UPDATE_SCHEDULE_OVERRIDE",
+            target_id=existing.id,
+            detail={
+                "practitioner_id": data.practitioner_id,
+                "date": str(data.date),
+                "is_working": data.is_working,
+                "reason": data.reason,
+            },
+        )
         if not data.is_working:
             await _notify_schedule_conflicts_if_any(db)
         return existing
@@ -225,6 +275,16 @@ async def create_override(
     db.add(override)
     await db.commit()
     await db.refresh(override)
+    await _safe_log_action(
+        db, x_operator, "CREATE_SCHEDULE_OVERRIDE",
+        target_id=override.id,
+        detail={
+            "practitioner_id": data.practitioner_id,
+            "date": str(data.date),
+            "is_working": data.is_working,
+            "reason": data.reason,
+        },
+    )
     # 休暇登録なら被り予約をチェックして通知
     if not data.is_working:
         await _notify_schedule_conflicts_if_any(db)
@@ -235,6 +295,7 @@ async def create_override(
 async def delete_override(
     override_id: int,
     db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """臨時休み/出勤を削除（スタッフ共通・権限不要）"""
     result = await db.execute(
@@ -243,8 +304,18 @@ async def delete_override(
     override = result.scalar_one_or_none()
     if not override:
         raise HTTPException(status_code=404, detail="オーバーライドが見つかりません")
+    snapshot = {
+        "practitioner_id": override.practitioner_id,
+        "date": str(override.date),
+        "is_working": override.is_working,
+        "reason": override.reason,
+    }
     await db.delete(override)
     await db.commit()
+    await _safe_log_action(
+        db, x_operator, "DELETE_SCHEDULE_OVERRIDE",
+        target_id=override_id, detail=snapshot,
+    )
     return {"ok": True}
 
 
@@ -410,6 +481,7 @@ async def list_unavailable_times(
 async def create_unavailable_time(
     data: UnavailableTimeCreate,
     db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """時間帯休みを登録（スタッフ共通・権限不要）"""
     ut = PractitionerUnavailableTime(
@@ -426,6 +498,17 @@ async def create_unavailable_time(
     )
     await db.commit()
     await db.refresh(ut)
+    await _safe_log_action(
+        db, x_operator, "CREATE_UNAVAILABLE_TIME",
+        target_id=ut.id,
+        detail={
+            "practitioner_id": data.practitioner_id,
+            "date": str(data.date),
+            "start_time": data.start_time,
+            "end_time": data.end_time,
+            "reason": data.reason,
+        },
+    )
     await _notify_schedule_conflicts_if_any(db)
     return ut
 
@@ -434,6 +517,7 @@ async def create_unavailable_time(
 async def delete_unavailable_time(
     ut_id: int,
     db: AsyncSession = Depends(get_db),
+    x_operator: Optional[str] = Header(None, alias="X-Operator"),
 ):
     """時間帯休みを削除（スタッフ共通・権限不要）"""
     result = await db.execute(
@@ -442,12 +526,23 @@ async def delete_unavailable_time(
     ut = result.scalar_one_or_none()
     if not ut:
         raise HTTPException(status_code=404, detail="時間帯休みが見つかりません")
+    snapshot = {
+        "practitioner_id": ut.practitioner_id,
+        "date": str(ut.date),
+        "start_time": ut.start_time,
+        "end_time": ut.end_time,
+        "reason": ut.reason,
+    }
     await create_notification(
         db, "unavailable_time_updated",
         f"時間帯休み削除: {ut.date} {ut.start_time}-{ut.end_time}",
     )
     await db.delete(ut)
     await db.commit()
+    await _safe_log_action(
+        db, x_operator, "DELETE_UNAVAILABLE_TIME",
+        target_id=ut_id, detail=snapshot,
+    )
     return {"ok": True}
 
 
