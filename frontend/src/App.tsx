@@ -147,7 +147,12 @@ function AppContent() {
       ['HOTPEPPER', 'CHATBOT', 'WEB'].includes(event.data.channel as string)
     ) {
       // 自動予約（ホットペッパー・ホームページ）: 着信音付きで通知
-      addToast(msg, 'incoming');
+      const channel = event.data.channel as string;
+      if (channel === 'HOTPEPPER') {
+        addToast(msg, 'incoming', 'hotpepper');
+      } else {
+        addToast(msg, 'incoming', 'web');
+      }
     } else {
       addToast(msg, 'info');
     }

@@ -24,7 +24,7 @@ async function ensureRunning(): Promise<boolean> {
   return audioContext?.state === 'running';
 }
 
-async function playTone(frequency: number, duration: number, volume = 0.3): Promise<void> {
+async function playTone(frequency: number, duration: number, volume = 0.3, type: OscillatorType = 'sine'): Promise<void> {
   const ready = await ensureRunning();
   if (!ready || !audioContext) return;
 
@@ -35,7 +35,7 @@ async function playTone(frequency: number, duration: number, volume = 0.3): Prom
   gainNode.connect(audioContext.destination);
 
   oscillator.frequency.value = frequency;
-  oscillator.type = 'sine';
+  oscillator.type = type;
   gainNode.gain.value = volume;
 
   // Fade out
@@ -66,4 +66,25 @@ export async function playIncomingReservationSound(): Promise<void> {
   await playTone(660, 0.3, 0.45);
   setTimeout(() => playTone(880, 0.3, 0.45), 180);
   setTimeout(() => playTone(1100, 0.55, 0.45), 360);
+}
+
+/** ホットペッパー予約着信音: 三角波を使って輪郭をはっきりさせた、高音のインターホン風2連打（タラン！ タラン！） */
+export async function playHotpepperReservationSound(): Promise<void> {
+  // 1回目：タラン！
+  await playTone(1100, 0.15, 0.45, 'triangle');
+  setTimeout(() => playTone(1375, 0.25, 0.45, 'triangle'), 100);
+
+  // 2回目：タラン！（400ms 後）
+  setTimeout(() => {
+    playTone(1100, 0.15, 0.45, 'triangle');
+    setTimeout(() => playTone(1375, 0.25, 0.45, 'triangle'), 100);
+  }, 400);
+}
+
+/** ホームページ/チャットボット予約着信音: 明るい和音風の上昇4連音（テ・レ・レ・レン♪） */
+export async function playWebReservationSound(): Promise<void> {
+  await playTone(880, 0.15, 0.4, 'sine');
+  setTimeout(() => playTone(1100, 0.15, 0.4, 'sine'), 120);
+  setTimeout(() => playTone(1320, 0.15, 0.4, 'sine'), 240);
+  setTimeout(() => playTone(1650, 0.35, 0.4, 'sine'), 360);
 }

@@ -1,5 +1,13 @@
 import { useState, useCallback, useEffect } from 'react';
-import { initAudio, playNotificationSound, playAlertSound, playWarningSound, playIncomingReservationSound } from '../utils/soundUtils';
+import {
+  initAudio,
+  playNotificationSound,
+  playAlertSound,
+  playWarningSound,
+  playIncomingReservationSound,
+  playHotpepperReservationSound,
+  playWebReservationSound
+} from '../utils/soundUtils';
 
 const AUDIO_PREF_KEY = 'notification_audio_enabled';
 
@@ -40,7 +48,11 @@ export function useNotification() {
   }, []);
 
   const addToast = useCallback(
-    (message: string, type: 'info' | 'warning' | 'error' | 'incoming' = 'info') => {
+    (
+      message: string,
+      type: 'info' | 'warning' | 'error' | 'incoming' = 'info',
+      soundType?: 'hotpepper' | 'web'
+    ) => {
       const id = Date.now().toString();
       const persistent = type === 'error';
       setToasts((prev) => [...prev, { id, message, type, persistent }]);
@@ -58,7 +70,13 @@ export function useNotification() {
         } else if (type === 'warning') {
           playWarningSound();
         } else if (type === 'incoming') {
-          playIncomingReservationSound();
+          if (soundType === 'hotpepper') {
+            playHotpepperReservationSound();
+          } else if (soundType === 'web') {
+            playWebReservationSound();
+          } else {
+            playIncomingReservationSound();
+          }
         } else {
           playNotificationSound();
         }
