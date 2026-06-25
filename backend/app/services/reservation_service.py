@@ -112,6 +112,7 @@ def build_reservation_response(reservation: Reservation) -> dict:
         "notes": reservation.notes,
         "conflict_note": reservation.conflict_note,
         "hotpepper_synced": reservation.hotpepper_synced,
+        "synced_by": reservation.synced_by,
         "hold_expires_at": reservation.hold_expires_at,
         "series_id": reservation.series_id,
         "series_info": None,

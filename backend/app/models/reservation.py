@@ -29,6 +29,7 @@ class Reservation(Base):
     notes = Column(Text, nullable=True)
     conflict_note = Column(Text, nullable=True)
     hotpepper_synced = Column(Boolean, default=False)
+    synced_by = Column(String(10), nullable=True)  # 'rpa' | 'human' | 'legacy' | NULL
     hold_expires_at = Column(DateTime(timezone=True), nullable=True)
     series_id = Column(Integer, ForeignKey("reservation_series.id"), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())

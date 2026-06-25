@@ -44,16 +44,16 @@ export default function HotPepperSync() {
   const markSynced = async (id: number) => {
     setError(null);
     try {
-      await api.post(`/hotpepper/${id}/mark-synced`);
+      await api.post(`/hotpepper/${id}/mark-synced`, { synced_by: 'human' });
       setPendingSync((prev) => prev.filter((r) => r.id !== id));
     } catch (err) {
       setError(extractErrorMessage(err, 'HP同期更新に失敗しました'));
     }
   };
 
-  // 新しい予約を上に表示（start_time 降順）
+  // 直近の予約を上に表示（start_time 昇順: 今日に近いものから処理する）
   const sorted = [...pendingSync].sort(
-    (a, b) => new Date(b.start_time).getTime() - new Date(a.start_time).getTime()
+    (a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime()
   );
 
   return (

@@ -95,6 +95,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# /api/hotpepper/* への呼び出しを rpa_call_logs に観測記録（監査ログとは別系統）
+from app.middlewares.rpa_call_log import RpaCallLogMiddleware  # noqa: E402
+
+app.add_middleware(RpaCallLogMiddleware)
+
 app.include_router(practitioners.router)
 app.include_router(patients.router)
 app.include_router(menus.router)

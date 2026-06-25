@@ -155,6 +155,81 @@ async def test_poll_hotpepper_mail_once_dead_letters_after_retry_limit():
     assert adapter.mark_seen.call_count == 1
 
 
+# ---------------------------------------------------------------------------
+# shadow_mode: ホットペッパーN ダミー患者テスト
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_shadow_hotpepper_dummy_patient_increments_number():
+    """_get_or_create_hotpepper_dummy_patient が既存の最大番号+1で作成する"""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from app.services.hotpepper_mail import _get_or_create_hotpepper_dummy_patient
+
+    db = AsyncMock()
+    existing_scalar = MagicMock()
+    existing_scalar.scalars.return_value.all.return_value = [
+        SimpleNamespace(name="ホットペッパー1"),
+        SimpleNamespace(name="ホットペッパー3"),
+    ]
+    db.execute.return_value = existing_scalar
+
+    created = SimpleNamespace(id=56, name="ホットペッパー4")
+    with patch("app.services.patient_match.create_new_patient", new=AsyncMock(return_value=created)) as mock_create:
+        patient = await _get_or_create_hotpepper_dummy_patient(db)
+
+    assert patient.name == "ホットペッパー4"
+    assert mock_create.await_args.kwargs["name"] == "ホットペッパー4"
+    assert mock_create.await_args.kwargs.get("line_id") is None
+
+
+@pytest.mark.asyncio
+async def test_shadow_mode_handle_created_uses_dummy_patient_not_real_name():
+    """shadow_mode=True のとき _handle_created が実患者名ではなくダミー患者を使う"""
+    from datetime import datetime
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import app.models.reservation_series  # noqa: F401 – SQLAlchemy mapper 解決に必要
+    from app.services.hotpepper_mail import _handle_created
+
+    dummy_patient = SimpleNamespace(id=77, name="ホットペッパー5")
+    parsed = {
+        "reservation_number": "HP-9999",
+        "patient_name": "金田 堅",
+        "patient_reading": "カネダ ケン",
+        "start_time": datetime(2026, 5, 10, 10, 0),
+        "end_time": datetime(2026, 5, 10, 11, 0),
+        "duration_minutes": 60,
+        "menu_name": "全身",
+        "practitioner_name": None,
+        "amount": 5000,
+        "coupon": None,
+        "note": None,
+    }
+
+    db = AsyncMock()
+    # 重複チェック → None（新規）、手動マッチ → None
+    no_result = MagicMock()
+    no_result.scalar_one_or_none.return_value = None
+    db.execute.return_value = no_result
+
+    with patch("app.services.hotpepper_mail.settings.shadow_mode", True), \
+         patch("app.services.hotpepper_mail._get_or_create_hotpepper_dummy_patient", new=AsyncMock(return_value=dummy_patient)) as mock_dummy, \
+         patch("app.services.hotpepper_mail._find_or_create_patient", new=AsyncMock()) as mock_real, \
+         patch("app.services.hotpepper_mail._resolve_hotpepper_color_id", new=AsyncMock(return_value=None)), \
+         patch("app.services.hotpepper_mail._find_existing_manual_match", new=AsyncMock(return_value=None)), \
+         patch("app.services.hotpepper_mail._resolve_hotpepper_menu", new=AsyncMock(return_value=(None, 60))), \
+         patch("app.services.hotpepper_mail._assign_practitioner", new=AsyncMock(return_value=(1, None))), \
+         patch("app.services.hotpepper_mail._build_notes", return_value="note"), \
+         patch("app.services.hotpepper_mail._notify_hotpepper_conflict_risk", new=AsyncMock()), \
+         patch("app.services.hotpepper_mail.create_notification", new=AsyncMock()):
+        result = await _handle_created(db, parsed)
+
+    mock_dummy.assert_awaited_once()
+    mock_real.assert_not_awaited()
+    assert result["status"] == "created"
+
+
 @pytest.mark.asyncio
 async def test_process_hotpepper_email_skips_ai_review_when_required_fields_are_complete():
     from app.services.hotpepper_mail import process_hotpepper_email

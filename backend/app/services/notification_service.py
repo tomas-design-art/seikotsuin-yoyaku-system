@@ -33,6 +33,19 @@ async def create_notification(
     if extra_data:
         payload.update(extra_data)
 
-    await broadcast_event(event_type, payload)
+    # ダーティリード/コミットタイミング競合ハック: 
+    # API側の `db.commit()` とフロント側の超高速な再フェッチが衝突し、
+    # 「自動更新が走ったのに、再読み込みしたデータがコミット前なので未反映」という時間差の競合（Race Condition）を防ぐため、
+    # 0.15秒(150ms)だけ非同期遅延させてからブロードキャストする。
+    async def _delayed_broadcast():
+        import asyncio
+        await asyncio.sleep(0.15)
+        try:
+            await broadcast_event(event_type, payload)
+        except Exception as e:
+            logger.error("Delayed broadcast failed: %s", str(e))
+
+    import asyncio
+    asyncio.create_task(_delayed_broadcast())
 
     return notif

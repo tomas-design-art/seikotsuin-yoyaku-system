@@ -52,8 +52,10 @@ export default function AdminLoginModal({ isOpen, onClose, onSuccess }: Props) {
                 </p>
                 <form onSubmit={handleSubmit} className="space-y-3">
                     <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">管理者ID</label>
+                        <label htmlFor="admin-username" className="block text-sm font-medium text-gray-700 mb-1">管理者ID</label>
                         <input
+                            id="admin-username"
+                            name="username"
                             type="text"
                             value={username}
                             onChange={(e) => setUsername(e.target.value)}
@@ -63,8 +65,10 @@ export default function AdminLoginModal({ isOpen, onClose, onSuccess }: Props) {
                         />
                     </div>
                     <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">パスワード</label>
+                        <label htmlFor="admin-password" className="block text-sm font-medium text-gray-700 mb-1">パスワード</label>
                         <input
+                            id="admin-password"
+                            name="password"
                             type="password"
                             value={password}
                             onChange={(e) => setPassword(e.target.value)}

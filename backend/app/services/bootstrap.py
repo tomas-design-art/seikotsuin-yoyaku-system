@@ -27,6 +27,7 @@ def _import_all_models() -> None:
         "app.models.reservation",
         "app.models.reservation_color",
         "app.models.reservation_series",
+        "app.models.rpa_call_log",
         "app.models.setting",
         "app.models.shadow_log",
         "app.models.weekly_schedule",

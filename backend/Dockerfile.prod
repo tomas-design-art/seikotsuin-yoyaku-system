@@ -15,5 +15,7 @@ RUN chown -R appuser:appuser /app
 
 USER appuser
 
-# 本番: マイグレーション実行後に起動 (--reload なし, ワーカー数2, アクセスログ有効)
-CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 2 --access-log"]
+# 本番: マイグレーション実行後に起動 (--reload なし, --access-log 有効)
+# ⚠ SSE（リアルタイム更新）はメモリ内のクライアントキューを使うため、複数ワーカーだと
+# 送信プロセスと接続プロセスが分断してイベントが届かない。必ず --workers 1 で起動すること。
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --access-log"]

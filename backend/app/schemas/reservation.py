@@ -144,6 +144,7 @@ class ReservationResponse(BaseModel):
     notes: Optional[str] = None
     conflict_note: Optional[str] = None
     hotpepper_synced: bool
+    synced_by: Optional[str] = None
     hold_expires_at: Optional[datetime] = None
     series_id: Optional[int] = None
     series_info: Optional[SeriesInfoBrief] = None

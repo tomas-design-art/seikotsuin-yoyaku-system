@@ -244,7 +244,13 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
     setSubmitting(true);
     try {
       if (initialData?.isSingleClick) {
-        const blockAllToday = window.confirm(`本日の担当${practitionerName}の予約枠を全て止めますか？\nOK: 一括ブロック / キャンセル: 選択枠のみブロック`);
+        const blockAllToday = window.confirm(
+          `⚠ 終日（1日丸ごと）の枠オサエを登録します。\n\n` +
+          `施術者: ${practitionerName}\n` +
+          `対象日: ${date}（この日1日まるごと）\n\n` +
+          `この操作は監査ログに記録されます。\n` +
+          `「OK」で登録、「キャンセル」で時間帯のみの枠オサエに進みます。`
+        );
         if (blockAllToday) {
           await createScheduleOverride({
             practitioner_id: practitionerId,
@@ -259,16 +265,26 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
         }
       }
 
-      await createUnavailableTime({
-        practitioner_id: practitionerId,
-        date,
-        start_time: startTime,
-        end_time: endTime,
-        reason: '枠オサエ',
-      });
-      onSuccess();
-      onClose();
-      resetFormState();
+      const blockThisSlot = window.confirm(
+        `時間帯休み（枠オサエ）を登録します。\n\n` +
+        `施術者: ${practitionerName}\n` +
+        `日付: ${date}\n` +
+        `時間帯: ${startTime}〜${endTime}\n\n` +
+        `この操作は監査ログに記録されます。\n` +
+        `「OK」で登録、「キャンセル」で何もしません。`
+      );
+      if (blockThisSlot) {
+        await createUnavailableTime({
+          practitioner_id: practitionerId,
+          date,
+          start_time: startTime,
+          end_time: endTime,
+          reason: '枠オサエ',
+        });
+        onSuccess();
+        onClose();
+        resetFormState();
+      }
     } catch (err: unknown) {
       setError(extractErrorMessage(err, '枠オサエの登録に失敗しました'));
     } finally {

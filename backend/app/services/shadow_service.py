@@ -10,14 +10,19 @@ from datetime import date, datetime, time, timedelta
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.models.patient import Patient
+from app.models.reservation import Reservation
+from app.models.reservation_series import ReservationSeries  # noqa: F401 - SQLAlchemy relationship registration
 from app.models.shadow_log import ShadowLog
+from app.services.patient_match import normalize_name
 from app.services.line_reply import push_message_with_access_token
 from app.services.line_state import (
     clear_user_draft,
     create_pending_request,
+    get_request,
     get_user_state,
     merge_user_draft,
     set_user_mode,
@@ -29,6 +34,10 @@ logger = logging.getLogger(__name__)
 # ── デバウンス用バッファ（user_id → {text, ts}) ──
 _DEBOUNCE_BUFFER: dict[str, dict] = {}
 _DEBOUNCE_SECONDS = 10
+
+# ミラー転送と通常Webhookが同時に届く構成では、同一LINEイベントが数秒差で二重処理される。
+_RECENT_SHADOW_MESSAGES: dict[tuple[str, str], float] = {}
+_DEDUP_SECONDS = 8
 
 # ── 予約意図キーワード ──
 _RESERVATION_KEYWORDS = [
@@ -128,21 +137,51 @@ def is_template_only_message(text: str) -> bool:
     return False
 
 
+def _strip_courtesy_phrases(text: str) -> str:
+    """予約意図・日時抽出の邪魔になる挨拶表現を除去する。"""
+    cleaned = text or ""
+    cleaned = re.sub(r"夜分\s*遅く(?:に)?\s*(?:失礼(?:します|いたします)?|すみません|申し訳ありません)?", "", cleaned)
+    cleaned = re.sub(r"夜分(?:に)?\s*(?:失礼(?:します|いたします)?|すみません|申し訳ありません)", "", cleaned)
+    return cleaned
+
+
+def _extract_self_declared_name_rule(text: str) -> str | None:
+    """「佐々木です」のような自己申告名を抽出する。名字だけでも既存予約照合に使う。"""
+    cleaned = re.sub(r"\[[^\]]+\]", "", text or "")
+    blacklist = {"おはよう", "こんにちは", "こんばんは", "予約", "変更", "キャンセル", "お願い", "大丈夫"}
+    patterns = [
+        r"(?:^|[\s\n。、,，])([一-龥々ぁ-んァ-ヶー]{2,12})(?:です|と申します|といいます)",
+        r"(?:名前|氏名)[は:：\s]*([一-龥々ぁ-んァ-ヶー]{2,16})",
+    ]
+    for pattern in patterns:
+        for match in re.finditer(pattern, cleaned):
+            candidate = re.sub(r"[\s\u3000]+", "", match.group(1))
+            candidate = re.sub(r"(さん|様|ちゃん|くん)$", "", candidate)
+            if len(candidate) < 2:
+                continue
+            if any(word in candidate for word in blacklist):
+                continue
+            return candidate
+    return None
+
+
 def _extract_intent_rule(text: str) -> str:
-    if re.search(r"キャンセル|取り消|取消|なしで|やめ|辞退", text):
+    target = _strip_courtesy_phrases(text)
+    if re.search(r"キャンセル|取り消|取消|なしで|やめ|辞退", target):
         return "キャンセル"
-    if re.search(r"変更|変え|ずら|移動|リスケ|別日", text):
+    if re.search(r"変更|変え|ずら|移動|リスケ|別日", target):
         return "変更"
-    if re.search(r"遅れ|遅刻|遅く|間に合わ|少し遅れ", text):
+    if re.search(r"遅刻|遅れ(?:ます|る|そう|そうです)|遅く(?:なり|なっ|到着|行き)|間に合わ|少し遅れ", target):
         return "遅刻"
-    if re.search(r"相談|そうだん|問合せ|問い合わせ|確認したい|聞きたい", text):
+    if re.search(r"相談|そうだん|問合せ|問い合わせ|確認したい|聞きたい", target):
         return "相談"
-    if re.search(r"予約|よやく|空き|あき|取りたい|お願い|受診|見てもら|診てもら", text):
+    if re.search(r"予約|よやく|空き|あき|空いて|取りたい|お願い|受診|見てもら|診てもら", target):
         return "予約希望"
     return "その他"
 
 
 def _extract_date_time_rule(text: str) -> tuple[str | None, str | None]:
+    text = _strip_courtesy_phrases(text)
     now = now_jst()
     dval: str | None = None
     tval: str | None = None
@@ -233,6 +272,228 @@ def _extract_date_time_rule(text: str) -> tuple[str | None, str | None]:
     return dval, tval
 
 
+def _extract_date_mentions_rule(text: str) -> list[dict]:
+    """日付候補を出現位置つきで抽出する。"""
+    text = _strip_courtesy_phrases(text)
+    now = now_jst()
+    mentions: list[dict] = []
+
+    for m_abs in re.finditer(r"(20\d{2})[/-](\d{1,2})[/-](\d{1,2})", text):
+        y, mo, da = int(m_abs.group(1)), int(m_abs.group(2)), int(m_abs.group(3))
+        mentions.append({"value": f"{y:04d}-{mo:02d}-{da:02d}", "start": m_abs.start(), "end": m_abs.end()})
+
+    for m_md in re.finditer(r"(?<![\d/-])(\d{1,2})\s*[月/]\s*(\d{1,2})\s*日?", text):
+        mo, da = int(m_md.group(1)), int(m_md.group(2))
+        y = now.year + (1 if mo < now.month else 0)
+        mentions.append({"value": f"{y:04d}-{mo:02d}-{da:02d}", "start": m_md.start(), "end": m_md.end()})
+
+    relative_patterns = [
+        ("明後日", now.date() + timedelta(days=2)),
+        ("明日", now.date() + timedelta(days=1)),
+        ("今日", now.date()),
+        ("本日", now.date()),
+    ]
+    for label, target_date in relative_patterns:
+        for m_rel in re.finditer(label, text):
+            mentions.append({"value": target_date.isoformat(), "start": m_rel.start(), "end": m_rel.end()})
+
+    mentions.sort(key=lambda item: (item["start"], item["end"]))
+    deduped: list[dict] = []
+    for mention in mentions:
+        if deduped and mention["start"] == deduped[-1]["start"] and mention["value"] == deduped[-1]["value"]:
+            continue
+        deduped.append(mention)
+    return deduped
+
+
+def _extract_time_mentions_rule(text: str) -> list[dict]:
+    """時刻候補を出現位置つきで抽出する。"""
+    text = _strip_courtesy_phrases(text)
+    mentions: list[dict] = []
+
+    for m_hm in re.finditer(r"(午前|午後)?\s*(\d{1,2})\s*[:：]\s*(\d{1,2})", text):
+        hh = int(m_hm.group(2))
+        mm = int(m_hm.group(3))
+        if m_hm.group(1) == "午後" and 1 <= hh <= 11:
+            hh += 12
+        mentions.append({"value": f"{hh:02d}:{mm:02d}", "start": m_hm.start(), "end": m_hm.end()})
+
+    for m_h in re.finditer(r"(午前|午後)?\s*(\d{1,2})\s*時\s*(半)?", text):
+        hh = int(m_h.group(2))
+        mm = 30 if m_h.group(3) else 0
+        if m_h.group(1) == "午後" and 1 <= hh <= 11:
+            hh += 12
+        mentions.append({"value": f"{hh:02d}:{mm:02d}", "start": m_h.start(), "end": m_h.end()})
+
+    vague_times = [
+        (r"午前中|午前", "10:00"),
+        (r"お昼|(?<!\d)昼(?!食)", "12:00"),
+        (r"午後", "14:00"),
+        (r"夕方", "17:00"),
+        (r"夜|晩", "19:00"),
+        (r"(?<!深)朝(?!ご飯)", "09:00"),
+    ]
+    occupied_spans = [(m["start"], m["end"]) for m in mentions]
+    for pattern, value in vague_times:
+        for m_vague in re.finditer(pattern, text):
+            if any(start <= m_vague.start() < end for start, end in occupied_spans):
+                continue
+            mentions.append({"value": value, "start": m_vague.start(), "end": m_vague.end()})
+
+    mentions.sort(key=lambda item: (item["start"], item["end"]))
+    deduped: list[dict] = []
+    for mention in mentions:
+        if deduped and mention["start"] == deduped[-1]["start"] and mention["value"] == deduped[-1]["value"]:
+            continue
+        deduped.append(mention)
+    return deduped
+
+
+def _looks_like_current_reservation_reference(text: str, mention: dict) -> bool:
+    around = text[max(0, mention["start"] - 16): mention["end"] + 28]
+    return bool(re.search(r"予約|入れて|入って|いただいて|頂いて|現在|今の|元の", around))
+
+
+def _extract_change_fields_rule(text: str) -> dict:
+    """変更依頼で、既存予約日時と希望日時を分けて抽出する。"""
+    cleaned = _strip_courtesy_phrases(text)
+    date_mentions = _extract_date_mentions_rule(cleaned)
+    time_mentions = _extract_time_mentions_rule(cleaned)
+
+    current_date = None
+    current_time = None
+    desired_date = None
+    desired_time = None
+    desired_date_start = None
+
+    if len(date_mentions) >= 2:
+        current_date = date_mentions[0]["value"]
+        desired_date = date_mentions[-1]["value"]
+        desired_date_start = date_mentions[-1]["start"]
+    elif len(date_mentions) == 1:
+        only_date = date_mentions[0]
+        if _looks_like_current_reservation_reference(cleaned, only_date):
+            current_date = only_date["value"]
+        else:
+            desired_date = only_date["value"]
+            desired_date_start = only_date["start"]
+
+    if desired_date_start is not None:
+        after_desired_date = [m for m in time_mentions if m["start"] >= desired_date_start]
+        before_desired_date = [m for m in time_mentions if m["start"] < desired_date_start]
+        if after_desired_date:
+            desired_time = after_desired_date[-1]["value"]
+        if before_desired_date:
+            current_time = before_desired_date[0]["value"]
+    elif len(time_mentions) >= 2:
+        current_time = time_mentions[0]["value"]
+        desired_time = time_mentions[-1]["value"]
+    elif len(time_mentions) == 1:
+        only_time = time_mentions[0]
+        if _looks_like_current_reservation_reference(cleaned, only_time):
+            current_time = only_time["value"]
+        else:
+            desired_time = only_time["value"]
+
+    if not desired_date and current_date and re.search(r"翌日", cleaned):
+        try:
+            desired_date = (date.fromisoformat(current_date) + timedelta(days=1)).isoformat()
+        except ValueError:
+            pass
+
+    return {
+        "current_date": current_date,
+        "current_time": current_time,
+        "date": desired_date,
+        "time": desired_time,
+    }
+
+
+def _name_matches_reference(reference_name: str | None, patient: Patient | None) -> bool:
+    ref = normalize_name(reference_name)
+    if not ref or len(ref) < 2 or not patient:
+        return False
+    candidates = [
+        normalize_name(patient.name),
+        normalize_name(f"{patient.last_name or ''}{patient.first_name or ''}"),
+        normalize_name(patient.last_name),
+        normalize_name(patient.first_name),
+    ]
+    return any(candidate and (ref == candidate or ref in candidate or candidate in ref) for candidate in candidates)
+
+
+async def _find_existing_reservation_by_reference(
+    db: AsyncSession,
+    *,
+    patient_name: str | None,
+    current_date: str | None,
+    current_time: str | None,
+) -> dict | None:
+    """LINE本文中の「◯◯です」「M/D H時に予約」から予約ボード上の既存予約を照合する。"""
+    if not patient_name or not current_date or not current_time:
+        return None
+
+    try:
+        target_date = date.fromisoformat(current_date)
+        hh, mm = map(int, str(current_time).split(":"))
+    except Exception:
+        return None
+
+    day_start = datetime.combine(target_date, time(0, 0), tzinfo=JST)
+    day_end = day_start + timedelta(days=1)
+    result = await db.execute(
+        select(Reservation)
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+        )
+        .where(
+            Reservation.start_time >= day_start,
+            Reservation.start_time < day_end,
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD", "CHANGE_REQUESTED"]),
+        )
+        .order_by(Reservation.start_time.asc(), Reservation.id.desc())
+    )
+    reservations = list(result.scalars().all())
+    matches = []
+    for reservation in reservations:
+        start = reservation.start_time.astimezone(JST) if reservation.start_time else None
+        if not start or start.hour != hh or start.minute != mm:
+            continue
+        if _name_matches_reference(patient_name, reservation.patient):
+            matches.append(reservation)
+
+    if len(matches) != 1:
+        if len(matches) > 1:
+            logger.warning(
+                "Shadow: existing reservation reference ambiguous name=%s date=%s time=%s ids=%s",
+                patient_name, current_date, current_time, [r.id for r in matches],
+            )
+        return None
+
+    reservation = matches[0]
+    start = reservation.start_time.astimezone(JST)
+    end = reservation.end_time.astimezone(JST) if reservation.end_time else start
+    duration = max(1, int((end - start).total_seconds() // 60))
+    patient = reservation.patient
+    practitioner = reservation.practitioner
+    menu = reservation.menu
+    return {
+        "existing_reservation_id": reservation.id,
+        "patient_id": patient.id if patient else None,
+        "customer_name": patient.name if patient else patient_name,
+        "current_date": start.date().isoformat(),
+        "current_time": start.strftime("%H:%M"),
+        "current_end_time": end.strftime("%H:%M"),
+        "duration_minutes": duration,
+        "menu_id": menu.id if menu else None,
+        "menu_name": menu.name if menu else None,
+        "practitioner_id": practitioner.id if practitioner else None,
+        "practitioner_name": practitioner.name if practitioner else None,
+    }
+
+
 def _normalize_analysis(analysis: dict, message: str) -> dict:
     rule_intent = _extract_intent_rule(message)
     rule_date, rule_time = _extract_date_time_rule(message)
@@ -242,9 +503,19 @@ def _normalize_analysis(analysis: dict, message: str) -> dict:
     valid_intents = {"予約希望", "変更", "キャンセル", "遅刻", "相談", "その他"}
     intent = parsed.get("intent")
     parsed["intent"] = intent if intent in valid_intents else rule_intent
+    if parsed["intent"] in {"相談", "その他"} and rule_intent == "予約希望" and (rule_date or rule_time):
+        parsed["intent"] = "予約希望"
+    parsed["name"] = parsed.get("name") or _extract_self_declared_name_rule(message)
 
-    parsed["date"] = parsed.get("date") or rule_date
-    parsed["time"] = parsed.get("time") or rule_time
+    change_fields = _extract_change_fields_rule(message) if parsed["intent"] == "変更" or rule_intent == "変更" else None
+    if change_fields and any(change_fields.values()):
+        parsed["current_date"] = change_fields.get("current_date") or parsed.get("current_date")
+        parsed["current_time"] = change_fields.get("current_time") or parsed.get("current_time")
+        parsed["date"] = change_fields.get("date") or parsed.get("date")
+        parsed["time"] = change_fields.get("time")
+    else:
+        parsed["date"] = parsed.get("date") or rule_date
+        parsed["time"] = parsed.get("time") or rule_time
     parsed["menu"] = None
 
     # current_date/current_time（変更意図時の既存予約日時）— 文字列"null"を除去
@@ -284,19 +555,44 @@ def _rule_based_shadow_parse(message: str) -> dict:
     date_val, time_val = _extract_date_time_rule(message)
     duration = _extract_duration_rule(message)
     intent = _extract_intent_rule(message)
+    current_date = None
+    current_time = None
+    if intent == "変更":
+        change_fields = _extract_change_fields_rule(message)
+        current_date = change_fields.get("current_date")
+        current_time = change_fields.get("current_time")
+        date_val = change_fields.get("date")
+        time_val = change_fields.get("time")
     confidence = "high" if (date_val and time_val) else ("medium" if (date_val or time_val) else "low")
     return {
         "intent": intent,
         "content": None,
-        "name": None,
+        "name": _extract_self_declared_name_rule(message),
         "menu": None,
-        "current_date": None,
-        "current_time": None,
+        "current_date": current_date,
+        "current_time": current_time,
         "date": date_val,
         "time": time_val,
         "duration_minutes": duration,
         "confidence": confidence,
     }
+
+
+def _should_restart_shadow_from_manual(message: str, user_state: dict) -> bool:
+    """request_id のない手動状態から、明確な新規予約文面だけドラフトに戻す。"""
+    if user_state.get("request_id"):
+        return False
+    if not has_reservation_intent(message):
+        return False
+
+    parsed = _rule_based_shadow_parse(message)
+    if parsed.get("intent") in {"変更", "キャンセル", "遅刻", "相談"}:
+        return False
+    if not (parsed.get("date") or parsed.get("time")):
+        return False
+    if parsed.get("intent") == "予約希望":
+        return True
+    return bool(re.search(r"予約|空い|空き|希望|お願い|取りたい|受診|見てもら|診てもら", message or ""))
 
 
 def debounce_message(user_id: str, text: str) -> str | None:
@@ -324,6 +620,23 @@ def debounce_message(user_id: str, text: str) -> str | None:
     _DEBOUNCE_BUFFER[user_id] = {"text": text, "ts": now}
 
     return flushed
+
+
+def _is_duplicate_shadow_message(user_id: str, text: str) -> bool:
+    """短時間に同じユーザー・同じ本文が二重到着した場合は後続を捨てる。"""
+    now = _time.time()
+    normalized = re.sub(r"\s+", "", text or "")
+    if not normalized:
+        return False
+
+    expired = [key for key, ts in _RECENT_SHADOW_MESSAGES.items() if now - ts > _DEDUP_SECONDS]
+    for key in expired:
+        _RECENT_SHADOW_MESSAGES.pop(key, None)
+
+    key = (user_id, normalized)
+    last_seen = _RECENT_SHADOW_MESSAGES.get(key)
+    _RECENT_SHADOW_MESSAGES[key] = now
+    return last_seen is not None and now - last_seen <= _DEDUP_SECONDS
 
 
 def flush_debounce(user_id: str) -> str | None:
@@ -582,6 +895,10 @@ async def handle_shadow_message(
         messages_to_process.append(current)
 
     for msg in messages_to_process:
+        if _is_duplicate_shadow_message(user_id, msg):
+            logger.info("Shadow: duplicate message skipped (user=%s)", user_id[:12])
+            continue
+
         intent_detected = has_reservation_intent(msg)
 
         # ── 既存ドラフトがあるか確認 ──
@@ -589,6 +906,23 @@ async def handle_shadow_message(
         current_mode = user_state.get("mode")
         prev_draft = user_state.get("draft") or {}
         is_shadow_drafting = current_mode == "shadow_drafting"
+
+        if current_mode == "manual" and _should_restart_shadow_from_manual(msg, user_state):
+            await clear_user_draft(db, user_id)
+            prev_draft = {}
+            current_mode = "manual_restart"
+            is_shadow_drafting = False
+            logger.info("Shadow: manual mode restarted as new reservation draft (user=%s)", user_id[:12])
+
+        if current_mode == "shadow_pending_admin" and intent_detected:
+            request_id = user_state.get("request_id")
+            pending = await get_request(db, request_id, line_user_id=user_id) if request_id else None
+            seed_draft = _draft_from_pending_request(pending or {})
+            if seed_draft:
+                prev_draft = await merge_user_draft(db, user_id, seed_draft)
+            await set_user_mode(db, user_id, "shadow_drafting", request_id)
+            current_mode = "shadow_drafting"
+            is_shadow_drafting = True
 
         # ── デモ用フルデバッグ通知（入口） ──
         if _is_debug_mode():
@@ -605,8 +939,8 @@ async def handle_shadow_message(
                 )
             )
 
-        # 管理者対応待ち or 手動モード → 追加メッセージを管理者へ転送のみ
-        if current_mode in {"shadow_pending_admin", "manual"}:
+        # 手動モード、または予約確認待ち中の非予約メッセージは原文だけ転送する。
+        if current_mode == "manual" or (current_mode == "shadow_pending_admin" and not intent_detected):
             await _push_admin_text(
                 f"📨 {display_name or '不明'}さんから追加メッセージ:\n── 原文 ──\n{msg}"
             )
@@ -652,6 +986,23 @@ async def handle_shadow_message(
             analysis["intent"] = intent
             analysis["_template_only"] = True
 
+        existing_reservation_ref = None
+        if intent == "変更":
+            existing_reservation_ref = await _find_existing_reservation_by_reference(
+                db,
+                patient_name=analysis.get("name") or prev_draft.get("customer_name"),
+                current_date=analysis.get("current_date") or prev_draft.get("current_date"),
+                current_time=analysis.get("current_time") or prev_draft.get("current_time"),
+            )
+            if existing_reservation_ref:
+                analysis["_existing_reservation"] = existing_reservation_ref
+                analysis["name"] = analysis.get("name") or existing_reservation_ref.get("customer_name")
+                analysis["duration_minutes"] = analysis.get("duration_minutes") or existing_reservation_ref.get("duration_minutes")
+                logger.info(
+                    "Shadow: matched existing reservation from message (user=%s, reservation_id=%s)",
+                    user_id[:12], existing_reservation_ref.get("existing_reservation_id"),
+                )
+
         # ── デバッグモード: LLM解析直後のフルダンプ ──
         if _is_debug_mode():
             await _push_admin_text(
@@ -667,8 +1018,13 @@ async def handle_shadow_message(
                 )
             )
 
-        # 予約希望以外の意図（変更・キャンセル・遅刻・相談）は手動対応へ切替
-        if intent in {"変更", "キャンセル", "遅刻", "相談"}:
+        # 予約希望以外の意図は原則手動対応。ただし変更依頼で希望日時の断片が
+        # 取れている場合は、後続メッセージで不足分を補えるようドラフト継続する。
+        if intent in {"キャンセル", "遅刻", "相談"} or (
+            intent == "変更" and not (
+                analysis.get("date") or analysis.get("time") or existing_reservation_ref or is_shadow_drafting
+            )
+        ):
             notified = await notify_admin_shadow(
                 display_name=display_name,
                 user_id=user_id,
@@ -723,6 +1079,12 @@ async def handle_shadow_message(
             draft_update["customer_name"] = analysis["name"]
         if analysis.get("content"):
             draft_update["content"] = analysis["content"]
+        if analysis.get("current_date"):
+            draft_update["current_date"] = analysis["current_date"]
+        if analysis.get("current_time"):
+            draft_update["current_time"] = analysis["current_time"]
+        if existing_reservation_ref:
+            draft_update.update(existing_reservation_ref)
 
         # 原文をドラフトに蓄積
         existing_raw = prev_draft.get("raw_messages") or ""
@@ -861,9 +1223,34 @@ def _format_draft_progress(
         lines.append(f"時間: {draft['time']}")
     if draft.get("duration_minutes"):
         lines.append(f"施術時間: {draft['duration_minutes']}分")
+    if draft.get("existing_reservation_id"):
+        current = " ".join(
+            part for part in [draft.get("current_date"), draft.get("current_time"), draft.get("current_end_time")]
+            if part
+        )
+        lines.append(f"既存予約照合: #{draft['existing_reservation_id']} {current}".strip())
+    if draft.get("practitioner_name"):
+        lines.append(f"既存担当: {draft['practitioner_name']}")
     if missing:
         lines.append(f"⏳ 未抽出: {', '.join(missing)}")
     return "\n".join(lines)
+
+
+def _draft_from_pending_request(request: dict) -> dict:
+    """確認待ちリクエストから、追加メッセージ再解析用のドラフトを復元する。"""
+    if not request:
+        return {}
+    keys = [
+        "customer_name",
+        "date",
+        "time",
+        "menu_name",
+        "menu_id",
+        "duration_minutes",
+        "practitioner_id",
+        "practitioner_name",
+    ]
+    return {key: request.get(key) for key in keys if request.get(key) not in (None, "")}
 
 
 async def _push_admin_text(text: str) -> bool:
@@ -881,7 +1268,7 @@ async def _push_admin_text(text: str) -> bool:
 
 def _is_debug_mode() -> bool:
     """シャドーデモ用フルデバッグ出力のON/OFF"""
-    return getattr(settings, "shadow_debug_dump", False) or settings.environment != "production"
+    return bool(getattr(settings, "shadow_debug_dump", False))
 
 
 def _format_debug_dump(
@@ -998,6 +1385,10 @@ async def _shadow_check_and_notify(
             "menu_name": draft.get("menu_name") or "未指定",
             "menu_id": draft.get("menu_id"),
             "duration_minutes": duration,
+            "existing_reservation_id": draft.get("existing_reservation_id"),
+            "current_date": draft.get("current_date"),
+            "current_time": draft.get("current_time"),
+            "current_end_time": draft.get("current_end_time"),
             "available": practitioner is not None,
             "practitioner_id": practitioner.id if practitioner else None,
             "practitioner_name": practitioner.name if practitioner else None,

@@ -41,6 +41,40 @@ def test_rule_based_shadow_parse_extracts_intent_date_time():
     assert parsed["menu"] is None
 
 
+def test_shadow_parse_does_not_treat_yabun_osoku_as_late_arrival():
+    from app.services.shadow_service import _rule_based_shadow_parse
+
+    parsed = _rule_based_shadow_parse(
+        "夜分遅くに失礼します。明日ご確認いただけますと幸いです！明日4/29の夕方以降で空いているお時間ありますか…？"
+    )
+
+    assert parsed["intent"] == "予約希望"
+    assert parsed["date"] == "2026-04-29"
+    assert parsed["time"] == "17:00"
+
+
+def test_shadow_parse_extracts_followup_time_expressions():
+    from app.services.shadow_service import _rule_based_shadow_parse
+
+    assert _rule_based_shadow_parse("返信ありがとうございます！16時以降のお時間ですと予約埋まっておりますか？？")["time"] == "16:00"
+    assert _rule_based_shadow_parse("承知しました！それでは本日11時からでお願いします")["time"] == "11:00"
+    assert _rule_based_shadow_parse("午前中10時半or11時ごろでも空いておりますでしょうか…？")["time"] == "10:30"
+
+
+def test_shadow_debug_mode_requires_explicit_flag():
+    from app.services.shadow_service import _is_debug_mode
+
+    with patch("app.services.shadow_service.settings.shadow_debug_dump", False), patch(
+        "app.services.shadow_service.settings.environment", "development"
+    ):
+        assert _is_debug_mode() is False
+
+    with patch("app.services.shadow_service.settings.shadow_debug_dump", True), patch(
+        "app.services.shadow_service.settings.environment", "production"
+    ):
+        assert _is_debug_mode() is True
+
+
 def test_format_admin_notification():
     from app.services.shadow_service import format_admin_notification
     result = format_admin_notification(
