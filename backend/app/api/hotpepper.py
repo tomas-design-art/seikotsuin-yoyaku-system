@@ -1,19 +1,21 @@
 """HotPepper関連API"""
 import logging
 import json
-from datetime import timedelta
+from datetime import datetime, time as dtime, timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
+from app.api.auth import require_staff
 from app.config import settings as app_settings
 from app.database import get_db
 from app.models.reservation import Reservation
 from app.models.setting import Setting
 from app.services.reservation_service import build_reservation_response
 from app.services.hold_expiration import scheduler
+from app.utils.datetime_jst import JST
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
@@ -40,7 +42,10 @@ class ParseEmailResponse(BaseModel):
 
 
 @router.get("/pending-sync")
-async def pending_sync(db: AsyncSession = Depends(get_db)):
+async def pending_sync(
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
     """HotPepper側未押さえの予約一覧（現在時刻〜90日先まで／SalonBoardカレンダー上限）"""
     from app.utils.datetime_jst import now_jst
     now = now_jst()
@@ -65,6 +70,46 @@ async def pending_sync(db: AsyncSession = Depends(get_db)):
     return [build_reservation_response(r) for r in reservations]
 
 
+@router.get("/reservations-by-date")
+async def reservations_by_date(
+    date: str,
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
+    """指定日（JST）の全予約を返す（同期済み・未同期の両方）。RPA差分転記用。
+
+    pending-sync と同一のレスポンス形だが、以下の2点のみが異なる:
+    1) hotpepper_synced フィルタを外す（同期済みも含めて全件）
+    2) date でその日（JST 0:00〜翌0:00）に絞る
+
+    channel != HOTPEPPER と status ホワイトリスト（CONFIRMED/PENDING/HOLD）は
+    pending-sync と同一。CANCELLED 等は status ホワイトリストにより除外される。
+    """
+    try:
+        target = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="date は YYYY-MM-DD 形式で指定してください")
+    day_start = datetime.combine(target, dtime.min, tzinfo=JST)
+    day_end = day_start + timedelta(days=1)
+    result = await db.execute(
+        select(Reservation)
+        .where(
+            Reservation.channel != "HOTPEPPER",
+            Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+            Reservation.start_time >= day_start,
+            Reservation.start_time < day_end,
+        )
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+        )
+        .order_by(Reservation.start_time)
+    )
+    reservations = result.scalars().all()
+    return [build_reservation_response(r) for r in reservations]
+
+
 class MarkSyncedRequest(BaseModel):
     synced_by: str = "human"  # 'rpa' | 'human'
 
@@ -74,6 +119,7 @@ async def mark_synced(
     reservation_id: int,
     body: MarkSyncedRequest | None = None,
     db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
 ):
     """HP側押さえ済みマーク"""
     from app.api.sse import broadcast_event
@@ -131,6 +177,7 @@ async def mark_synced(
 async def reconcile_queue(
     days: int = 7,
     db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
 ):
     """RPAによる『直近◯日の取りこぼし救済』用キュー。
 
@@ -194,6 +241,7 @@ async def rpa_queue(
     days: int = 30,
     limit: int = 100,
     db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
 ):
     """RPA worker 専用の最適化キュー。
 
@@ -255,7 +303,10 @@ async def rpa_queue(
 
 
 @router.get("/stats")
-async def hotpepper_stats(db: AsyncSession = Depends(get_db)):
+async def hotpepper_stats(
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
     """HP同期の集計値（シリーズ vs 単発の内訳など）。
 
     UI影響を出さないため `/pending-sync` 本体には触らず、別エンドポイントで提供。
@@ -317,7 +368,10 @@ async def hotpepper_stats(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/health")
-async def hotpepper_health(db: AsyncSession = Depends(get_db)):
+async def hotpepper_health(
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
     """HP/RPA系の自己診断ダッシュボード（AI/開発者向け）。
 
     rpa_call_logs と pending予約から「RPA workerが生きているか」「詰まりの傾向」を
@@ -466,7 +520,11 @@ async def hotpepper_health(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/diagnose/{reservation_id}")
-async def hotpepper_diagnose(reservation_id: int, db: AsyncSession = Depends(get_db)):
+async def hotpepper_diagnose(
+    reservation_id: int,
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
     """特定予約が pending-sync に残っている理由を返す診断 API。"""
     from app.utils.datetime_jst import now_jst
 
@@ -523,7 +581,11 @@ async def hotpepper_diagnose(reservation_id: int, db: AsyncSession = Depends(get
 
 
 @router.post("/parse-email", response_model=ParseEmailResponse)
-async def parse_email(body: ParseEmailRequest, db: AsyncSession = Depends(get_db)):
+async def parse_email(
+    body: ParseEmailRequest,
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
     """HotPepperメール解析（テスト用手動解析）"""
     from app.agents.mail_parser import parse_hotpepper_email
     try:
@@ -534,7 +596,11 @@ async def parse_email(body: ParseEmailRequest, db: AsyncSession = Depends(get_db
 
 
 @router.post("/receive-email")
-async def receive_email(body: ParseEmailRequest, db: AsyncSession = Depends(get_db)):
+async def receive_email(
+    body: ParseEmailRequest,
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
     """HotPepperメールを受信して予約登録/更新/キャンセルする。
 
     手動投入 or 将来のIMAP/Gmailポーリングから呼ばれる共通エントリーポイント。
@@ -550,7 +616,10 @@ async def receive_email(body: ParseEmailRequest, db: AsyncSession = Depends(get_
 
 
 @router.post("/trigger-poll")
-async def trigger_poll(db: AsyncSession = Depends(get_db)):
+async def trigger_poll(
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
     """手動ポーリング実行"""
     from app.services.hotpepper_mail import poll_hotpepper_mail_once
 
@@ -563,7 +632,10 @@ async def trigger_poll(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/runtime-status")
-async def runtime_status(db: AsyncSession = Depends(get_db)):
+async def runtime_status(
+    db: AsyncSession = Depends(get_db),
+    _auth: dict = Depends(require_staff),
+):
     """HotPepperメール連携の稼働状態を返す（運用確認用）。"""
     provider = (app_settings.mail_provider or "").lower()
     provider_ok = provider in {"imap", "icloud", "icloud_imap", "icloud-imap"}
