@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
 import { X, Trash2, Check } from 'lucide-react';
 import type { Notification } from '../../types';
-import { getNotifications, deleteNotification } from '../../api/client';
+import { getNotifications, deleteNotification, deleteAllNotifications } from '../../api/client';
 
 interface NotificationPanelProps {
   onClose: () => void;
@@ -36,14 +36,16 @@ export default function NotificationPanel({ onClose, dismissedIds }: Notificatio
     }
   };
 
+  // 「すべて完了」: 現在表示中の50件だけでなく、DB上の通知を丸ごと削除する
+  // （過去の大量リマインドが50件制限の裏に隠れて延々と復活し続けるのを防ぐ）
   const handleClearAllVisible = async () => {
-    const targets = notifications.filter((n) => !hiddenIds.has(n.id));
-    setHiddenIds((prev) => {
-      const next = new Set(prev);
-      targets.forEach((n) => next.add(n.id));
-      return next;
-    });
-    await Promise.allSettled(targets.map((n) => deleteNotification(n.id)));
+    setNotifications([]);
+    setHiddenIds(new Set());
+    try {
+      await deleteAllNotifications();
+    } catch {
+      // 失敗しても表示上はクリアのままにする（次回リロード時に再取得される）
+    }
   };
 
   const visibleNotifications = useMemo(
@@ -109,7 +111,7 @@ export default function NotificationPanel({ onClose, dismissedIds }: Notificatio
                   完了
                 </button>
               </div>
-              <p className="text-gray-700">{n.message}</p>
+              <p className="text-gray-700 whitespace-pre-line">{n.message}</p>
               <p className="text-xs text-gray-400 mt-1">
                 {new Date(n.created_at).toLocaleString('ja-JP')}
               </p>

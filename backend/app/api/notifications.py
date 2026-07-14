@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, delete
 
 from app.database import get_db
 from app.models.notification_log import NotificationLog
@@ -58,3 +58,11 @@ async def delete_notification(notification_id: int, db: AsyncSession = Depends(g
     await db.delete(notif)
     await db.commit()
     return {"status": "ok", "id": notification_id}
+
+
+@router.delete("/")
+async def delete_all_notifications(db: AsyncSession = Depends(get_db)):
+    """通知を一括で完全削除する（『すべて完了』用。一覧APIの50件制限に関わらず全件消す）"""
+    result = await db.execute(delete(NotificationLog))
+    await db.commit()
+    return {"status": "ok", "deleted": result.rowcount}

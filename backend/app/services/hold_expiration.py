@@ -95,6 +95,20 @@ async def _delete_unread_notifications(db, event_type: str) -> int:
     return len(stale)
 
 
+def _format_unsynced_detail(reservations, limit: int = 5) -> str:
+    """未転記予約の一覧を「何月何日の何時・担当者」が一目でわかる形式に整形する"""
+    lines = []
+    for r in reservations[:limit]:
+        time_str = r.start_time.strftime("%m/%d %H:%M") if r.start_time else "時刻不明"
+        practitioner_name = r.practitioner.name if r.practitioner else "担当未定"
+        patient_name = r.patient.name if r.patient else "患者名不明"
+        lines.append(f"・{time_str} {patient_name}様（担当:{practitioner_name}）")
+    remaining = len(reservations) - limit
+    if remaining > 0:
+        lines.append(f"他{remaining}件")
+    return "\n".join(lines)
+
+
 async def check_hotpepper_unsynced_urgent_morning():
     """本日分のHP未転記予約を検出し、最優先の朝一アラートを出す（1日1回・cron）
 
@@ -105,13 +119,16 @@ async def check_hotpepper_unsynced_urgent_morning():
         day_start = datetime.combine(now.date(), dtime.min, tzinfo=JST)
         day_end = day_start + timedelta(days=1)
         result = await db.execute(
-            select(Reservation).where(
+            select(Reservation)
+            .where(
                 Reservation.hotpepper_synced == False,
                 Reservation.channel != "HOTPEPPER",
                 Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
                 Reservation.start_time >= day_start,
                 Reservation.start_time < day_end,
             )
+            .options(selectinload(Reservation.patient), selectinload(Reservation.practitioner))
+            .order_by(Reservation.start_time)
         )
         unsynced_today = result.scalars().all()
 
@@ -126,11 +143,12 @@ async def check_hotpepper_unsynced_urgent_morning():
             return
 
         count = len(unsynced_today)
+        detail = _format_unsynced_detail(unsynced_today)
         logger.info(f"HP urgent morning reminder: {count} unsynced today")
         await create_notification(
             db,
             "hotpepper_sync_reminder_urgent",
-            f"本日分のホットペッパーへの転記がされていない可能性があります！（{count}件・至急ご確認ください）",
+            f"本日分のホットペッパーへの転記がされていない可能性があります！（{count}件・至急ご確認ください）\n{detail}",
         )
         await db.commit()
 
@@ -141,13 +159,16 @@ async def check_hotpepper_unsynced_weekly():
         now = now_jst()
         horizon = now + timedelta(days=7)
         result = await db.execute(
-            select(Reservation).where(
+            select(Reservation)
+            .where(
                 Reservation.hotpepper_synced == False,
                 Reservation.channel != "HOTPEPPER",
                 Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
                 Reservation.start_time >= now,
                 Reservation.start_time <= horizon,
             )
+            .options(selectinload(Reservation.patient), selectinload(Reservation.practitioner))
+            .order_by(Reservation.start_time)
         )
         unsynced = result.scalars().all()
 
@@ -162,11 +183,12 @@ async def check_hotpepper_unsynced_weekly():
             return
 
         count = len(unsynced)
+        detail = _format_unsynced_detail(unsynced)
         logger.info(f"HP weekly reminder: {count} unsynced within 7 days")
         await create_notification(
             db,
             "hotpepper_sync_reminder",
-            f"HotPepper未押さえの予約が1週間以内に{count}件あります。HP同期画面で確認してください。",
+            f"HotPepper未押さえの予約が1週間以内に{count}件あります。HP同期画面で確認してください。\n{detail}",
         )
         await db.commit()
 

@@ -354,6 +354,8 @@ export const markNotificationRead = (id: number) =>
   api.put<Notification>(`/notifications/${id}/read`);
 export const deleteNotification = (id: number) =>
   api.delete(`/notifications/${id}`);
+export const deleteAllNotifications = () =>
+  api.delete('/notifications/');
 export const getAuditLogs = (limit = 200) =>
   api.get<AuditLog[]>('/audit-logs/', { params: { limit } });
 
