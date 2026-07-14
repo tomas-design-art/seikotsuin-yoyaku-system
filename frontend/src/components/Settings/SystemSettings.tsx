@@ -19,6 +19,8 @@ const SETTING_LABELS: Record<string, string> = {
 // 認証系の設定キーは汎用リストから除外
 const AUTH_KEYS = ['admin_username', 'admin_password_hash'];
 const INTERNAL_PREFIXES = ['staff_pin_failures:', 'staff_pin_lock_until:'];
+// 通知音の詳細設定は専用画面（/settings/notification-sound）で扱うため汎用リストから除外
+const NOTIFICATION_SOUND_DETAIL_KEYS = ['notification_sound', 'notification_sound_hotpepper', 'notification_sound_line', 'notification_sound_web'];
 
 export default function SystemSettings() {
   const [settings, setSettings] = useState<Setting[]>([]);
@@ -99,7 +101,9 @@ export default function SystemSettings() {
   };
 
   const displaySettings = settings.filter((s) => (
-    !AUTH_KEYS.includes(s.key) && !INTERNAL_PREFIXES.some((prefix) => s.key.startsWith(prefix))
+    !AUTH_KEYS.includes(s.key)
+    && !INTERNAL_PREFIXES.some((prefix) => s.key.startsWith(prefix))
+    && !NOTIFICATION_SOUND_DETAIL_KEYS.includes(s.key)
   ));
 
   return (

@@ -4,9 +4,8 @@ import {
   playNotificationSound,
   playAlertSound,
   playWarningSound,
-  playIncomingReservationSound,
-  playHotpepperReservationSound,
-  playWebReservationSound
+  playSoundPattern,
+  type SoundPatternId,
 } from '../utils/soundUtils';
 
 const AUDIO_PREF_KEY = 'notification_audio_enabled';
@@ -21,10 +20,11 @@ interface ToastNotification {
 export function useNotification() {
   const [toasts, setToasts] = useState<ToastNotification[]>([]);
   const [unreadCount, setUnreadCount] = useState(0);
-  // localStorage から初期値を復元
-  const [audioInitialized, setAudioInitialized] = useState<boolean>(
-    () => localStorage.getItem(AUDIO_PREF_KEY) === 'true'
-  );
+  // localStorage から初期値を復元（未設定の端末は「有効」をデフォルトにする＝聞き逃し防止のオプトアウト方式）
+  const [audioInitialized, setAudioInitialized] = useState<boolean>(() => {
+    const stored = localStorage.getItem(AUDIO_PREF_KEY);
+    return stored === null ? true : stored === 'true';
+  });
 
   // リロード後: 設定ONなら最初のユーザー操作で AudioContext を自動復元
   useEffect(() => {
@@ -51,7 +51,7 @@ export function useNotification() {
     (
       message: string,
       type: 'info' | 'warning' | 'error' | 'incoming' = 'info',
-      soundType?: 'hotpepper' | 'web'
+      soundPatternId?: SoundPatternId
     ) => {
       const id = Date.now().toString();
       const persistent = type === 'error';
@@ -70,13 +70,7 @@ export function useNotification() {
         } else if (type === 'warning') {
           playWarningSound();
         } else if (type === 'incoming') {
-          if (soundType === 'hotpepper') {
-            playHotpepperReservationSound();
-          } else if (soundType === 'web') {
-            playWebReservationSound();
-          } else {
-            playIncomingReservationSound();
-          }
+          playSoundPattern(soundPatternId ?? 'bright_ascend');
         } else {
           playNotificationSound();
         }

@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
-import { Calendar, Users, Settings, Stethoscope, Menu as MenuIcon, Volume2, VolumeX, Palette, Bot, CalendarDays, CheckCircle, Lock, Unlock, LogOut, X } from 'lucide-react';
+import { Calendar, Users, Settings, Stethoscope, Menu as MenuIcon, Volume2, VolumeX, Palette, Bot, CalendarDays, CheckCircle, Lock, Unlock, LogOut, X, Music2 } from 'lucide-react';
 import TimeTable from './components/TimeTable/TimeTable';
 import ReservationForm from './components/ReservationForm/ReservationForm';
 import ReservationDetail from './components/ReservationDetail';
@@ -11,6 +11,7 @@ import ChatbotSettings from './components/Settings/ChatbotSettings';
 import WeeklyScheduleManager from './components/Settings/WeeklyScheduleManager';
 import PractitionerScheduleManager from './components/Settings/PractitionerScheduleManager';
 import SystemSettings from './components/Settings/SystemSettings';
+import NotificationSoundSettings from './components/Settings/NotificationSoundSettings';
 import AuditLogViewer from './components/Settings/AuditLogViewer';
 import PatientList from './components/PatientList';
 import NotificationBell from './components/Notification/NotificationBell';
@@ -25,6 +26,7 @@ import PinLogin from './components/Auth/PinLogin';
 import { AuthProvider, useAuth } from './hooks/useAuth';
 import { useSSE } from './hooks/useSSE';
 import { useNotification } from './hooks/useNotification';
+import { useNotificationSoundSettings } from './hooks/useNotificationSoundSettings';
 import { rescheduleReservation, getSeries, getPendingSeriesAlerts, getScheduleConflictAlerts, getReservation } from './api/client';
 import { extractErrorMessage } from './utils/errorUtils';
 import type { Reservation, SeriesResponse } from './types';
@@ -105,6 +107,7 @@ function AppContent() {
   }, [isOperating]);
 
   const { toasts, unreadCount, audioInitialized, enableAudio, disableAudio, addToast, removeToast, clearUnread } = useNotification();
+  const { patternForChannel } = useNotificationSoundSettings();
 
   const handleSSEEvent = useCallback((event: { event_type: string; data: Record<string, unknown> }) => {
     const msg = (event.data.message as string) || event.event_type;
@@ -147,14 +150,15 @@ function AppContent() {
       }
     } else if (
       event.event_type === 'new_reservation' &&
-      ['HOTPEPPER', 'CHATBOT', 'WEB'].includes(event.data.channel as string)
+      ['HOTPEPPER', 'LINE', 'CHATBOT', 'WEB'].includes(event.data.channel as string)
     ) {
-      // 自動予約（ホットペッパー・ホームページ）: 着信音付きで通知
+      // 自動予約（ホットペッパー・ LINE・ホームページ/チャットボット）: スタッフ設定の通知音で通知
       const channel = event.data.channel as string;
-      if (channel === 'HOTPEPPER') {
-        addToast(msg, 'incoming', 'hotpepper');
+      const patternId = patternForChannel(channel);
+      if (patternId) {
+        addToast(msg, 'incoming', patternId);
       } else {
-        addToast(msg, 'incoming', 'web');
+        addToast(msg, 'incoming');
       }
     } else {
       addToast(msg, 'info');
@@ -377,6 +381,9 @@ function AppContent() {
                   <CalendarDays size={16} className="inline mr-1" />院営業スケジュール
                 </AdminNavLink>
                 <NavLink to="/settings/practitioner-schedules"><CalendarDays size={16} className="inline mr-1" />職員勤務スケジュール</NavLink>
+                <AdminNavLink to="/settings/notification-sound" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
+                  <Music2 size={16} className="inline mr-1" />通知音設定
+                </AdminNavLink>
                 <AdminNavLink to="/settings/audit-logs" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
                   <Settings size={16} className="inline mr-1" />監査ログ
                 </AdminNavLink>
@@ -463,6 +470,9 @@ function AppContent() {
                   <CalendarDays size={16} className="inline mr-1" />院営業スケジュール
                 </AdminNavLink>
                 <NavLink to="/settings/practitioner-schedules" onClick={closeMobileMenu}><CalendarDays size={16} className="inline mr-1" />職員勤務スケジュール</NavLink>
+                <AdminNavLink to="/settings/notification-sound" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
+                  <Music2 size={16} className="inline mr-1" />通知音設定
+                </AdminNavLink>
                 <AdminNavLink to="/settings/audit-logs" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
                   <Settings size={16} className="inline mr-1" />監査ログ
                 </AdminNavLink>
@@ -521,6 +531,7 @@ function AppContent() {
           <Route path="/settings/chatbot" element={<ChatbotSettings />} />
           <Route path="/settings/schedule" element={<WeeklyScheduleManager />} />
           <Route path="/settings/practitioner-schedules" element={<PractitionerScheduleManager />} />
+          <Route path="/settings/notification-sound" element={<NotificationSoundSettings />} />
           <Route path="/settings/audit-logs" element={<AuditLogViewer />} />
           <Route path="/settings" element={<SystemSettings />} />
           <Route path="/hotpepper" element={<HotPepperSync />} />
