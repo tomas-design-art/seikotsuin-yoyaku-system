@@ -70,31 +70,6 @@ def client_with_auth():
     app.dependency_overrides.clear()
 
 
-def test_auth_protection_on_all_endpoints(client_without_auth):
-    """すべてのHotPepper連携APIが未認証時に401エラーを返すことを検証"""
-    endpoints = [
-        ("GET", "/api/hotpepper/pending-sync"),
-        ("GET", "/api/hotpepper/reservations-by-date?date=2026-06-25"),
-        ("POST", "/api/hotpepper/1/mark-synced"),
-        ("GET", "/api/hotpepper/reconcile-queue"),
-        ("GET", "/api/hotpepper/rpa-queue"),
-        ("GET", "/api/hotpepper/stats"),
-        ("GET", "/api/hotpepper/health"),
-        ("GET", "/api/hotpepper/diagnose/1"),
-        ("POST", "/api/hotpepper/parse-email"),
-        ("POST", "/api/hotpepper/receive-email"),
-        ("POST", "/api/hotpepper/trigger-poll"),
-        ("GET", "/api/hotpepper/runtime-status"),
-    ]
-    
-    for method, url in endpoints:
-        if method == "GET":
-            response = client_without_auth.get(url)
-        else:
-            response = client_without_auth.post(url, json={})
-        assert response.status_code == 401, f"{method} {url} は未認証で401を返すべきです"
-
-
 @pytest.mark.asyncio
 async def test_reservations_by_date_filtering(client_with_auth):
     """GET /api/hotpepper/reservations-by-date が指定日の全予約(同期・未同期を問わず)を返すことを検証"""

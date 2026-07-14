@@ -943,7 +943,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                   </div>
                   {/* 曜日ヘッダー */}
                   <div className="grid grid-cols-7 mb-1">
-                    {['日', '月', '火', '水', '木', '金', '土'].map((lbl, i) => (
+                    {['日','月','火','水','木','金','土'].map((lbl, i) => (
                       <div key={lbl} className={`text-center text-[10px] font-medium pb-0.5 ${i === 0 ? 'text-red-500' : i === 6 ? 'text-blue-500' : 'text-gray-400'}`}>{lbl}</div>
                     ))}
                   </div>
@@ -965,10 +965,10 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
                           className={[
                             'text-[11px] w-7 h-7 mx-auto rounded-full flex items-center justify-center transition-colors',
                             tod ? 'bg-blue-500 text-white font-bold' :
-                              inWeek ? 'bg-blue-100 text-blue-800 font-semibold' :
-                                dow === 0 ? 'text-red-500 hover:bg-gray-100' :
-                                  dow === 6 ? 'text-blue-500 hover:bg-gray-100' :
-                                    'text-gray-700 hover:bg-gray-100',
+                            inWeek ? 'bg-blue-100 text-blue-800 font-semibold' :
+                            dow === 0 ? 'text-red-500 hover:bg-gray-100' :
+                            dow === 6 ? 'text-blue-500 hover:bg-gray-100' :
+                            'text-gray-700 hover:bg-gray-100',
                           ].join(' ')}
                         >
                           {d}
