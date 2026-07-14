@@ -1,6 +1,6 @@
 """HOLD自動失効ジョブ + チャットセッション自動expire + HP枠押さえリマインド + 通知ログ自動削除 + シリーズ残り通知"""
 import logging
-from datetime import timedelta
+from datetime import timedelta, datetime, time as dtime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select, delete
@@ -15,7 +15,7 @@ from app.models.notification_log import NotificationLog
 from app.services.notification_service import create_notification
 from app.services.schedule_conflict_alerts import collect_schedule_conflict_alerts
 from app.api.sse import broadcast_event
-from app.utils.datetime_jst import now_jst
+from app.utils.datetime_jst import now_jst, JST
 
 logger = logging.getLogger(__name__)
 
@@ -67,31 +67,108 @@ async def expire_chat_sessions():
             logger.info(f"Expired {len(sessions)} chat sessions")
 
 
-async def remind_hotpepper_sync():
-    """HP未押さえ予約のリマインド通知（30分間隔）"""
+async def _has_unread_notification_today(db, event_type: str) -> bool:
+    """同種の未読通知が本日すでに発報済みか（二重発報防止）"""
+    now = now_jst()
+    day_start = datetime.combine(now.date(), dtime.min, tzinfo=JST)
+    result = await db.execute(
+        select(NotificationLog).where(
+            NotificationLog.event_type == event_type,
+            NotificationLog.is_read == False,
+            NotificationLog.created_at >= day_start,
+        )
+    )
+    return result.scalars().first() is not None
+
+
+async def _delete_unread_notifications(db, event_type: str) -> int:
+    """未読通知を完全削除（対象が解消された場合の自動クリア用）"""
+    result = await db.execute(
+        select(NotificationLog).where(
+            NotificationLog.event_type == event_type,
+            NotificationLog.is_read == False,
+        )
+    )
+    stale = result.scalars().all()
+    for n in stale:
+        await db.delete(n)
+    return len(stale)
+
+
+async def check_hotpepper_unsynced_urgent_morning():
+    """本日分のHP未転記予約を検出し、最優先の朝一アラートを出す（1日1回・cron）
+
+    他のリマインドより優先度が高いイベント種別（hotpepper_sync_reminder_urgent）で発報する。
+    """
     async with async_session() as db:
         now = now_jst()
+        day_start = datetime.combine(now.date(), dtime.min, tzinfo=JST)
+        day_end = day_start + timedelta(days=1)
         result = await db.execute(
-            select(Reservation)
-            .where(
+            select(Reservation).where(
+                Reservation.hotpepper_synced == False,
+                Reservation.channel != "HOTPEPPER",
+                Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
+                Reservation.start_time >= day_start,
+                Reservation.start_time < day_end,
+            )
+        )
+        unsynced_today = result.scalars().all()
+
+        if not unsynced_today:
+            deleted = await _delete_unread_notifications(db, "hotpepper_sync_reminder_urgent")
+            if deleted:
+                await db.commit()
+                logger.info("HP urgent reminder auto-cleared: today's items all synced")
+            return
+
+        if await _has_unread_notification_today(db, "hotpepper_sync_reminder_urgent"):
+            return
+
+        count = len(unsynced_today)
+        logger.info(f"HP urgent morning reminder: {count} unsynced today")
+        await create_notification(
+            db,
+            "hotpepper_sync_reminder_urgent",
+            f"本日分のホットペッパーへの転記がされていない可能性があります！（{count}件・至急ご確認ください）",
+        )
+        await db.commit()
+
+
+async def check_hotpepper_unsynced_weekly():
+    """1週間以内の未転記予約をまとめて通知（1日1回・低優先度・cron）"""
+    async with async_session() as db:
+        now = now_jst()
+        horizon = now + timedelta(days=7)
+        result = await db.execute(
+            select(Reservation).where(
                 Reservation.hotpepper_synced == False,
                 Reservation.channel != "HOTPEPPER",
                 Reservation.status.in_(["CONFIRMED", "PENDING", "HOLD"]),
                 Reservation.start_time >= now,
+                Reservation.start_time <= horizon,
             )
-            .options(selectinload(Reservation.patient))
-            .order_by(Reservation.start_time)
         )
         unsynced = result.scalars().all()
-        if unsynced:
-            count = len(unsynced)
-            logger.info(f"HP sync reminder: {count} unsynced reservations")
-            await create_notification(
-                db,
-                "hotpepper_sync_reminder",
-                f"HotPepper未押さえの予約が {count} 件あります。HP同期画面で確認してください。",
-            )
-            await db.commit()
+
+        if not unsynced:
+            deleted = await _delete_unread_notifications(db, "hotpepper_sync_reminder")
+            if deleted:
+                await db.commit()
+                logger.info("HP weekly reminder auto-cleared: no unsynced within 7 days")
+            return
+
+        if await _has_unread_notification_today(db, "hotpepper_sync_reminder"):
+            return
+
+        count = len(unsynced)
+        logger.info(f"HP weekly reminder: {count} unsynced within 7 days")
+        await create_notification(
+            db,
+            "hotpepper_sync_reminder",
+            f"HotPepper未押さえの予約が1週間以内に{count}件あります。HP同期画面で確認してください。",
+        )
+        await db.commit()
 
 
 async def cleanup_old_notifications():
@@ -147,7 +224,7 @@ async def dismiss_stale_hotpepper_reminders():
             .join(Reservation, NotificationLog.reservation_id == Reservation.id)
             .where(
                 NotificationLog.event_type.in_([
-                    "hotpepper_sync_reminder", "hotpepper_sync", "hotpepper_hold_reminder"
+                    "hotpepper_sync_reminder", "hotpepper_sync", "hotpepper_sync_reminder_urgent"
                 ]),
                 NotificationLog.is_read == False,
                 Reservation.start_time < now,
@@ -165,7 +242,7 @@ async def dismiss_stale_hotpepper_reminders():
         result2 = await db.execute(
             select(NotificationLog).where(
                 NotificationLog.event_type.in_([
-                    "hotpepper_sync_reminder", "hotpepper_sync", "hotpepper_hold_reminder"
+                    "hotpepper_sync_reminder", "hotpepper_sync", "hotpepper_sync_reminder_urgent"
                 ]),
                 NotificationLog.is_read == False,
                 NotificationLog.reservation_id == None,
@@ -312,7 +389,9 @@ async def check_schedule_conflicts_morning():
 def start_hold_expiration_job():
     scheduler.add_job(expire_holds, "interval", minutes=1, id="hold_expiration")
     scheduler.add_job(expire_chat_sessions, "interval", minutes=10, id="chat_session_expiration")
-    scheduler.add_job(remind_hotpepper_sync, "interval", minutes=30, id="hotpepper_sync_reminder")
+    # HP未転記リマインドは1日2回に抑制: 朝一(最優先・本日分のみ)と午後(1週間分・低優先度)
+    scheduler.add_job(check_hotpepper_unsynced_urgent_morning, "cron", hour=8, minute=30, id="hotpepper_urgent_morning")
+    scheduler.add_job(check_hotpepper_unsynced_weekly, "cron", hour=15, minute=0, id="hotpepper_weekly_reminder")
     scheduler.add_job(dismiss_stale_hotpepper_reminders, "interval", hours=1, id="hp_stale_dismiss")
     scheduler.add_job(
         poll_hotpepper_mail_job,

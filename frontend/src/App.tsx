@@ -129,6 +129,9 @@ function AppContent() {
       setShowConflictAlertModal(true);
     } else if (event.event_type === 'hold_expired') {
       addToast(msg, 'warning');
+    } else if (event.event_type === 'hotpepper_sync_reminder_urgent') {
+      // 本日分のHP未転記 — 最優先アラート（自動で消えない）
+      addToast(msg, 'error');
     } else if (event.event_type === 'hotpepper_sync_reminder') {
       addToast(msg, 'warning');
     } else if (event.event_type === 'hotpepper_synced') {

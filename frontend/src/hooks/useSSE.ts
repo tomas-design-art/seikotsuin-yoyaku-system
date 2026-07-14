@@ -38,6 +38,7 @@ export function useSSE(onEvent: (event: SSEEvent) => void) {
       'hotpepper_import',
       'line_proposal',
       'hotpepper_sync_reminder',
+      'hotpepper_sync_reminder_urgent',
       'hotpepper_hold_reminder',
       'hotpepper_synced',
       'unavailable_time_updated',

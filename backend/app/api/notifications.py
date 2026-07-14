@@ -44,3 +44,17 @@ async def mark_read(notification_id: int, db: AsyncSession = Depends(get_db)):
     await db.commit()
     await db.refresh(notif)
     return notif
+
+
+@router.delete("/{notification_id}")
+async def delete_notification(notification_id: int, db: AsyncSession = Depends(get_db)):
+    """スタッフが「完了」を確認した通知を完全に削除する（既読ではなく抹消）"""
+    result = await db.execute(
+        select(NotificationLog).where(NotificationLog.id == notification_id)
+    )
+    notif = result.scalar_one_or_none()
+    if not notif:
+        raise HTTPException(status_code=404, detail="通知が見つかりません")
+    await db.delete(notif)
+    await db.commit()
+    return {"status": "ok", "id": notification_id}

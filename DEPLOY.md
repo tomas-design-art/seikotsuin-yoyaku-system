@@ -171,6 +171,10 @@ Render の Environment に以下を設定:
 - `CHATBOT_ALLOWED_ORIGINS=https://<embed-site-domain>`
 - `GEMINI_API_KEY`（利用時）
 - `LINE_CHANNEL_SECRET` / `LINE_CHANNEL_ACCESS_TOKEN`（利用時）
+- `MAIL_PROVIDER=icloud-imap`（HotPepperメール自動取得を使う場合、必須）
+- `ICLOUD_EMAIL` / `ICLOUD_APP_PASSWORD`（**サービス移設時に忘れやすい。未設定だとポーリングが黙ってスキップされ続ける**）
+- `IMAP_HOST` / `IMAP_PORT` / `IMAP_MAILBOX`（デフォルト値と異なる場合のみ）
+- `HOTPEPPER_SENDER_FILTERS`（利用時）
 
 ### 2. Frontend (Static Site)
 

@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo } from 'react';
-import { X, Trash2 } from 'lucide-react';
+import { X, Trash2, Check } from 'lucide-react';
 import type { Notification } from '../../types';
-import { getNotifications, markNotificationRead } from '../../api/client';
+import { getNotifications, deleteNotification } from '../../api/client';
 
 interface NotificationPanelProps {
   onClose: () => void;
@@ -12,61 +12,38 @@ export default function NotificationPanel({ onClose, dismissedIds }: Notificatio
   const [notifications, setNotifications] = useState<Notification[]>([]);
   const [hiddenIds, setHiddenIds] = useState<Set<number>>(new Set());
 
-  const persistHiddenIds = (next: Set<number>) => {
-    try {
-      localStorage.setItem('notification_hidden_ids_v1', JSON.stringify(Array.from(next)));
-    } catch {
-      // ignore storage errors
-    }
-  };
-
   useEffect(() => {
-    try {
-      const raw = localStorage.getItem('notification_hidden_ids_v1');
-      if (!raw) return;
-      const parsed = JSON.parse(raw) as number[];
-      setHiddenIds(new Set(parsed.filter((id) => Number.isFinite(id))));
-    } catch {
-      setHiddenIds(new Set());
-    }
+    getNotifications().then((res) => setNotifications(res.data ?? [])).catch(() => setNotifications([]));
   }, []);
 
-  // RPA完了などで外部からdismissされたIDを反映
+  // RPA完了などで外部からdismissされたIDを反映（サーバー側で既に削除済みなので表示からも除く）
   useEffect(() => {
     if (!dismissedIds || dismissedIds.size === 0) return;
     setHiddenIds((prev) => {
       const next = new Set(prev);
       dismissedIds.forEach((id) => next.add(id));
-      persistHiddenIds(next);
       return next;
     });
   }, [dismissedIds]);
 
-  useEffect(() => {
-    getNotifications().then((res) => setNotifications(res.data ?? [])).catch(() => setNotifications([]));
-  }, []);
-
-  const handleHideNotification = async (id: number) => {
-    const next = new Set(hiddenIds);
-    next.add(id);
-    setHiddenIds(next);
-    persistHiddenIds(next);
-
+  // 「完了」チェック: 通知を完全に削除する（既読フラグではなく抹消。全端末で消える）
+  const handleCompleteNotification = async (id: number) => {
+    setHiddenIds((prev) => new Set(prev).add(id));
     try {
-      await markNotificationRead(id);
-      setNotifications((prev) =>
-        prev.map((n) => (n.id === id ? { ...n, is_read: true } : n))
-      );
+      await deleteNotification(id);
     } catch {
-      // 表示上の削除を優先するため、既読API失敗でも復元しない
+      // 削除APIが失敗しても表示上は消したままにする（次回リロード時に復活する可能性あり）
     }
   };
 
-  const handleClearAllVisible = () => {
-    const next = new Set(hiddenIds);
-    notifications.forEach((n) => next.add(n.id));
-    setHiddenIds(next);
-    persistHiddenIds(next);
+  const handleClearAllVisible = async () => {
+    const targets = notifications.filter((n) => !hiddenIds.has(n.id));
+    setHiddenIds((prev) => {
+      const next = new Set(prev);
+      targets.forEach((n) => next.add(n.id));
+      return next;
+    });
+    await Promise.allSettled(targets.map((n) => deleteNotification(n.id)));
   };
 
   const visibleNotifications = useMemo(
@@ -87,6 +64,7 @@ export default function NotificationPanel({ onClose, dismissedIds }: Notificatio
     line_proposal: 'LINE予約提案',
     hotpepper_cancel_remind: 'HPキャンセルリマインド',
     hotpepper_sync_reminder: 'HP押さえリマインド',
+    hotpepper_sync_reminder_urgent: '【至急】HP押さえリマインド',
     hotpepper_hold_reminder: 'HP押さえリマインド',
   };
 
@@ -98,10 +76,10 @@ export default function NotificationPanel({ onClose, dismissedIds }: Notificatio
           <button
             onClick={handleClearAllVisible}
             className="inline-flex items-center gap-1 px-2 py-1 text-xs hover:bg-gray-100 rounded text-gray-600 hover:text-gray-800"
-            title="ゴミ箱（表示上の全消し）"
+            title="表示中の通知をすべて完了にする"
           >
             <Trash2 size={13} />
-            ゴミ箱
+            すべて完了
           </button>
         </div>
         <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded"><X size={18} /></button>
@@ -110,29 +88,34 @@ export default function NotificationPanel({ onClose, dismissedIds }: Notificatio
         {visibleNotifications.length === 0 && (
           <p className="p-4 text-center text-gray-500 text-sm">通知はありません</p>
         )}
-        {visibleNotifications.map((n) => (
-          <div
-            key={n.id}
-            className={`px-4 py-3 border-b text-sm ${n.is_read ? 'bg-white' : 'bg-blue-50'}`}
-          >
-            <div className="flex items-center justify-between mb-1">
-              <span className="text-xs font-medium text-gray-500">
-                {EVENT_LABELS[n.event_type] || n.event_type}
-              </span>
-              <button
-                onClick={() => handleHideNotification(n.id)}
-                className="text-gray-400 hover:text-gray-700"
-                title="この通知を非表示"
-              >
-                <X size={14} />
-              </button>
+        {visibleNotifications.map((n) => {
+          const isUrgent = n.event_type === 'hotpepper_sync_reminder_urgent';
+          return (
+            <div
+              key={n.id}
+              className={`px-4 py-3 border-b text-sm ${isUrgent ? 'bg-red-50' : n.is_read ? 'bg-white' : 'bg-blue-50'
+                }`}
+            >
+              <div className="flex items-center justify-between mb-1">
+                <span className={`text-xs font-medium ${isUrgent ? 'text-red-600' : 'text-gray-500'}`}>
+                  {EVENT_LABELS[n.event_type] || n.event_type}
+                </span>
+                <button
+                  onClick={() => handleCompleteNotification(n.id)}
+                  className="inline-flex items-center gap-1 px-1.5 py-0.5 text-xs text-gray-500 hover:text-green-700 hover:bg-green-50 rounded"
+                  title="完了（この通知を消す）"
+                >
+                  <Check size={14} />
+                  完了
+                </button>
+              </div>
+              <p className="text-gray-700">{n.message}</p>
+              <p className="text-xs text-gray-400 mt-1">
+                {new Date(n.created_at).toLocaleString('ja-JP')}
+              </p>
             </div>
-            <p className="text-gray-700">{n.message}</p>
-            <p className="text-xs text-gray-400 mt-1">
-              {new Date(n.created_at).toLocaleString('ja-JP')}
-            </p>
-          </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
