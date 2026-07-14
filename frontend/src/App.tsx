@@ -1,6 +1,6 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Link, Navigate, useLocation, useNavigate } from 'react-router-dom';
-import { Calendar, Users, Settings, Stethoscope, Menu as MenuIcon, Volume2, VolumeX, Palette, Bot, CalendarDays, CheckCircle, Lock, Unlock, LogOut, X, Music2 } from 'lucide-react';
+import { Calendar, Users, Settings, Menu as MenuIcon, Volume2, VolumeX, CalendarDays, CheckCircle, Lock, Unlock, LogOut, X, Building2 } from 'lucide-react';
 import TimeTable from './components/TimeTable/TimeTable';
 import ReservationForm from './components/ReservationForm/ReservationForm';
 import ReservationDetail from './components/ReservationDetail';
@@ -10,8 +10,9 @@ import ColorManager from './components/Settings/ColorManager';
 import ChatbotSettings from './components/Settings/ChatbotSettings';
 import WeeklyScheduleManager from './components/Settings/WeeklyScheduleManager';
 import PractitionerScheduleManager from './components/Settings/PractitionerScheduleManager';
-import SystemSettings from './components/Settings/SystemSettings';
 import NotificationSoundSettings from './components/Settings/NotificationSoundSettings';
+import ClinicInfoSettings from './components/Settings/ClinicInfoSettings';
+import SettingsHub from './components/Settings/SettingsHub';
 import AuditLogViewer from './components/Settings/AuditLogViewer';
 import PatientList from './components/PatientList';
 import NotificationBell from './components/Notification/NotificationBell';
@@ -365,32 +366,17 @@ function AppContent() {
               <nav className="hidden md:flex items-center gap-1 flex-wrap">
                 <NavLink to="/timetable"><Calendar size={16} className="inline mr-1" />タイムテーブル</NavLink>
                 <NavLink to="/patients" locked={role !== 'staff' && role !== 'admin'}><Users size={16} className="inline mr-1" />患者</NavLink>
-                <AdminNavLink to="/settings/practitioners" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                  <Stethoscope size={16} className="inline mr-1" />施術者
-                </AdminNavLink>
-                <AdminNavLink to="/settings/menus" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                  <MenuIcon size={16} className="inline mr-1" />メニュー
-                </AdminNavLink>
-                <AdminNavLink to="/settings/colors" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                  <Palette size={16} className="inline mr-1" />色設定
-                </AdminNavLink>
-                <AdminNavLink to="/settings/chatbot" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                  <Bot size={16} className="inline mr-1" />チャットボット
-                </AdminNavLink>
-                <AdminNavLink to="/settings/schedule" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                  <CalendarDays size={16} className="inline mr-1" />院営業スケジュール
-                </AdminNavLink>
                 <NavLink to="/settings/practitioner-schedules"><CalendarDays size={16} className="inline mr-1" />職員勤務スケジュール</NavLink>
-                <AdminNavLink to="/settings/notification-sound" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
-                  <Music2 size={16} className="inline mr-1" />通知音設定
-                </AdminNavLink>
+                <NavLink to="/hotpepper">🔥 HP同期</NavLink>
                 <AdminNavLink to="/settings/audit-logs" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
                   <Settings size={16} className="inline mr-1" />監査ログ
+                </AdminNavLink>
+                <AdminNavLink to="/settings/clinic-info" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
+                  <Building2 size={16} className="inline mr-1" />院情報設定
                 </AdminNavLink>
                 <AdminNavLink to="/settings" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget}>
                   <Settings size={16} className="inline mr-1" />設定
                 </AdminNavLink>
-                <NavLink to="/hotpepper">🔥 HP同期</NavLink>
               </nav>
             </div>
             <div className="flex items-center gap-2">
@@ -454,32 +440,17 @@ function AppContent() {
                 </div>
                 <NavLink to="/timetable" onClick={closeMobileMenu}><Calendar size={16} className="inline mr-1" />タイムテーブル</NavLink>
                 <NavLink to="/patients" locked={role !== 'staff' && role !== 'admin'} onClick={closeMobileMenu}><Users size={16} className="inline mr-1" />患者</NavLink>
-                <AdminNavLink to="/settings/practitioners" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
-                  <Stethoscope size={16} className="inline mr-1" />施術者
-                </AdminNavLink>
-                <AdminNavLink to="/settings/menus" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
-                  <MenuIcon size={16} className="inline mr-1" />メニュー
-                </AdminNavLink>
-                <AdminNavLink to="/settings/colors" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
-                  <Palette size={16} className="inline mr-1" />色設定
-                </AdminNavLink>
-                <AdminNavLink to="/settings/chatbot" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
-                  <Bot size={16} className="inline mr-1" />チャットボット
-                </AdminNavLink>
-                <AdminNavLink to="/settings/schedule" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
-                  <CalendarDays size={16} className="inline mr-1" />院営業スケジュール
-                </AdminNavLink>
                 <NavLink to="/settings/practitioner-schedules" onClick={closeMobileMenu}><CalendarDays size={16} className="inline mr-1" />職員勤務スケジュール</NavLink>
-                <AdminNavLink to="/settings/notification-sound" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
-                  <Music2 size={16} className="inline mr-1" />通知音設定
-                </AdminNavLink>
+                <NavLink to="/hotpepper" onClick={closeMobileMenu}>🔥 HP同期</NavLink>
                 <AdminNavLink to="/settings/audit-logs" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
                   <Settings size={16} className="inline mr-1" />監査ログ
+                </AdminNavLink>
+                <AdminNavLink to="/settings/clinic-info" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
+                  <Building2 size={16} className="inline mr-1" />院情報設定
                 </AdminNavLink>
                 <AdminNavLink to="/settings" isAdmin={isAdmin} onRequireAdmin={setAdminLoginTarget} onNavigate={closeMobileMenu}>
                   <Settings size={16} className="inline mr-1" />設定
                 </AdminNavLink>
-                <NavLink to="/hotpepper" onClick={closeMobileMenu}>🔥 HP同期</NavLink>
               </nav>
             </div>
           )}
@@ -532,8 +503,9 @@ function AppContent() {
           <Route path="/settings/schedule" element={<WeeklyScheduleManager />} />
           <Route path="/settings/practitioner-schedules" element={<PractitionerScheduleManager />} />
           <Route path="/settings/notification-sound" element={<NotificationSoundSettings />} />
+          <Route path="/settings/clinic-info" element={<ClinicInfoSettings />} />
           <Route path="/settings/audit-logs" element={<AuditLogViewer />} />
-          <Route path="/settings" element={<SystemSettings />} />
+          <Route path="/settings" element={<SettingsHub />} />
           <Route path="/hotpepper" element={<HotPepperSync />} />
           <Route path="/reserve" element={<PublicReserve />} />
           <Route path="*" element={<Navigate to="/timetable" replace />} />
