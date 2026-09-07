@@ -4831,3 +4831,78 @@ async def test_a_button_from_an_older_offer_is_not_applied():
     mock_merge.assert_not_awaited()
     mock_mode.assert_not_awaited()
     assert "入れ替わりました" in mock_reply.await_args.args[1]
+
+
+# ─────────────────────────────────────────────────────────────
+# 施術時間の箱が汚れない（2026-09-07 実機）
+# ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("60分で", 60),
+    ("マッスルセラピーを60分お願いします", 60),
+    ("90分", 90),
+    ("60", 60),
+    ("30分", 30),
+])
+def test_a_stated_treatment_length_is_kept(text, expected):
+    from app.api.line import _extract_duration_minutes
+
+    assert _extract_duration_minutes(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "2",            # 候補の番号。以前は 2分 として箱に入っていた
+    "1",
+    "10時30分に予約",  # 時刻の一部。以前は 30分 として拾っていた
+    "5分",          # 施術時間としてありえない
+    "300分",
+    "1時間で",
+])
+def test_a_number_that_is_not_a_treatment_length_is_ignored(text):
+    from app.api.line import _extract_duration_minutes
+
+    assert _extract_duration_minutes(text) is None
+
+
+@pytest.mark.asyncio
+async def test_the_usual_preset_does_not_overwrite_what_the_patient_said():
+    """「いつもの」は空いている箱を埋めるだけ。患者が述べた値は残す。
+
+    2026-09-07 実機:「マッスルセラピーを60分お願いします」の60分が
+    preset の値で上書きされ、同じ質問へ戻り続けた。
+    """
+    from app.api.line import _merge_autopilot_slots
+
+    patient = SimpleNamespace(id=7, name="時田信")
+    preset = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "duration_minutes": 30,
+        "practitioner_id": 1,
+        "practitioner_name": "時田",
+    }
+    saved: dict = {}
+
+    async def fake_merge(_db, _uid, update, *_a, **_k):
+        saved.update(update)
+        return dict(update)
+
+    with patch("app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)), patch(
+        "app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)
+    ), patch("app.api.line._resolve_booking_defaults", new=AsyncMock(return_value={})), patch(
+        "app.api.line._resolve_menu", new=AsyncMock(return_value=None)
+    ), patch("app.api.line.merge_user_draft", new=fake_merge):
+        await _merge_autopilot_slots(
+            _EmptyDB(),
+            user_id="U-usual-keep",
+            text="いつものマッスルセラピーを60分お願いします",
+            patient=patient,
+            previous={},
+            parsed={"duration_minutes": 60, "constraints": []},
+        )
+
+    # 患者が述べた60分が残る（presetの30分で上書きされない）
+    assert saved["duration_minutes"] == 60
+    # 述べていない担当は preset で埋まる
+    assert saved["practitioner_id"] == 1

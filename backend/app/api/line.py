@@ -439,12 +439,28 @@ def _conversation_is_expired(state: dict, now: datetime | None = None) -> bool:
         return False
 
 
+# 施術時間として受け取ってよい範囲。これを外れる数字は時間ではない。
+_MIN_STATED_DURATION = 10
+_MAX_STATED_DURATION = 240
+# 「10時30分」の30分を施術時間として拾わないよう、時刻の一部は除く。
+_STATED_DURATION = re.compile(r"(?<![時:：\d])(\d{2,3})\s*分(?!前|後)")
+
+
 def _extract_duration_minutes(text: str) -> int | None:
-    m = re.search(r"(\d{2,3})\s*分", text)
-    if m:
-        return int(m.group(1))
-    if text.isdigit():
-        return int(text)
+    """患者が述べた施術時間を取り出す。
+
+    以前は本文が数字だけなら何でも施術時間として採っていたため、
+    候補への返答「2」で duration_minutes=2 が箱に入っていた。
+    「10時30分」の「30分」も施術時間として拾っていた（2026-09-07 実機）。
+    """
+    stated = _STATED_DURATION.search(text or "")
+    if stated:
+        minutes = int(stated.group(1))
+        return minutes if _MIN_STATED_DURATION <= minutes <= _MAX_STATED_DURATION else None
+    bare = (text or "").strip()
+    if bare.isdigit():
+        minutes = int(bare)
+        return minutes if _MIN_STATED_DURATION <= minutes <= _MAX_STATED_DURATION else None
     return None
 
 
@@ -1628,9 +1644,19 @@ async def _merge_autopilot_slots(
     menu_hint = parsed.get("menu_name") or parsed.get("menu_hint")
     wants_usual = menu_hint == "usual" or bool(re.search(r"いつもの|前回と同じ|この前と同じ", text)) or text.startswith("⭐️いつもの")
     if wants_usual:
+        # 「いつもの」は空いている箱を埋めるだけ。患者が述べた値は上書きしない。
+        # 以前は preset で必ず上書きしていたため、「マッスルセラピーを60分お願いします」の
+        # 60分が捨てられ、同じ質問へ戻り続けた（2026-09-07 実機）。
+        def _fill_gaps(values: dict) -> None:
+            for key, value in values.items():
+                if value in (None, ""):
+                    continue
+                if update.get(key) in (None, "") and previous.get(key) in (None, ""):
+                    update[key] = value
+
         preset = await _get_patient_default_preset(db, patient)
         if preset:
-            update.update(
+            _fill_gaps(
                 {
                     "menu_id": preset["menu_id"],
                     "menu_name": preset["menu_name"],
@@ -1642,7 +1668,7 @@ async def _merge_autopilot_slots(
         else:
             latest = await _get_latest_reservation_for_line_user(db, user_id)
             if latest:
-                update.update(
+                _fill_gaps(
                     {
                         "menu_id": latest.get("menu_id"),
                         "menu_name": latest["menu_name"],
