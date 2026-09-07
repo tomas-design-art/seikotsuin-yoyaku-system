@@ -36,6 +36,7 @@ from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.booking_form import Form as BookingForm
 from app.services.line_composer import compose_from_plan, compose_reply
+from app.services import offered_slots
 from app.services.reply_plan import ReplyPlan, plan_for
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
 from app.services.line_inbox import (
@@ -231,6 +232,7 @@ _AUTOPILOT_BOOKING_MODES = {
     "waiting_time_duration",
     "autopilot_confirm_usual",
     "autopilot_booking_confirm",
+    "autopilot_slot_confirm",
     "adjusting",
     "autopilot_cancel_select",
     "autopilot_cancel_confirm",
@@ -996,6 +998,7 @@ async def _find_change_target_reservation(
 # 確認ボタンが、どの場面の「はい/いいえ」なのか。
 # ボタンを押した時点で会話が別の場面へ進んでいたら、その答えは適用しない。
 _CONFIRM_FORM_MODES = {
+    "slot": "autopilot_slot_confirm",
     "booking": "autopilot_booking_confirm",
     "usual": "autopilot_confirm_usual",
     "cancel": "autopilot_cancel_confirm",
@@ -1086,6 +1089,72 @@ async def _reply_plan(reply_token: str | None, form: str, plan: ReplyPlan) -> No
         await compose_from_plan(plan),
         _build_confirmation_quick_reply_items(form),
     )
+
+
+async def _offer_candidates(
+    db: AsyncSession,
+    user_id: str,
+    candidates: list[dict],
+    duration_minutes: int | None = None,
+    request_id: str | None = None,
+) -> offered_slots.Offer:
+    """提示する候補を1箇所へ保存し、選択待ちにする。
+
+    番号と枠の対応を文章から切り離すため、保存はここだけで行う。
+    以前は request と draft の2箇所に別々に書いており、
+    画面に出ていない枠が番号で確定した（2026-09-07 実機・本番DB #2572）。
+    """
+    offer = offered_slots.new_offer(candidates, duration_minutes)
+    await merge_user_draft(db, user_id, offer.to_draft(), request_id)
+    await set_user_mode(db, user_id, "adjusting", request_id)
+    return offer
+
+
+async def _reply_offer(reply_token: str | None, offer: offered_slots.Offer, message: str) -> None:
+    """候補の文面に、その候補を指すボタンを添えて送る。"""
+    if not reply_token:
+        return
+    await reply_text_with_quick_reply(reply_token, message, offered_slots.quick_reply_items(offer))
+
+
+def _picked_slot_plan(candidate: dict, menu_name: str | None = None) -> ReplyPlan:
+    """選ばれた枠の確認。日時・担当はここで決まり、LLMは言い回しだけ整える。"""
+    day = candidate.get("date") or ""
+    start = str(candidate.get("start") or "")
+    end = str(candidate.get("end") or "")
+    practitioner = str(candidate.get("practitioner_name") or "")
+    try:
+        day_label = _format_date_with_weekday_jp(date.fromisoformat(str(day)))
+    except (TypeError, ValueError):
+        day_label = str(day)
+    detail = f"{day_label} {start}〜{end}"
+    parts = [f"担当: {practitioner}"] if practitioner else []
+    if menu_name:
+        parts.append(f"メニュー: {menu_name}")
+    if parts:
+        detail += "（" + "・".join(parts) + "）"
+    keep = [day_label, start, end] + ([practitioner] if practitioner else [])
+    return ReplyPlan(
+        facts=[detail],
+        ask="こちらでご予約をお取りしてよろしいですか？",
+        ask_about="よろしい",
+        yes_no=True,
+        keep=[term for term in keep if term],
+    )
+
+
+async def _confirm_picked_slot(
+    db: AsyncSession,
+    user_id: str,
+    reply_token: str | None,
+    candidate: dict,
+    menu_name: str | None = None,
+    request_id: str | None = None,
+) -> None:
+    """選ばれた枠を確認へ回す。ここでは予約を作らない。"""
+    await merge_user_draft(db, user_id, {"autopilot_picked_slot": dict(candidate)}, request_id)
+    await set_user_mode(db, user_id, "autopilot_slot_confirm", request_id)
+    await _reply_plan(reply_token, "slot", _picked_slot_plan(candidate, menu_name))
 
 
 async def _reply_confirmation(reply_token: str | None, form: str, message: str) -> None:
@@ -2073,9 +2142,9 @@ async def _reoffer_autopilot_candidates(
 
     # 患者が新しい日付を明示したら、前回の条件（「短くてもいい」等）は引き継がない。
     # 引き継ぐと、以前の会話で言った条件がいつまでも生き残って別日の検索を歪める。
-    offered_slots = draft.get("autopilot_offered_slots") or []
+    previous_offer = draft.get("autopilot_offered_slots") or []
     requested_date = _parse_iso_date((parsed_intent or {}).get("date"))
-    previous_date = _parse_iso_date(offered_slots[0].get("date") if offered_slots else None)
+    previous_date = _parse_iso_date(previous_offer[0].get("date") if previous_offer else None)
     starts_new_search = bool(requested_date and previous_date and requested_date != previous_date)
     merged_filters = (
         filters
@@ -2208,10 +2277,12 @@ async def _reoffer_autopilot_candidates(
     else:
         request_id = await create_pending_request(db, payload)
 
+    offer = offered_slots.new_offer(candidates, search_duration)
     await merge_user_draft(
         db,
         user_id,
         {
+            **offer.to_draft(),
             "autopilot_filters": merged_filters.to_dict(),
             "autopilot_offered_slots": _to_offered_slots(candidates),
             "autopilot_offer_duration": search_duration,
@@ -2226,8 +2297,9 @@ async def _reoffer_autopilot_candidates(
     )
     await set_user_mode(db, user_id, "adjusting", request_id)
     if reply_token:
-        await reply_to_line(
+        await _reply_offer(
             reply_token,
+            offer,
             await _compose_autopilot_reply(
                 "offer_alternatives",
                 {
@@ -2758,11 +2830,192 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
         return
 
+    if is_autopilot_patient and current_mode == "autopilot_slot_confirm":
+        picked = prev_draft.get("autopilot_picked_slot")
+        if not isinstance(picked, dict):
+            await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "ask_datetime", {"patient_name": line_patient.name, "patient_message": text}, parsed_intent
+                    ),
+                )
+            return
+
+        if _is_negative(text):
+            await merge_user_draft(db, user_id, {"autopilot_picked_slot": {}}, user_state.get("request_id"))
+            offer = offered_slots.from_draft(prev_draft)
+            if offer:
+                await set_user_mode(db, user_id, "adjusting", user_state.get("request_id"))
+                await _reply_offer(
+                    reply_token,
+                    offer,
+                    await _compose_autopilot_reply(
+                        "offer_alternatives",
+                        {"alternatives": offer.candidates, "vague": True, "patient_message": text},
+                        parsed_intent,
+                    ),
+                )
+            else:
+                await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
+                if reply_token:
+                    await reply_to_line(
+                        reply_token,
+                        await _compose_autopilot_reply(
+                            "ask_datetime", {"patient_name": line_patient.name, "patient_message": text}, parsed_intent
+                        ),
+                    )
+            return
+
+        if not _is_affirmative(text):
+            await _reply_plan(reply_token, "slot", _picked_slot_plan(picked, prev_draft.get("menu_name")))
+            return
+
+        try:
+            start_dt = datetime.combine(
+                date.fromisoformat(str(picked["date"])), time.fromisoformat(str(picked["start"])), tzinfo=JST
+            )
+            end_dt = datetime.combine(
+                date.fromisoformat(str(picked["date"])), time.fromisoformat(str(picked["end"])), tzinfo=JST
+            )
+        except (KeyError, TypeError, ValueError):
+            await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "ask_datetime", {"patient_name": line_patient.name, "patient_message": text}, parsed_intent
+                    ),
+                )
+            return
+
+        # ★予約を作る直前の検算。患者が選んだ枠と、これから作る枠が同じか。
+        #   画面に出ていない枠が確定した事故（2026-09-07・本番DB #2572）を、
+        #   ここで構造的に止める。
+        if not offered_slots.matches_slot(
+            picked,
+            practitioner_id=picked.get("practitioner_id"),
+            start_iso=start_dt.isoformat(),
+            end_iso=end_dt.isoformat(),
+        ):
+            logger.error(
+                "LINE autopilot picked slot mismatch: picked=%s start=%s",
+                picked,
+                start_dt.isoformat(),
+            )
+            await _handoff_autopilot_to_human(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                notification=f"LINE予約の枠が選択と一致せず中止: {line_patient.id}",
+            )
+            return
+
+        try:
+            await _assert_bookable_duration(db, prev_draft.get("menu_id"), start_dt, end_dt)
+            reservation = await create_reservation(
+                db,
+                ReservationCreate(
+                    patient_id=line_patient.id,
+                    practitioner_id=int(picked["practitioner_id"]),
+                    menu_id=prev_draft.get("menu_id"),
+                    start_time=start_dt,
+                    end_time=end_dt,
+                    channel="LINE",
+                    notes="LINE AI秘書 候補選択確定",
+                    source_ref=_line_reservation_source_ref(),
+                ),
+                reject_conflicts=True,
+            )
+        except (HTTPException, ValueError):
+            await set_user_mode(db, user_id, "adjusting", user_state.get("request_id"))
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply("slot_taken", {"patient_message": text}, parsed_intent),
+                )
+            return
+
+        request_id = user_state.get("request_id")
+        if request_id:
+            await update_request(
+                db, request_id, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id")
+            )
+        practitioner_name = picked.get("practitioner_name") or "担当者"
+        await clear_user_draft(db, user_id)
+        await remember_completed_booking(
+            db,
+            user_id,
+            {
+                "date": start_dt.strftime("%Y/%m/%d"),
+                "start": start_dt.strftime("%H:%M"),
+                "end": end_dt.strftime("%H:%M"),
+                "practitioner": practitioner_name,
+            },
+        )
+        await set_user_mode(db, user_id, "idle")
+        if reply_token:
+            await reply_to_line(
+                reply_token,
+                await _compose_autopilot_reply(
+                    "confirmed",
+                    {
+                        "date": start_dt.strftime("%Y/%m/%d"),
+                        "start": start_dt.strftime("%H:%M"),
+                        "end": end_dt.strftime("%H:%M"),
+                        "practitioner": practitioner_name,
+                        "menu": prev_draft.get("menu_name"),
+                        "patient_message": text,
+                    },
+                    parsed_intent,
+                ),
+            )
+        return
+
     if is_autopilot_patient and current_mode == "adjusting":
+        # 番号は「保存した候補」にだけ照合する。本文が番号だけのときに限る。
+        # 以前は本文から最初の孤立した1桁を拾い、別の場所に保存された古い候補を
+        # 引いていたため、画面に出ていない枠が確定した（2026-09-07 実機）。
+        stored_offer = offered_slots.from_draft(prev_draft)
+        picked_index = None
+        if stored_offer:
+            picked_index = offered_slots.selected_index(text)
+            if picked_index is None:
+                # 「19:30からお願いします」のような答え方も、保存した候補にだけ照合する
+                picked_index = offered_slots.selected_index_by_time(text, stored_offer)
+        if stored_offer and picked_index is not None:
+            candidate = stored_offer.at(picked_index)
+            if candidate is None:
+                await _reply_offer(
+                    reply_token,
+                    stored_offer,
+                    await _compose_autopilot_reply(
+                        "offer_alternatives",
+                        {"alternatives": stored_offer.candidates, "vague": True, "patient_message": text},
+                        parsed_intent,
+                    ),
+                )
+                return
+            await _confirm_picked_slot(
+                db,
+                user_id,
+                reply_token,
+                candidate,
+                prev_draft.get("menu_name"),
+                user_state.get("request_id"),
+            )
+            return
+
         request_id = user_state.get("request_id")
         request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
         alternatives = request_data.get("alternatives") if request_data else None
-        selected_choice = _select_offered_alternative(text, alternatives) if alternatives else None
+        # 番号選択は上の分岐で、保存した候補にだけ照合して処理する。
+        # ここで request の古い候補を引くと、画面に出ていない枠が確定する。
+        selected_choice = None
         if alternatives and selected_choice is not None:
             alternative = alternatives[selected_choice - 1]
             try:
@@ -3022,10 +3275,10 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     await _compose_autopilot_reply("change_target_missing", {"patient_message": text}, parsed),
                 )
             return
-        offered_slots = prev_draft.get("autopilot_change_offered_slots") or []
-        selected_choice = _select_change_alternative(text, offered_slots)
+        change_offer = prev_draft.get("autopilot_change_offered_slots") or []
+        selected_choice = _select_change_alternative(text, change_offer)
         if selected_choice is not None:
-            selected = offered_slots[selected_choice - 1]
+            selected = change_offer[selected_choice - 1]
             await _complete_autopilot_reschedule(
                 db,
                 reservation=reservation,
@@ -3848,6 +4101,36 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                             },
                             user_state.get("request_id"),
                         )
+                        if candidates:
+                            # 時刻が足りないだけなら、聞き返さずに空き枠を出して選ばせる。
+                            # 以前はここで質問だけを返しており、患者が何を答えても
+                            # 同じ質問に戻り続けた（2026-09-07 実機）。
+                            offer = await _offer_candidates(
+                                db,
+                                user_id,
+                                candidates,
+                                duration_for_candidates,
+                                user_state.get("request_id"),
+                            )
+                            await _reply_offer(
+                                reply_token,
+                                offer,
+                                await _compose_autopilot_reply(
+                                    "offer_alternatives",
+                                    {
+                                        "alternatives": candidates,
+                                        "vague": True,
+                                        "date_only": True,
+                                        "menu": merged.get("menu_name"),
+                                        "duration_minutes": duration_for_candidates,
+                                        "day_availability": day_availability,
+                                        "patient_message": text,
+                                        **_preferred_practitioner_context(merged, candidates),
+                                    },
+                                    parsed_intent,
+                                ),
+                            )
+                            return
                     except (TypeError, ValueError):
                         pass
                     context.update(
@@ -4164,10 +4447,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
 
         await update_request(db, request_id, line_user_id=user_id, status="alternatives_sent")
+        offer = offered_slots.new_offer(alternatives, duration)
         await merge_user_draft(
             db,
             user_id,
             {
+                **offer.to_draft(),
                 "autopilot_offered_slots": _to_offered_slots(alternatives),
                 "autopilot_offer_duration": duration,
                 "autopilot_negotiation_failures": 0,
@@ -4176,8 +4461,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         )
         await set_user_mode(db, user_id, "adjusting", request_id)
         if reply_token:
-            await reply_to_line(
+            await _reply_offer(
                 reply_token,
+                offer,
                 await _compose_autopilot_reply(
                     "offer_alternatives",
                     {
@@ -4223,6 +4509,52 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     await clear_user_draft(db, user_id)
     await set_user_mode(db, user_id, "adjusting", request_id)
+
+
+async def _handle_pick_postback(
+    db: AsyncSession,
+    query: dict,
+    reply_token: str | None,
+    actor_user_id: str | None,
+) -> None:
+    """候補のボタンで選ばれた枠を、そのまま確認へ回す。
+
+    ボタンは「どの提示の何番目か」を持っている。文字の番号を読まないので、
+    文面がどう整えられても対応がずれない。
+    """
+    if not actor_user_id:
+        return
+    patient = await _find_line_patient(db, actor_user_id)
+    if not patient or not patient.line_autopilot_enabled:
+        return
+
+    state = await get_user_state(db, actor_user_id)
+    draft = state.get("draft") or {}
+    offer = offered_slots.from_draft(draft)
+    offer_id = (query.get("offer") or [""])[0]
+    try:
+        index = int((query.get("index") or ["0"])[0])
+    except ValueError:
+        return
+
+    # 押した時点で別の候補を提示していたら、その番号は使わない。
+    if not offer or offer.offer_id != offer_id:
+        if reply_token:
+            await reply_to_line(
+                reply_token,
+                "恐れ入ります、その候補は新しい案内に入れ替わりました。改めてご希望をお知らせください。",
+            )
+        return
+
+    candidate = offer.at(index)
+    if candidate is None:
+        if reply_token:
+            await reply_to_line(reply_token, "恐れ入ります、もう一度お選びいただけますか。")
+        return
+
+    await _confirm_picked_slot(
+        db, actor_user_id, reply_token, candidate, draft.get("menu_name"), state.get("request_id")
+    )
 
 
 async def _handle_confirmation_postback(
@@ -4315,6 +4647,10 @@ async def _handle_postback(event: dict, db: AsyncSession):
     action = (q.get("action") or [""])[0]
     rid = (q.get("rid") or [""])[0]
     line_user_id = (q.get("uid") or [""])[0] or None
+
+    if action == "pick":
+        await _handle_pick_postback(db, q, reply_token, actor_user_id)
+        return
 
     if action == "confirm":
         await _handle_confirmation_postback(db, event, q, reply_token, actor_user_id)
