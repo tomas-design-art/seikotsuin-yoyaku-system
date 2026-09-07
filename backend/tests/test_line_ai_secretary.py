@@ -4906,3 +4906,183 @@ async def test_the_usual_preset_does_not_overwrite_what_the_patient_said():
     assert saved["duration_minutes"] == 60
     # 述べていない担当は preset で埋まる
     assert saved["practitioner_id"] == 1
+
+
+# ─────────────────────────────────────────────────────────────
+# 実機（2026-09-07 01:51〜01:55）と同じ順番を流し、箱の中身を見る
+# 返信の文面は見ない。何が箱に入ったか、何が予約されたかだけを見る
+# ─────────────────────────────────────────────────────────────
+
+
+class _FlowDB(_EmptyDB):
+    """施術者を1人だけ返すDB。候補生成は別途モックする。"""
+
+    class _Result:
+        def __init__(self, items):
+            self._items = items
+
+        def scalars(self):
+            return self
+
+        def all(self):
+            return self._items
+
+        def first(self):
+            return self._items[0] if self._items else None
+
+        def scalar_one_or_none(self):
+            return None
+
+        def scalar(self):
+            return None
+
+    async def execute(self, *_args, **_kwargs):
+        return self._Result([SimpleNamespace(id=1, name="時田 太郎", is_active=True, display_order=1)])
+
+
+@pytest.mark.asyncio
+async def test_the_real_conversation_fills_the_boxes_and_books_what_was_shown():
+    """実機で壊れた流れを、箱の状態で検証する。
+
+    今日予約したい → 60分で → 今日何時が空いてるの？ → 候補のボタン → はい
+    """
+    from app.api.line import _handle_text_message, _handle_pick_postback
+    from app.services import offered_slots
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    menu = SimpleNamespace(
+        id=5, name="マッスルセラピー", duration_minutes=60,
+        is_duration_variable=False, color_id=None,
+    )
+    draft: dict = {}
+    modes: list[str] = []
+    created = AsyncMock(return_value={"id": 999})
+
+    # その日の空き（コードが計算した結果として返す）
+    def _slot(start, end):
+        return SimpleNamespace(
+            to_dict=lambda s=start, e=end: {
+                "date": "2026-09-07", "start": s, "end": e,
+                "practitioner_id": 1, "practitioner_name": "時田",
+                "label": f"9/7(月) {s}〜{e}（担当: 時田）",
+            }
+        )
+
+    async def fake_merge(_db, _uid, update, *_a, **_k):
+        draft.update({k: v for k, v in update.items() if v not in (None, "")})
+        return dict(draft)
+
+    async def fake_set_mode(_db, _uid, value, *_a, **_k):
+        modes.append(value)
+
+    parsed_by_text = {
+        "今日予約したい": {"intent": "new", "date": "2026-09-07", "menu_hint": "マッスルセラピー"},
+        "60分で": {"intent": "new", "duration_minutes": 60},
+        "今日何時が空いてるの？": {"intent": "new", "date": "2026-09-07"},
+        "はい": {"intent": "other", "polarity": "affirmative"},
+    }
+
+    async def fake_parse(text, *_a, **_k):
+        base = {"intent": "new", "confidence": "high", "constraints": [], "has_reservation_intent": True}
+        return {**base, **parsed_by_text.get(text, {})}
+
+    def _state():
+        return {"mode": modes[-1] if modes else "idle", "draft": dict(draft),
+                "request_id": "rid-1", "context_data": {}}
+
+    async def fake_state(_db, _uid):
+        return _state()
+
+    async def fake_mode(_db, _uid):
+        return modes[-1] if modes else "idle"
+
+    patches = {
+        "_get_line_display_name": "時田",
+        "_find_line_patient": patient,
+        "_get_latest_reservation_for_line_user": None,
+        "build_clinic_context": {},
+        "_resolve_menu": menu,
+        "_get_patient_default_preset": None,
+        "_resolve_booking_defaults": {},
+        "_extract_requested_practitioner": None,
+        "build_day_availability_summary": {},
+        "create_pending_request": "rid-1",
+        "update_request": None,
+        "get_request": {"menu_id": 5, "menu_name": "マッスルセラピー", "alternatives": []},
+        "_assert_bookable_duration": None,
+        "remember_completed_booking": None,
+        "create_notification": None,
+        "_handoff_autopilot_to_human": None,
+        "_compose_autopilot_reply": "（返信）",
+        "reply_to_line": None,
+        "reply_text_with_quick_reply": None,
+        "get_autopilot_min_duration": 30,
+    }
+
+    async def send(text):
+        with ExitStack() as stack:
+            stack.enter_context(patch("app.api.line.settings.line_autopilot_enabled", True))
+            for name, value in patches.items():
+                stack.enter_context(patch(f"app.api.line.{name}", new=AsyncMock(return_value=value)))
+            stack.enter_context(patch("app.api.line.get_user_state", new=fake_state))
+            stack.enter_context(patch("app.api.line.get_user_mode", new=fake_mode))
+            stack.enter_context(patch("app.api.line.parse_line_message", new=fake_parse))
+            stack.enter_context(patch("app.api.line.merge_user_draft", new=fake_merge))
+            stack.enter_context(patch("app.api.line.set_user_mode", new=fake_set_mode))
+            stack.enter_context(patch("app.api.line.create_reservation", new=created))
+            stack.enter_context(
+                patch("app.api.line.build_same_day_candidates",
+                      new=AsyncMock(return_value=[_slot("14:00", "15:00"), _slot("15:00", "16:00")]))
+            )
+            stack.enter_context(
+                patch("app.api.line.build_candidates_over_days",
+                      new=AsyncMock(return_value=[_slot("14:00", "15:00"), _slot("15:00", "16:00")]))
+            )
+            stack.enter_context(
+                patch("app.api.line.find_best_practitioner", new=AsyncMock(return_value=(None, None, None, 0, 0)))
+            )
+            await _handle_text_message(
+                {"replyToken": "reply-token",
+                 "source": {"userId": f"U-flow-{abs(hash(text)) % 10000}"},
+                 "message": {"type": "text", "text": text}},
+                _FlowDB(),
+            )
+
+    # ① 日付を受け取る
+    await send("今日予約したい")
+    assert draft.get("date") == "2026-09-07"
+
+    # ② 施術時間を受け取り、箱に残る（以前は「2分」等に汚れて消えていた）
+    await send("60分で")
+    assert draft.get("duration_minutes") == 60
+
+    # ③ 空き状況を尋ねられたら、聞き返さずに候補を出す（以前は同じ質問に戻り続けた）
+    await send("今日何時が空いてるの？")
+    offer = offered_slots.from_draft(draft)
+    assert offer is not None, "候補が保存されていない＝患者に選ばせられない"
+    assert [c["start"] for c in offer.candidates] == ["14:00", "15:00"]
+    assert modes[-1] == "adjusting"
+    created.assert_not_awaited()
+
+    # ④ ボタンで1番目を選ぶ → まだ予約しない。確認へ進む
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)))
+        stack.enter_context(patch("app.api.line.get_user_state", new=fake_state))
+        stack.enter_context(patch("app.api.line.merge_user_draft", new=fake_merge))
+        stack.enter_context(patch("app.api.line.set_user_mode", new=fake_set_mode))
+        stack.enter_context(patch("app.api.line.reply_text_with_quick_reply", new=AsyncMock()))
+        stack.enter_context(patch("app.api.line.reply_to_line", new=AsyncMock()))
+        await _handle_pick_postback(
+            _FlowDB(), {"offer": [offer.offer_id], "index": ["1"]}, "reply-token", "U-flow-pick"
+        )
+    created.assert_not_awaited()
+    assert modes[-1] == "autopilot_slot_confirm"
+    assert draft["autopilot_picked_slot"]["start"] == "14:00"
+
+    # ⑤ 「はい」で、提示した枠がそのまま予約になる
+    await send("はい")
+    created.assert_awaited_once()
+    booked = created.await_args.args[1]
+    assert booked.practitioner_id == 1
+    assert booked.start_time.strftime("%Y-%m-%d %H:%M") == "2026-09-07 14:00"
+    assert booked.end_time.strftime("%H:%M") == "15:00"
