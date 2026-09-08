@@ -801,6 +801,106 @@ async def test_a_picked_slot_without_its_offer_record_is_not_booked():
 
 
 # ─────────────────────────────────────────────────────────────
+# 画面に出た一覧と、番号が指す一覧を同じものにする
+#
+# 2026-09-08 発見: 番号でも条件変更でもない返答への再提示は、文面を
+# request の alternatives から作り、番号の照合先は autopilot_offer だった。
+# 別ソースなので #2572 と同じ形が残っていた。
+# ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_an_unanswerable_reply_while_adjusting_reoffers_the_stored_candidates():
+    """出し直す一覧は、番号の照合先と同じものでなければならない。"""
+    offer = _offered_two_slots()
+    draft = {"menu_id": 5, "menu_name": "マッスルセラピー", **offer.to_draft()}
+    quick = AsyncMock()
+
+    result = await _run_turn(
+        "U-adjust-vague",
+        "adjusting",
+        draft,
+        "うーん",
+        extra_patches={"reply_text_with_quick_reply": quick},
+    )
+
+    result["created"].assert_not_awaited()
+    quick.assert_awaited_once()
+    # ボタンは保存した提示から作られている＝押した番号がそのまま照合できる
+    assert quick.await_args.args[2] == offered_slots.quick_reply_items(offer)
+
+
+@pytest.mark.asyncio
+async def test_adjusting_without_a_stored_offer_goes_back_to_asking_for_a_date():
+    """出せる候補が無いのに adjusting へ留まると、何を答えても同じ返事に戻る。"""
+    result = await _run_turn(
+        "U-adjust-no-offer",
+        "adjusting",
+        {"menu_id": 5, "menu_name": "マッスルセラピー"},
+        "うーん",
+    )
+
+    result["created"].assert_not_awaited()
+    assert result["modes"][-1] == "waiting_datetime"
+
+
+@pytest.mark.asyncio
+async def test_alternatives_sent_by_the_clinic_become_the_current_offer():
+    """院長が送った一覧も「いま提示している候補」として保存する。
+
+    保存せずに adjusting へ移すと、患者が新しい一覧を見ながら「2」と返したとき
+    draft に残っている前回の候補に照合される（#2572 と同じ形）。
+    """
+    from app.api.line import _handle_postback
+
+    alternatives = [
+        {"date": "2026-09-09", "start": "14:00", "end": "15:00",
+         "practitioner_id": 1, "practitioner_name": "時田"},
+        {"date": "2026-09-09", "start": "15:00", "end": "16:00",
+         "practitioner_id": 2, "practitioner_name": "上田"},
+    ]
+    written: list[dict] = []
+
+    async def fake_merge(_db, _uid, update, *_a, **_k):
+        written.append(dict(update))
+        return dict(update)
+
+    pushed = AsyncMock()
+    with ExitStack() as stack:
+        for name, value in {
+            "get_request": {
+                "user_id": "U-patient",
+                "alternatives": alternatives,
+                "duration_minutes": 60,
+            },
+            "update_request": None,
+            "_compose_autopilot_reply": "（候補です）",
+            "reply_to_line": None,
+            "set_user_mode": None,
+        }.items():
+            stack.enter_context(patch(f"app.api.line.{name}", new=AsyncMock(return_value=value)))
+        stack.enter_context(patch("app.api.line.merge_user_draft", new=fake_merge))
+        stack.enter_context(patch("app.api.line.push_text_with_quick_reply", new=pushed))
+        await _handle_postback(
+            {
+                "replyToken": "reply-token",
+                "source": {"userId": "U-admin"},
+                "postback": {"data": "action=send_alternatives&rid=rid-1"},
+            },
+            _EmptyDB(),
+        )
+
+    stored = [w[offered_slots.DRAFT_KEY] for w in written if offered_slots.DRAFT_KEY in w]
+    assert stored, "院長が送った候補が保存されていない"
+    saved = offered_slots.from_draft({offered_slots.DRAFT_KEY: stored[0]})
+    assert [c["start"] for c in saved.candidates] == ["14:00", "15:00"]
+
+    # 押せるボタンも、その保存した提示から作られている
+    pushed.assert_awaited_once()
+    assert pushed.await_args.args[2] == offered_slots.quick_reply_items(saved)
+
+
+# ─────────────────────────────────────────────────────────────
 # 確認の返事が読めないときは、作らない・消さない・動かさない
 #
 # 2026-09-08 実測: "15時でお願いします" が肯定と判定され、提示済みの14:00で

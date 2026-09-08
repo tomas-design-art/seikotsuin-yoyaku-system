@@ -1591,7 +1591,15 @@ async def _reply_with_loop_guard(
     situation: str,
     context: dict,
     parsed: dict | None = None,
+    quick_items: list[dict] | None = None,
 ) -> bool:
+    """同じ場面が続いた回数を記録して返信する。
+
+    注意: `autopilot_situation_streak` は記録しているだけで、**誰も読んでいない**。
+    打ち切りの仕組みは無い。確認（はい/いいえ）の打ち切りは
+    `_reask_confirmation` の `autopilot_confirm_unclear` が受け持つ。
+    ここに2つ目のカウンタを足す前に、まずどちらかへ寄せること。
+    """
     state = await get_user_state(db, user_id)
     draft = state.get("draft") or {}
     previous_situation = draft.get("autopilot_last_situation")
@@ -1603,7 +1611,11 @@ async def _reply_with_loop_guard(
         state.get("request_id"),
     )
     if reply_token:
-        await reply_to_line(reply_token, await _compose_autopilot_reply(situation, context, parsed))
+        message = await _compose_autopilot_reply(situation, context, parsed)
+        if quick_items:
+            await reply_text_with_quick_reply(reply_token, message, quick_items)
+        else:
+            await reply_to_line(reply_token, message)
     return False
 
 
@@ -3161,107 +3173,46 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
             return
 
-        request_id = user_state.get("request_id")
-        request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
-        alternatives = request_data.get("alternatives") if request_data else None
-        # 番号選択は上の分岐で、保存した候補にだけ照合して処理する。
-        # ここで request の古い候補を引くと、画面に出ていない枠が確定する。
-        selected_choice = None
-        if alternatives and selected_choice is not None:
-            alternative = alternatives[selected_choice - 1]
-            try:
-                start_dt = datetime.combine(
-                    date.fromisoformat(alternative["date"]),
-                    time.fromisoformat(alternative["start"]),
-                    tzinfo=JST,
-                )
-                end_dt = datetime.combine(
-                    date.fromisoformat(alternative["date"]),
-                    time.fromisoformat(alternative["end"]),
-                    tzinfo=JST,
-                )
-            except (KeyError, TypeError, ValueError):
-                if reply_token:
-                    await reply_to_line(
-                        reply_token,
-                        await _compose_autopilot_reply(
-                            "ask_datetime",
-                            {"patient_name": line_patient.name, "patient_message": text},
-                            parsed_intent,
-                        ),
-                    )
-                return
-            # 番号選択＝患者の明示的な確定意思。追加の「はい/いいえ」は求めない。
-            try:
-                await _assert_bookable_duration(db, request_data.get("menu_id"), start_dt, end_dt)
-                reservation = await create_reservation(
-                    db,
-                    ReservationCreate(
-                        patient_id=line_patient.id,
-                        practitioner_id=int(alternative["practitioner_id"]),
-                        menu_id=request_data.get("menu_id"),
-                        start_time=start_dt,
-                        end_time=end_dt,
-                        channel="LINE",
-                        notes="LINE AI秘書 候補選択確定",
-                        source_ref=_line_reservation_source_ref(),
-                    ),
-                    reject_conflicts=True,
-                )
-            except (HTTPException, ValueError):
-                await update_request(db, request_id, line_user_id=user_id, status="alternatives_sent")
-                if reply_token:
-                    await reply_to_line(
-                        reply_token,
-                        await _compose_autopilot_reply("slot_taken", {"patient_message": text}, parsed_intent),
-                    )
-                return
-            await update_request(db, request_id, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id"))
-            await clear_user_draft(db, user_id)
-            practitioner_name = alternative.get("practitioner_name") or "担当者"
-            await remember_completed_booking(
-                db,
-                user_id,
-                {"date": start_dt.strftime("%Y/%m/%d"), "start": start_dt.strftime("%H:%M"), "end": end_dt.strftime("%H:%M"), "practitioner": practitioner_name},
-            )
-            await set_user_mode(db, user_id, "idle")
-            if reply_token:
-                await reply_to_line(
-                    reply_token,
-                    await _compose_autopilot_reply(
-                        "confirmed",
-                        {
-                            "date": start_dt.strftime("%Y/%m/%d"),
-                            "start": start_dt.strftime("%H:%M"),
-                            "end": end_dt.strftime("%H:%M"),
-                            "practitioner": practitioner_name,
-                            "menu": request_data.get("menu_name"),
-                            "patient_message": text,
-                        },
-                        parsed_intent,
-                    ),
-                )
-            return
-
-        # 番号でも条件変更でもない返答。黙って落とさず、候補を示し直す。
+        # 番号でも条件変更でもない返答。黙って落とさず、保存した候補を示し直す。
+        #
+        # 以前はここで request の alternatives を文面に並べていた。番号の照合先は
+        # 保存した候補（autopilot_offer）なので、**画面に出る一覧と番号が指す一覧が
+        # 別物**になりうる。#2572 と同じ形。提示そのものから出し直す。
         if (
             (parsed_intent or {}).get("intent") not in {"cancel", "change", "question"}
             and not _has_cancellation_intent(text)
             and not _has_change_intent(text)
         ):
-            await _reply_with_loop_guard(
-                db,
-                user_id,
-                reply_token,
-                "offer_alternatives",
-                {
-                    "alternatives": alternatives or [],
-                    "vague": True,
-                    "duration_minutes": prev_draft.get("autopilot_offer_duration"),
-                    "patient_message": text,
-                },
-                parsed_intent,
-            )
+            if stored_offer:
+                await _reply_with_loop_guard(
+                    db,
+                    user_id,
+                    reply_token,
+                    "offer_alternatives",
+                    {
+                        "alternatives": stored_offer.candidates,
+                        "vague": True,
+                        "duration_minutes": (
+                            stored_offer.duration_minutes or prev_draft.get("autopilot_offer_duration")
+                        ),
+                        "patient_message": text,
+                    },
+                    parsed_intent,
+                    quick_items=offered_slots.quick_reply_items(stored_offer),
+                )
+                return
+            # 出せる候補が無いのに adjusting へ留まると、何を答えても同じ返事に戻る。
+            # カウンタを足さず、状態で前の段階へ戻す。
+            await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "ask_datetime",
+                        {"patient_name": line_patient.name, "patient_message": text},
+                        parsed_intent,
+                    ),
+                )
             return
 
     if is_autopilot_patient and current_mode == "autopilot_cancel_select":
@@ -4265,10 +4216,23 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     # 日付の解決に失敗しても context.update で参照するため先に初期化する。
                     day_availability: dict = {}
                     date_label = str(merged.get("date"))
+                    # try で包むのは「日付と施術時間が読めるか」だけにする。
+                    # 状態の書き込みや返信まで包むと、途中で落ちたときに
+                    # 「候補は保存され mode は adjusting なのに一覧は送られず、
+                    # 同じ reply_token で別の文が送られる」状態になる。
+                    # 例外を上へ通してよい理由: _notify_webhook_failure が
+                    # 院長へ traceback を push し、患者へ定型文を1通だけ返す。
+                    target_date = None
                     try:
                         target_date = date.fromisoformat(str(merged["date"]))
+                        duration_for_candidates = int(
+                            merged.get("duration_minutes") or (menu.duration_minutes if menu else 60)
+                        )
+                    except (KeyError, TypeError, ValueError):
+                        target_date = None
+
+                    if target_date is not None:
                         date_label = _format_date_with_weekday_jp(target_date)
-                        duration_for_candidates = int(merged.get("duration_minutes") or (menu.duration_minutes if menu else 60))
                         slot_filters = build_slot_filters(merged.get("constraints"))
                         scored = await build_same_day_candidates(
                             db,
@@ -4284,17 +4248,23 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         day_availability = await build_day_availability_summary(
                             db, target_date, duration_for_candidates
                         )
-                        await merge_user_draft(
-                            db,
-                            user_id,
-                            {
-                                "autopilot_offered_slots": _to_offered_slots(candidates),
-                                "autopilot_offer_duration": duration_for_candidates,
-                                "autopilot_filters": slot_filters.to_dict(),
-                            },
-                            user_state.get("request_id"),
-                        )
                         if candidates:
+                            # 候補が0件のときに覚え書きを空で上書きしない。
+                            # autopilot_offered_slots が [] になると
+                            # 「候補提示済み」フラグ（line.py の再検索への分岐）が
+                            # 落ち、枠確認中に「もっと早く」と言われても
+                            # 再検索へ逃がせなくなる。autopilot_offer 側は
+                            # 書かれないので、2つのキーが食い違いもする。
+                            await merge_user_draft(
+                                db,
+                                user_id,
+                                {
+                                    "autopilot_offered_slots": _to_offered_slots(candidates),
+                                    "autopilot_offer_duration": duration_for_candidates,
+                                    "autopilot_filters": slot_filters.to_dict(),
+                                },
+                                user_state.get("request_id"),
+                            )
                             # 時刻が足りないだけなら、聞き返さずに空き枠を出して選ばせる。
                             # 以前はここで質問だけを返しており、患者が何を答えても
                             # 同じ質問に戻り続けた（2026-09-07 実機）。
@@ -4324,8 +4294,6 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                                 ),
                             )
                             return
-                    except (TypeError, ValueError):
-                        pass
                     context.update(
                         {
                             "date": date_label,
@@ -4906,12 +4874,18 @@ async def _handle_postback(event: dict, db: AsyncSession):
 
     elif action == "send_alternatives":
         alternatives = req.get("alternatives") or []
-        await push_message(
+        # 院長が送った一覧も「いま提示している候補」として保存する。
+        # 保存せずに adjusting へ移すと、患者が新しい一覧を見ながら「2」と返したとき
+        # draft に残っている **前回の** 候補に照合される（#2572 と同じ形）。
+        offer = offered_slots.new_offer(alternatives, req.get("duration_minutes"))
+        await merge_user_draft(db, user_id, offer.to_draft(), rid)
+        await push_text_with_quick_reply(
             user_id,
             await _compose_autopilot_reply(
                 "offer_alternatives",
                 {"alternatives": alternatives, "vague": False},
             ),
+            offered_slots.quick_reply_items(offer),
         )
         await update_request(db, rid, line_user_id=user_id, status="alternatives_sent")
         await set_user_mode(db, user_id, "adjusting", rid)
