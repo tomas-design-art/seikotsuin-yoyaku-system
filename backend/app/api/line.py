@@ -12,7 +12,7 @@ import re
 import traceback
 import unicodedata
 from collections.abc import Awaitable, Callable
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import parse_qs
 
 import httpx
@@ -36,7 +36,7 @@ from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.booking_form import Form as BookingForm
 from app.services.line_composer import compose_from_plan, compose_reply
-from app.services import offered_slots
+from app.services import confirmation, offered_slots
 from app.services.reply_plan import ReplyPlan, plan_for
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
 from app.services.line_inbox import (
@@ -1083,6 +1083,35 @@ def _slot_confirmation_plan(
     )
 
 
+def _parse_iso_datetime(raw: Any) -> datetime | None:
+    """保存済みのISO日時。読めなければ None（例外にしない）。"""
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_request_start(request_data: dict | None) -> datetime | None:
+    """提示済み request の開始日時。読めなければ None。"""
+    return _parse_iso_datetime((request_data or {}).get("start_time_iso"))
+
+
+def _request_confirmation_plan(request_data: dict | None) -> ReplyPlan | None:
+    """提示済み request から予約確認の骨格を組み直す。読めなければ None。"""
+    start_dt = _parse_request_start(request_data)
+    end_dt = _parse_iso_datetime((request_data or {}).get("end_time_iso"))
+    if not start_dt or not end_dt:
+        return None
+    return _slot_confirmation_plan(
+        start_dt=start_dt,
+        end_dt=end_dt,
+        practitioner_name=(request_data or {}).get("practitioner_name"),
+        menu_name=(request_data or {}).get("menu_name"),
+    )
+
+
 def _cancel_confirmation_plan(reservation: Reservation, remaining: int = 0) -> ReplyPlan:
     """キャンセル確認の骨格。文面はここで決まり、LLMは言い回しだけ整える。"""
     start = reservation.start_time.astimezone(JST)
@@ -1181,6 +1210,57 @@ async def _reply_confirmation(reply_token: str | None, form: str, message: str) 
     await reply_text_with_quick_reply(
         reply_token, message, _build_confirmation_quick_reply_items(form)
     )
+
+
+# 確認の返事が読めなかった回数。閾値は既存の autopilot_cancel_select_failures に合わせる。
+_CONFIRM_UNCLEAR_KEY = "autopilot_confirm_unclear"
+_CONFIRM_UNCLEAR_LIMIT = 3
+
+
+async def _reask_confirmation(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    patient: Patient | None,
+    text: str,
+    parsed_intent: dict | None,
+    request_id: str | None = None,
+    form: str,
+    plan: ReplyPlan | None = None,
+    message: str | None = None,
+) -> None:
+    """確認の返事が読めなかった。実行せず、事実を出し直して尋ね直す。
+
+    「はい か いいえ でお答えください」だけを返さない。分からなかった患者に
+    同じ質問だけ返すのは、実機で起きたループそのもの（2026-09-07）。
+    骨格（何を確認しているか）を毎回出し直す。
+
+    繰り返すなら人へ渡す。ここに打ち切りが無かったため、肯定でも否定でもない
+    返事に対して同じ枠確認を無限に返していた。
+    """
+    failures = int(((await get_user_state(db, user_id)).get("draft") or {}).get(_CONFIRM_UNCLEAR_KEY) or 0) + 1
+
+    if failures >= _CONFIRM_UNCLEAR_LIMIT:
+        # 退避する前に0へ戻す。manual にしても draft は消えないので、
+        # 院長が自動応答へ戻した直後に1回で再退避してしまう。
+        await merge_user_draft(db, user_id, {_CONFIRM_UNCLEAR_KEY: 0}, request_id)
+        await _handoff_autopilot_to_human(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            patient=patient,
+            text=text,
+            parsed_intent=parsed_intent,
+            notification=f"LINE確認の返答が読み取れず: {patient.id if patient else '-'}",
+        )
+        return
+
+    await merge_user_draft(db, user_id, {_CONFIRM_UNCLEAR_KEY: failures}, request_id)
+    if plan is not None:
+        await _reply_plan(reply_token, form, plan)
+    elif message is not None:
+        await _reply_confirmation(reply_token, form, message)
 
 
 def _build_cancel_selection_items(reservations: list[Reservation]) -> list[dict]:
@@ -1301,29 +1381,16 @@ def _normalize_confirmation_text(text: str) -> str:
     return re.sub(r"[\s\u3000,，!！?？。､、…]+", "", (text or "").lower())
 
 
-# 否定を先に判定するので「いいえ」が肯定の「いい」に誤爆しない。
-_NEGATIVE_MARKERS = (
-    "いいえ", "いや", "やだ", "やめ", "だめ", "ちがう", "違う", "結構", "けっこう",
-    "取りやめ", "とりやめ", "no", "nope",
-)
-_AFFIRMATIVE_MARKERS = (
-    "はい", "うん", "ええ", "いいよ", "いいですよ", "いいです", "それでいい", "それで",
-    "おねがい", "お願い", "だいじょうぶ", "大丈夫", "了解", "りょうかい", "りょ",
-    "よろしく", "オッケー", "おっけー", "おけ", "ok", "okay", "yes", "yeah", "yep",
-    "sure", "please", "네", "예", "응", "好",
-)
+# 語の並びは app/services/confirmation.py に置いてある。
+# 確認（はい/いいえ）の読み取りには、この2つを **直接使わない** こと。
+# 部分一致の bool なので「わからない」を表現できず、"お願い" だけで肯定になる。
+# 確認は confirmation.read_answer（三値）を通す。
+_NEGATIVE_MARKERS = confirmation.NEGATIVE_MARKERS
+_AFFIRMATIVE_MARKERS = confirmation.AFFIRMATIVE_MARKERS
 
-
-def _is_negative(text: str) -> bool:
-    t = (text or "").lower()
-    return any(marker in t for marker in _NEGATIVE_MARKERS)
-
-
-def _is_affirmative(text: str) -> bool:
-    if _is_negative(text):
-        return False
-    t = (text or "").lower()
-    return any(marker in t for marker in _AFFIRMATIVE_MARKERS)
+# 確認ではない用途（候補時刻の明示選択・単一候補への肯定）だけがここを使う。
+_is_negative = confirmation.looks_negative
+_is_affirmative = confirmation.looks_affirmative
 
 
 def _extract_alternative_choice(text: str, count: int) -> int | None:
@@ -2772,7 +2839,6 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     if is_autopilot_patient and current_mode == "autopilot_booking_confirm":
         request_id = user_state.get("request_id")
         request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
-        polarity = parsed_intent.get("polarity") if parsed_intent else "none"
         if (parsed_intent or {}).get("intent") == "change" or _has_change_intent(text):
             await set_user_mode(db, user_id, "waiting_datetime", request_id)
             if reply_token:
@@ -2785,7 +2851,17 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     ),
                 )
             return
-        if polarity == "negative" or (polarity == "none" and _is_negative(text)):
+        offered_start = _parse_request_start(request_data)
+        answer = confirmation.read_answer(
+            text,
+            parsed_intent,
+            expected=(
+                confirmation.expected_slot(offered_start.date().isoformat(), offered_start.strftime("%H:%M"))
+                if offered_start
+                else None
+            ),
+        )
+        if answer == confirmation.NO:
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "waiting_datetime", request_id)
             if reply_token:
@@ -2798,14 +2874,18 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     ),
                 )
             return
-        if not (polarity == "affirmative" or (polarity == "none" and _is_affirmative(text))) or not request_data or not request_data.get("available"):
-            await _reply_with_loop_guard(
+        if answer != confirmation.YES or not request_data or not request_data.get("available"):
+            await _reask_confirmation(
                 db,
-                user_id,
-                reply_token,
-                "reconfirm_yes_no",
-                {"what": "提示した予約候補", "patient_message": text},
-                parsed_intent,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                request_id=request_id,
+                form="booking",
+                plan=_request_confirmation_plan(request_data),
+                message="恐れ入ります、こちらのご予約でよろしいでしょうか。",
             )
             return
         try:
@@ -2869,8 +2949,19 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
             return
 
-        if _is_negative(text):
-            await merge_user_draft(db, user_id, {"autopilot_picked_slot": {}}, user_state.get("request_id"))
+        answer = confirmation.read_answer(
+            text,
+            parsed_intent,
+            expected=confirmation.expected_slot(picked.get("date"), picked.get("start")),
+        )
+
+        if answer == confirmation.NO:
+            await merge_user_draft(
+                db,
+                user_id,
+                {"autopilot_picked_slot": {}, _CONFIRM_UNCLEAR_KEY: 0},
+                user_state.get("request_id"),
+            )
             offer = offered_slots.from_draft(prev_draft)
             if offer:
                 await set_user_mode(db, user_id, "adjusting", user_state.get("request_id"))
@@ -2894,8 +2985,20 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     )
             return
 
-        if not _is_affirmative(text):
-            await _reply_plan(reply_token, "slot", _picked_slot_plan(picked, prev_draft.get("menu_name")))
+        if answer != confirmation.YES:
+            # 「15時でお願いします」のように別の時刻を述べた返事は同意ではない。
+            # ここで予約を作っていた（2026-09-08 発見）。
+            await _reask_confirmation(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                request_id=user_state.get("request_id"),
+                form="slot",
+                plan=_picked_slot_plan(picked, prev_draft.get("menu_name")),
+            )
             return
 
         try:
@@ -3200,7 +3303,10 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     if is_autopilot_patient and current_mode == "autopilot_cancel_confirm":
         reservation_id = prev_draft.get("autopilot_cancel_reservation_id")
-        if _is_affirmative(text) and reservation_id:
+        # 消す側なので expected は渡さない。組み立てるには判定より前にDBを引く必要があり、
+        # そこまでして「はい、9/4のを」を1往復短縮する価値より、慎重に倒す方を採る。
+        answer = confirmation.read_answer(text, parsed_intent)
+        if answer == confirmation.YES and reservation_id:
             try:
                 cancelled_reservation = await transition_status(db, int(reservation_id), "CANCELLED")
                 cancelled_start = cancelled_reservation.start_time.astimezone(JST)
@@ -3268,7 +3374,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     ),
                 )
             return
-        if _is_negative(text):
+        if answer == confirmation.NO:
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "idle")
             if reply_token:
@@ -3277,15 +3383,20 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     await _compose_autopilot_reply("cancel_aborted", {"patient_message": text}, parsed_intent),
                 )
             return
-        if reply_token:
-            await _reply_with_loop_guard(
-                db,
-                user_id,
-                reply_token,
-                "reconfirm_yes_no",
-                {"what": "予約のキャンセル", "patient_message": text},
-                parsed_intent,
-            )
+
+        # 読めなかった。取り消しは元に戻せないので、何を消そうとしているかを出し直す。
+        cancel_target = await db.get(Reservation, int(reservation_id)) if reservation_id else None
+        await _reask_confirmation(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            patient=line_patient,
+            text=text,
+            parsed_intent=parsed_intent,
+            form="cancel",
+            plan=_cancel_confirmation_plan(cancel_target) if cancel_target else None,
+            message="恐れ入ります、こちらのご予約をキャンセルしてよろしいでしょうか。",
+        )
         return
 
     if is_autopilot_patient and current_mode == "autopilot_change_datetime":
@@ -3395,7 +3506,18 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         start_time_iso = prev_draft.get("autopilot_change_start_time_iso")
         end_time_iso = prev_draft.get("autopilot_change_end_time_iso")
         practitioner_id = prev_draft.get("autopilot_change_practitioner_id")
-        if _is_negative(text):
+        change_start = _parse_iso_datetime(start_time_iso)
+        change_end = _parse_iso_datetime(end_time_iso)
+        answer = confirmation.read_answer(
+            text,
+            parsed_intent,
+            expected=(
+                confirmation.expected_slot(change_start.date().isoformat(), change_start.strftime("%H:%M"))
+                if change_start
+                else None
+            ),
+        )
+        if answer == confirmation.NO:
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "autopilot_change_datetime")
             if reply_token:
@@ -3404,16 +3526,28 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     await _compose_autopilot_reply("change_aborted", {"patient_message": text}, parsed_intent),
                 )
             return
-        if not _is_affirmative(text) or not all([reservation_id, start_time_iso, end_time_iso, practitioner_id]):
-            if reply_token:
-                await reply_to_line(
-                    reply_token,
-                    await _compose_autopilot_reply(
-                        "reconfirm_yes_no",
-                        {"what": "予約変更の候補", "patient_message": text},
-                        parsed_intent,
-                    ),
-                )
+        if answer != confirmation.YES or not all([reservation_id, start_time_iso, end_time_iso, practitioner_id]):
+            # 既存の予約を動かす場面。読めない返事で実行しない。
+            await _reask_confirmation(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                form="change",
+                plan=(
+                    _slot_confirmation_plan(
+                        start_dt=change_start,
+                        end_dt=change_end,
+                        practitioner_name=prev_draft.get("autopilot_change_practitioner_name"),
+                        purpose="ご変更",
+                    )
+                    if change_start and change_end
+                    else None
+                ),
+                message="恐れ入ります、こちらの日時へご変更してよろしいでしょうか。",
+            )
             return
         try:
             start_dt = datetime.fromisoformat(start_time_iso)
@@ -3468,8 +3602,14 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     quick_items,
                 )
             return
-        if _is_affirmative(text):
+        # 確認しているのはメニューであって枠ではない。同じ文に日時が入っていても
+        # 「別の希望」とは読まない（下でその日時を拾う）。
+        usual_answer = confirmation.read_answer(
+            text, parsed_intent, wish_fields=confirmation.MENU_WISH_FIELDS
+        )
+        if usual_answer == confirmation.YES:
             usual_draft = {
+                _CONFIRM_UNCLEAR_KEY: 0,
                 "menu_id": preset["menu_id"],
                 "menu_name": preset["menu_name"],
                 "duration_minutes": preset["duration_minutes"],
@@ -3492,8 +3632,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
             await set_user_mode(db, user_id, "idle")
         # 「変更」は予約そのものの変更依頼と語がぶつかる。ここで拾うと
-        # 変更のつもりの患者が新規予約のメニュー選択へ落ちるため含めない。
-        elif text.strip() in {"いいえ", "ちがう", "違う", "別のメニュー"}:
+        # 変更のつもりの患者が新規予約のメニュー選択へ落ちるため含めない
+        # （NEGATIVE_MARKERS に「変更」は入っていないので read_answer でも同じ）。
+        elif usual_answer == confirmation.NO or text.strip() == "別のメニュー":
             await set_user_mode(db, user_id, "waiting_menu")
             if reply_token:
                 quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
@@ -3504,21 +3645,25 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
             return
         else:
-            if reply_token:
-                await _reply_confirmation(
-                    reply_token,
-                    "usual",
-                    await _compose_autopilot_reply(
-                        "usual_confirm",
-                        {
-                            "menu": preset["menu_name"],
-                            "duration": preset["duration_minutes"],
-                            "practitioner": preset.get("practitioner_name"),
-                            "patient_message": text,
-                        },
-                        parsed_intent,
-                    ),
-                )
+            await _reask_confirmation(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                form="usual",
+                message=await _compose_autopilot_reply(
+                    "usual_confirm",
+                    {
+                        "menu": preset["menu_name"],
+                        "duration": preset["duration_minutes"],
+                        "practitioner": preset.get("practitioner_name"),
+                        "patient_message": text,
+                    },
+                    parsed_intent,
+                ),
+            )
             return
 
     # 「時田先生お休みの日ある？」を担当者の指名と誤読して予約フローへ流さない。

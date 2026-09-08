@@ -3212,13 +3212,22 @@ def test_usual_confirmation_does_not_treat_change_as_menu_rejection():
 
     予約の変更依頼と語がぶつかり、変更のつもりの患者が新規予約の
     メニュー選択へ落ちていた（実機で発生）。
-    """
-    import inspect as _inspect
-    from app.api import line as line_module
 
-    source = _inspect.getsource(line_module._handle_text_message)
-    assert '"いいえ", "変更"' not in source
-    assert '"いいえ", "ちがう", "違う", "別のメニュー"' in source
+    2026-09-08: 以前はここで `_handle_text_message` のソース文字列を検査していたが、
+    実装の書き方を固定するだけで挙動を守っていなかった。判定そのものを検査する。
+    """
+    from app.services import confirmation
+
+    # 「変更」は否定ではない。メニュー選択へ落とさない
+    for text in ("変更したいです", "予約を変更したい", "変更でお願いします"):
+        assert confirmation.read_answer(text, {"polarity": "none"}) != confirmation.NO
+
+    # 本物の否定はこれまでどおり否定
+    for text in ("いいえ", "ちがう", "違う"):
+        assert confirmation.read_answer(text, {"polarity": "none"}) == confirmation.NO
+
+    # 「変更」が否定語に混ざっていないこと自体も押さえる
+    assert not any("変更" in marker for marker in confirmation.NEGATIVE_MARKERS)
 
 
 def test_line_inbox_rollout_defaults_to_legacy_and_rejects_unknown_values():
