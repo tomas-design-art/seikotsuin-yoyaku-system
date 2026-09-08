@@ -18,7 +18,7 @@ from urllib.parse import parse_qs
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
-from sqlalchemy import and_, func, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.line_parser import classify_conversation_control, extract_full_name, parse_line_message
@@ -27,12 +27,10 @@ from app.database import async_session, get_db
 from app.models.menu import Menu
 from app.models.patient import Patient
 from app.models.practitioner import Practitioner
-from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation import Reservation
 from app.models.line_user_state import LineUserState
 from app.models.setting import Setting
 from app.schemas.reservation import ReservationCreate
-from app.services.conflict_detector import check_conflict
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.booking_form import Form as BookingForm
 from app.services.line_composer import compose_from_plan, compose_reply
@@ -99,7 +97,6 @@ from app.services.patient_match import (
     normalize_phone,
 )
 from app.services.reservation_service import create_reservation, reschedule_reservation, transition_status
-from app.services.schedule_service import is_practitioner_working
 from app.services.shadow_service import handle_shadow_message
 from app.utils.datetime_jst import JST, now_jst
 from app.utils.normalize import normalize_input_text
@@ -703,95 +700,6 @@ def _menu_duration_bounds(menu: Menu) -> tuple[int, int]:
 def _is_valid_duration_for_menu(menu: Menu, duration: int) -> bool:
     min_minutes, max_minutes = _menu_duration_bounds(menu)
     return min_minutes <= duration <= max_minutes and (duration - min_minutes) % 10 == 0
-
-
-async def _find_available_practitioner(
-    db: AsyncSession,
-    target_date: date,
-    start_time: time,
-    duration_minutes: int,
-) -> tuple[Practitioner | None, datetime, datetime]:
-    start_dt = datetime.combine(target_date, start_time, tzinfo=JST)
-    end_dt = start_dt + timedelta(minutes=duration_minutes)
-
-    practitioners = (
-        await db.execute(select(Practitioner).where(Practitioner.is_active == True).order_by(Practitioner.display_order))
-    ).scalars().all()
-
-    for p in practitioners:
-        working, _, _ = await is_practitioner_working(db, p.id, target_date)
-        if not working:
-            continue
-
-        # 時間帯休みチェック
-        uts = (
-            await db.execute(
-                select(PractitionerUnavailableTime).where(
-                    and_(
-                        PractitionerUnavailableTime.practitioner_id == p.id,
-                        PractitionerUnavailableTime.date == target_date,
-                    )
-                )
-            )
-        ).scalars().all()
-        blocked = False
-        s_min = start_dt.hour * 60 + start_dt.minute
-        e_min = end_dt.hour * 60 + end_dt.minute
-        for ut in uts:
-            sh, sm = map(int, ut.start_time.split(":"))
-            eh, em = map(int, ut.end_time.split(":"))
-            ut_s = sh * 60 + sm
-            ut_e = eh * 60 + em
-            if s_min < ut_e and e_min > ut_s:
-                blocked = True
-                break
-        if blocked:
-            continue
-
-        conflicts = await check_conflict(db, p.id, start_dt, end_dt)
-        if not conflicts:
-            return p, start_dt, end_dt
-
-    return None, start_dt, end_dt
-
-
-async def _suggest_alternatives(
-    db: AsyncSession,
-    base_date: date,
-    base_time: time,
-    duration_minutes: int,
-    max_items: int = 3,
-) -> list[dict]:
-    alternatives: list[dict] = []
-    slot_min = 30
-    base_minutes = base_time.hour * 60 + base_time.minute
-
-    for day_offset in range(0, 4):
-        d = base_date + timedelta(days=day_offset)
-        for delta in [0, -60, 60, -120, 120, -180, 180]:
-            mins = base_minutes + delta
-            if mins < 9 * 60 or mins > 19 * 60:
-                continue
-            t = time(mins // 60, mins % 60)
-            if (mins % slot_min) != 0:
-                continue
-            p, s, e = await _find_available_practitioner(db, d, t, duration_minutes)
-            if p:
-                label = f"{d.isoformat()} {s.strftime('%H:%M')}〜{e.strftime('%H:%M')}（{p.name}）"
-                if not any(a["label"] == label for a in alternatives):
-                    alternatives.append(
-                        {
-                            "date": d.isoformat(),
-                            "start": s.strftime("%H:%M"),
-                            "end": e.strftime("%H:%M"),
-                            "practitioner_id": p.id,
-                            "practitioner_name": p.name,
-                            "label": label,
-                        }
-                    )
-            if len(alternatives) >= max_items:
-                return alternatives
-    return alternatives
 
 
 async def _find_or_create_line_patient(db: AsyncSession, user_id: str, name: str | None) -> Patient:
