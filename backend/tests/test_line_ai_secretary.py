@@ -741,6 +741,207 @@ async def test_confirming_books_exactly_the_slot_that_was_chosen():
     assert booked.end_time.strftime("%H:%M") == "15:00"
 
 
+# ─────────────────────────────────────────────────────────────
+# 確認の返事が読めないときは、作らない・消さない・動かさない
+#
+# 2026-09-08 実測: "15時でお願いします" が肯定と判定され、提示済みの14:00で
+# 予約が確定していた。"お願い" が肯定マーカーに入っていたため。
+# ─────────────────────────────────────────────────────────────
+
+
+def _parsed_naming_a_new_time(time_value: str = "15:00") -> AsyncMock:
+    """患者が別の時刻を述べたときの解析結果。polarity は肯定になる。
+
+    解析側の _rule_polarity にも「お願いします」が入っているので、
+    polarity を見るだけでは止まらないことを再現している。
+    """
+    return AsyncMock(
+        return_value={
+            "intent": "new",
+            "confidence": "high",
+            "constraints": [],
+            "has_reservation_intent": True,
+            "polarity": "affirmative",
+            "time": time_value,
+        }
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_new_time_during_the_slot_confirmation_does_not_book():
+    """枠確認中に別の時刻を言われたら、提示済みの枠で予約しない。"""
+    offer = _offered_two_slots()
+    draft = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "autopilot_picked_slot": offer.candidates[0],  # 14:00
+        **offer.to_draft(),
+    }
+
+    result = await _run_turn(
+        "U-slot-newtime",
+        "autopilot_slot_confirm",
+        draft,
+        "15時でお願いします",
+        extra_patches={"parse_line_message": _parsed_naming_a_new_time()},
+    )
+
+    result["created"].assert_not_awaited()
+    assert "idle" not in result["modes"]
+
+
+@pytest.mark.asyncio
+async def test_a_new_time_during_the_cancel_confirmation_does_not_cancel():
+    """取り消しは元に戻せない。読めない返事で実行しない。"""
+    cancelled = AsyncMock()
+    draft = {"autopilot_cancel_reservation_id": 55}
+
+    await _run_turn(
+        "U-cancel-newtime",
+        "autopilot_cancel_confirm",
+        draft,
+        "15時でお願いします",
+        extra_patches={
+            "parse_line_message": _parsed_naming_a_new_time(),
+            "transition_status": cancelled,
+        },
+    )
+
+    cancelled.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_new_time_during_the_change_confirmation_does_not_reschedule():
+    """既存の予約を動かす場面も同じ。"""
+    moved = AsyncMock()
+    draft = {
+        "autopilot_change_reservation_id": 55,
+        "autopilot_change_start_time_iso": "2026-09-07T14:00:00+09:00",
+        "autopilot_change_end_time_iso": "2026-09-07T15:00:00+09:00",
+        "autopilot_change_practitioner_id": 1,
+        "autopilot_change_practitioner_name": "時田",
+    }
+
+    await _run_turn(
+        "U-change-newtime",
+        "autopilot_change_confirm",
+        draft,
+        "15時でお願いします",
+        extra_patches={
+            "parse_line_message": _parsed_naming_a_new_time(),
+            "reschedule_reservation": moved,
+        },
+    )
+
+    moved.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_matching_time_in_the_confirmation_still_books():
+    """確認中の枠と同じ時刻を添えただけなら、聞き返さずに確定する。
+
+    厳しくしすぎて、普通に同意した患者を止めてしまわないこと。
+    """
+    offer = _offered_two_slots()
+    draft = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "autopilot_picked_slot": offer.candidates[0],  # 14:00
+        **offer.to_draft(),
+    }
+
+    result = await _run_turn(
+        "U-slot-sametime",
+        "autopilot_slot_confirm",
+        draft,
+        "はい、14時でお願いします",
+        extra_patches={"parse_line_message": _parsed_naming_a_new_time("14:00")},
+    )
+
+    result["created"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_confirmation_button_still_books_after_the_stricter_reading():
+    """ボタンは本文を「はい」に差し替えて入り直す。判定を厳しくしても壊れない。"""
+    offer = _offered_two_slots()
+    draft = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "autopilot_picked_slot": offer.candidates[0],
+        **offer.to_draft(),
+    }
+
+    result = await _run_turn(
+        "U-slot-button",
+        "autopilot_slot_confirm",
+        draft,
+        "はい",
+        # 解析結果に別の時刻が残っていてもボタンの意味は変わらない
+        extra_patches={"parse_line_message": _parsed_naming_a_new_time("19:00")},
+    )
+
+    result["created"].assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_an_unclear_confirmation_counts_up_instead_of_booking():
+    """読めなかった回数を数える。ここに打ち切りが無く、無限ループしていた。"""
+    from app.api.line import _CONFIRM_UNCLEAR_KEY
+
+    offer = _offered_two_slots()
+    draft = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "autopilot_picked_slot": offer.candidates[0],
+        **offer.to_draft(),
+    }
+    handoff = AsyncMock()
+
+    result = await _run_turn(
+        "U-slot-unclear-1",
+        "autopilot_slot_confirm",
+        draft,
+        "やっぱり明日にできますか",
+        extra_patches={"_handoff_autopilot_to_human": handoff},
+    )
+
+    result["created"].assert_not_awaited()
+    handoff.assert_not_awaited()
+    counted = [w[_CONFIRM_UNCLEAR_KEY] for w in result["written"] if _CONFIRM_UNCLEAR_KEY in w]
+    assert counted == [1]
+
+
+@pytest.mark.asyncio
+async def test_the_third_unclear_confirmation_is_handed_to_a_human():
+    """分からないまま同じ確認を返し続けない。"""
+    from app.api.line import _CONFIRM_UNCLEAR_KEY, _CONFIRM_UNCLEAR_LIMIT
+
+    offer = _offered_two_slots()
+    draft = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "autopilot_picked_slot": offer.candidates[0],
+        _CONFIRM_UNCLEAR_KEY: _CONFIRM_UNCLEAR_LIMIT - 1,
+        **offer.to_draft(),
+    }
+    handoff = AsyncMock()
+
+    result = await _run_turn(
+        "U-slot-unclear-3",
+        "autopilot_slot_confirm",
+        draft,
+        "やっぱり明日にできますか",
+        extra_patches={"_handoff_autopilot_to_human": handoff},
+    )
+
+    result["created"].assert_not_awaited()
+    handoff.assert_awaited_once()
+    # 退避する前に0へ戻す。manual にしても draft は消えないので、
+    # 自動応答へ戻した直後に1回で再退避してしまう。
+    assert {_CONFIRM_UNCLEAR_KEY: 0} in result["written"]
+
+
 @pytest.mark.asyncio
 async def test_without_a_stored_offer_no_number_can_book():
     """保存した候補が無ければ、どんな返答でも予約は作られない。

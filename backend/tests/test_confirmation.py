@@ -105,6 +105,23 @@ def test_the_parser_polarity_and_the_words_are_read_together(text, parsed, expec
     assert confirmation.read_answer(text, parsed) == expected
 
 
+def test_the_loose_marker_reading_is_not_enough_on_its_own():
+    """なぜ三値にしたのかを残す。マーカーの部分一致だけなら全部「はい」になる。
+
+    マーカーから "お願い" を削るのは直し方として正しくない。
+    「16時に変更でお願いします」は肯定語を含んでいるのが事実で、
+    問題は **患者が別の希望を述べていること** を見ていなかった方にある。
+    確認の判定に looks_affirmative を単独で使わないこと。
+    """
+    for text in ("15時でお願いします", "16時に変更でお願いします", "よろしくお願いします"):
+        assert confirmation.looks_affirmative(text) is True
+
+    # そのうえで、別の希望を述べているものは同意として読まない
+    for text in ("15時でお願いします", "16時に変更でお願いします"):
+        parsed = {"polarity": "affirmative", "time": text[:2].replace("時", "") + ":00"}
+        assert confirmation.read_answer(text, parsed, expected=_asked_about()) == confirmation.UNCLEAR
+
+
 def test_the_expected_slot_is_only_built_when_both_parts_are_known():
     assert confirmation.expected_slot("2026-09-07", "14:00") == {"date": "2026-09-07", "start": "14:00"}
     assert confirmation.expected_slot("2026-09-07", None) is None
