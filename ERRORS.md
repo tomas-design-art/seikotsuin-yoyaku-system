@@ -92,3 +92,35 @@
 - 症状: `_extract_duration_minutes("1時間30分でお願いします")` が **30** を返す。`_STATED_DURATION` のルックビハインド `(?<![時:：\d])` が「間」を弾かないため。「1時間」単独は `None`（安全側）。
 - 影響: `parsed["duration_minutes"]` が取れないとき（Gemini 障害時の正規表現フォールバック）だけ通る経路。希望より短い枠で候補が組まれる。
 - 状態: **未修正。** 「N時間M分」「N時間半」を先に拾う分岐が要る。着手時は `_extract_duration_minutes("1時間半で") == 90` も併せて固定すること。
+
+## 2026-09-08: 複数LINE workerが同じイベントと会話を並列処理した
+
+- 症状: 患者への同一返信が2通ずつ届き、キャンセル確認へ「はい」と答えても同じ確認が繰り返された。Renderログでは受信直後に `LINE reply failed: 400 Invalid reply token`、続いて `LINE push fallback sent (reason=reply_api_failed)` が発生。APSchedulerの同一実行時刻にも重複したログがあった。
+- 原因: `claim_pending_events()` がpending行をロックせずSELECTしてからprocessingへ更新していた。`_LINE_EVENT_WORKER_LOCK` とAPSchedulerの `max_instances=1` はプロセス内でしか効かず、複数プロセス・コンテナのschedulerが同じDB行を同時にclaimできた。片方がreply tokenを使った後、もう片方が同じtokenで400となり、同文をpushした。別イベントも並列処理されるため、同一患者の会話状態とキャンセル手順の順序保証も失われた。
+- 修正: claim SELECTへ `FOR UPDATE SKIP LOCKED` を追加。同一患者の古いpending/processingイベントが残る間は後続をclaimしない `NOT EXISTS` 条件も追加した。異なる行を同時にclaimする競合は、claimトランザクション内だけの患者単位advisory lockで原子化する。長時間のworker lockは接続だけ切れた際に排他を失うため採用しない。上限到達のprocessing行はstaleになるまで障壁にし、その後failedへ終端化して後続を解放する。
+- 検証: `tests/test_line_inbox.py` で同一行の競合、同一患者の通常順序、古いイベントの遅着、同値/NULL timestamp、5回目処理中の停止復旧を実PostgreSQLで確認済み（7件成功）。LINE関連340件成功。backend全体は619件成功・既知4件失敗で、新規失敗なし。
+- 鉄則: **会話キューの直列性をプロセス内ロックだけで保証しない。** DB行claimを原子的にし、同一患者の先行イベントをDB条件で障壁にする。
+- 状態: L3（行ロック・短時間の患者claim lock・先行イベント障壁・実DB回帰テストで固定）
+
+## 2026-09-08: 実DBロックテストが全体実行時だけ別イベントループで失敗
+
+- 症状: `test_only_one_process_can_hold_the_line_worker_lease` は単独成功したが、全体スイートでは `Future attached to a different loop` で失敗した。
+- 原因: モジュール共有のAsyncEngineが、先に実行された別イベントループのasyncpg接続をpoolに保持していた。テストがそのEngineを直接再利用したため、pytestの現在ループと接続のループが食い違った。
+- 修正: `app.database.engine.url` から実DBテスト専用のAsyncEngineを `NullPool` で作る。ランダム名の専用schema内にキューテーブルを作り、テスト終了時にschemaごと削除する。アプリ共有Engineのpoolと開発DBの既存LINEイベントは使わない。
+- 手順: 複数イベントループを作る全体スイートでasyncpgを実測するテストは、アプリ共有Engineのpoolを再利用しない。
+- 状態: L1
+
+## 2026-09-08: キューテストが削除済みのEngine参照で失敗
+
+- 症状: `test_line_inbox.py` の実DBテスト2件が `module 'app.services.line_inbox' has no attribute 'engine'` で失敗した。
+- 原因: advisory lock撤去で `line_inbox` からEngine importも削除したが、テストの接続URL取得元を直していなかった。
+- 修正: Engineの所有元 `app.database.engine` をテストから明示参照する。
+- 状態: L1
+
+## 2026-09-08: 遅着した古いLINEイベントがprocessing障壁をすり抜けた
+
+- 症状: 未commit中の患者単位claim lockでは競合を止められたが、先にclaimした新しいイベントをcommitした後、遅着した古いイベントがclaimされた。
+- 原因: 先行障壁が「候補より古いpending/processing」だけを見ており、候補より新しいtimestampのprocessing行を見ていなかった。
+- 修正: 同一患者の別processing行はtimestamp順に関係なく後続claimの障壁にする。短時間claim lockは未commit同士の競合防止として併用する。
+- 併発: 復旧テストに `sqlalchemy.select` のimport漏れがあり `NameError`。テスト側へ明示importした。
+- 状態: L3（遅着イベント実DBテストで固定）
