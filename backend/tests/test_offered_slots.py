@@ -224,3 +224,30 @@ def test_each_offer_gets_its_own_id():
     first = offered_slots.new_offer(_candidates())
     second = offered_slots.new_offer(_candidates())
     assert first.offer_id != second.offer_id
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("二", 2),
+    ("三", 3),
+    ("一番", 1),
+    ("二でお願いします", 2),
+    ("三にします", 3),
+])
+def test_a_kanji_number_is_treated_as_a_choice(text, expected):
+    """フリック入力では「2」のつもりが「二」になる。
+
+    2026-09-08 まことさん指摘: 入力は人間の指なので、タップ次第で十分起こりうる。
+    """
+    assert offered_slots.selected_index(text) == expected
+
+
+@pytest.mark.parametrize("text", [
+    "二人で行きます",
+    "三日は空いてますか",
+    "一度伺いたいです",
+    "十",          # 候補は数件しか出さないので十以上は扱わない
+    "二十三",
+])
+def test_a_kanji_number_inside_a_sentence_is_not_a_choice(text):
+    """「本文が番号だけ」の条件が先に効く。ここが無いと「二人で行きます」が候補2になる。"""
+    assert offered_slots.selected_index(text) is None

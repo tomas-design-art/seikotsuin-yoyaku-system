@@ -25,7 +25,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from app.utils.normalize import normalize_input_text
+from app.utils.normalize import kanji_digits_to_ascii, normalize_input_text
 
 # 会話状態(draft)での保存キー。
 #
@@ -157,8 +157,11 @@ def selected_index(text: str) -> int | None:
     半角と同じに読む（2026-09-08: 全角の選択が無視され、再提示ループに落ちていた）。
     間違った枠を選ばせない保証は「本文が番号だけのときに限る」「保存した候補にだけ
     照合する」「そのあと必ず確認を1回挟む」の3つで、いずれも数字の字幅とは無関係。
+
+    漢数字も同じ理由で受ける。フリック入力では「2」のつもりが「二」になる。
+    「本文が番号だけ」の条件が先にあるので、「二人で行きます」は選択にならない。
     """
-    match = _NUMBER_ONLY.match(normalize_input_text(text))
+    match = _NUMBER_ONLY.match(kanji_digits_to_ascii(normalize_input_text(text)))
     return int(match.group(1)) if match else None
 
 

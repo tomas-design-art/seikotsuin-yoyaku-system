@@ -33,7 +33,7 @@ from app.models.setting import Setting
 from app.schemas.reservation import ReservationCreate
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.booking_form import Form as BookingForm
-from app.services.line_composer import compose_from_plan, compose_reply
+from app.services.line_composer import compose_from_plan, compose_reply, strip_opening_greeting
 from app.services import confirmation, offered_slots
 from app.services.reply_plan import ReplyPlan, plan_for
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
@@ -1034,13 +1034,30 @@ def _cancel_confirmation_plan(reservation: Reservation, remaining: int = 0) -> R
     )
 
 
+async def _polished_from_plan(plan: ReplyPlan) -> str:
+    """骨格を整えた文面。2通目以降は頭の関係性の挨拶を落とす。
+
+    `_compose_autopilot_reply` を通らない経路（確認の骨格）でも同じ扱いにする。
+    """
+    reply = await compose_from_plan(plan)
+    db = _AUTOPILOT_DB_CONTEXT.get()
+    user_id = _AUTOPILOT_USER_CONTEXT.get()
+    if db is None or not user_id:
+        return reply
+    state = await get_user_state(db, user_id)
+    history = (state.get("context_data") or {}).get("conversation_history") or []
+    if _has_already_replied_in_this_conversation(history):
+        return strip_opening_greeting(reply)
+    return reply
+
+
 async def _reply_plan(reply_token: str | None, form: str, plan: ReplyPlan) -> None:
     """骨格から文面を作って送る。整え方が骨格を壊していれば骨格をそのまま送る。"""
     if not reply_token:
         return
     await reply_text_with_quick_reply(
         reply_token,
-        await compose_from_plan(plan),
+        await _polished_from_plan(plan),
         _build_confirmation_quick_reply_items(form),
     )
 
@@ -1133,6 +1150,56 @@ async def _reply_confirmation(reply_token: str | None, form: str, message: str) 
 # 確認の返事が読めなかった回数。閾値は既存の autopilot_cancel_select_failures に合わせる。
 _CONFIRM_UNCLEAR_KEY = "autopilot_confirm_unclear"
 _CONFIRM_UNCLEAR_LIMIT = 3
+
+
+async def _reply_if_closed_day(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    target_date: date,
+    text: str,
+    parsed_intent: dict | None,
+    request_id: str | None = None,
+) -> bool:
+    """休診日ならその旨を答えて True を返す。予約できない日の話を進めないため。
+
+    これが無いと、休診日でも「空き0件」として扱われ「予約がいっぱい」と誤案内する。
+
+    **日付が確定した時点で呼ぶこと。時刻が揃うのを待たない。**
+    2026-09-08 実機: 「今日このあとお願いします」で日付だけ確定したとき、
+    時刻が無いと「ご希望のお時間を教えていただけますか」で返してしまい、
+    ここへ到達しなかった。休診日なのに時刻を聞き返していた。
+    同じ「今日」でも、時刻まで言われたときだけ休診日と答える状態になっていた。
+    """
+    try:
+        business_hours = await get_business_hours_for_date(db, target_date)
+    except Exception as error:
+        # 判定できないときは会話を止めない。確定時の validate_business_hours が最終防波堤。
+        logger.warning("business hours lookup failed for %s: %s", target_date, error)
+        return False
+    if business_hours is None or business_hours.is_open:
+        return False
+
+    await set_user_mode(db, user_id, "waiting_datetime", request_id)
+    if reply_token:
+        await reply_to_line(
+            reply_token,
+            await _compose_autopilot_reply(
+                "closed_day",
+                {
+                    "date": _format_date_with_weekday_jp(target_date),
+                    "reason": business_hours.label or "休診日",
+                    "next_open_dates": [
+                        _format_date_with_weekday_jp(date.fromisoformat(iso))
+                        for iso in await next_open_dates(db, target_date)
+                    ],
+                    "patient_message": text,
+                },
+                parsed_intent,
+            ),
+        )
+    return True
 
 
 async def _reask_confirmation(
@@ -1312,6 +1379,13 @@ _is_affirmative = confirmation.looks_affirmative
 
 
 def _extract_alternative_choice(text: str, count: int) -> int | None:
+    # 漢数字は「本文が番号だけ」のときにしか読まない。
+    # この関数は文中の1桁を拾うので、そのまま変換すると
+    # 「二人で来ます」がキャンセル候補2の選択になる。取り違えた取消は戻せない。
+    bare = offered_slots.selected_index(text)
+    if bare is not None:
+        return bare if 1 <= bare <= count else None
+
     normalized = _normalize_confirmation_text(normalize_input_text(text))
     match = re.search(r"(?<!\d)([1-9])(?!\d)", normalized)
     if not match:
@@ -1396,6 +1470,19 @@ async def _assert_bookable_duration(
         )
 
 
+def _has_already_replied_in_this_conversation(recent_history: object) -> bool:
+    """この会話でもう1回でも返信しているか。挨拶を許すのは1通目だけ。
+
+    履歴は直近6件しか保持しないが、返信は毎ターン記録されるので、
+    2ターン目以降は必ず assistant の記録が入っている。
+    """
+    if not isinstance(recent_history, list):
+        return False
+    return any(
+        isinstance(entry, dict) and entry.get("role") == "assistant" for entry in recent_history
+    )
+
+
 async def _compose_autopilot_reply(
     situation: str,
     context: dict,
@@ -1469,6 +1556,13 @@ async def _compose_autopilot_reply(
         reply = await compose_from_plan(plan)
     else:
         reply = await compose_reply(situation, enriched_context)
+
+    # 会話の頭でしか言わない挨拶を、2通目以降から落とす。
+    # プロンプトに「毎回の挨拶は不要」と書いてあるのに毎回付いていた（2026-09-08 実機）。
+    # 骨格ごと差し替えず、足された1文だけを削ってLLMの文は生かす。
+    if _has_already_replied_in_this_conversation(enriched_context.get("recent_history")):
+        reply = strip_opening_greeting(reply)
+
     if db is not None and user_id:
         await append_conversation_history(db, user_id, "assistant", reply)
     parser_summary = {
@@ -4123,6 +4217,21 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 await reply_text_with_quick_reply(reply_token, prompt, quick_items)
             return
 
+    # 日付が確定したら、時刻が揃うのを待たずに休診日を見る。
+    # 予約できない日に「何時がご希望ですか」と聞き返さないため（2026-09-08 実機）。
+    if is_autopilot_patient and merged.get("date"):
+        requested_date = _parse_iso_date(merged.get("date"))
+        if requested_date and await _reply_if_closed_day(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            target_date=requested_date,
+            text=text,
+            parsed_intent=parsed_intent,
+            request_id=user_state.get("request_id"),
+        ):
+            return
+
     missing_datetime = [k for k in ["date", "time"] if not merged.get(k)]
     if missing_datetime:
         await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
@@ -4310,34 +4419,16 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         return
 
     # ── 休診日チェック（候補を探す前に必ず見る）──
-    # これが無いと、休診日でも「空き0件」として扱われ「予約がいっぱい」と誤案内してしまう。
-    if is_autopilot_patient:
-        try:
-            business_hours = await get_business_hours_for_date(db, target_date)
-        except Exception as error:
-            # 判定できないときは会話を止めない。確定時の validate_business_hours が最終防波堤。
-            logger.warning("business hours lookup failed for %s: %s", target_date, error)
-            business_hours = None
-        if business_hours is not None and not business_hours.is_open:
-            await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
-            if reply_token:
-                await reply_to_line(
-                    reply_token,
-                    await _compose_autopilot_reply(
-                        "closed_day",
-                        {
-                            "date": _format_date_with_weekday_jp(target_date),
-                            "reason": business_hours.label or "休診日",
-                            "next_open_dates": [
-                                _format_date_with_weekday_jp(date.fromisoformat(iso))
-                                for iso in await next_open_dates(db, target_date)
-                            ],
-                            "patient_message": text,
-                        },
-                        parsed_intent,
-                    ),
-                )
-            return
+    if is_autopilot_patient and await _reply_if_closed_day(
+        db,
+        user_id=user_id,
+        reply_token=reply_token,
+        target_date=target_date,
+        text=text,
+        parsed_intent=parsed_intent,
+        request_id=user_state.get("request_id"),
+    ):
+        return
 
     # ── 担当・施術時間の決定ルール ──
     preferred_practitioner_id = merged.get("practitioner_id")

@@ -5455,3 +5455,69 @@ async def test_the_real_conversation_fills_the_boxes_and_books_what_was_shown():
     assert booked.practitioner_id == 1
     assert booked.start_time.strftime("%Y-%m-%d %H:%M") == "2026-09-07 14:00"
     assert booked.end_time.strftime("%H:%M") == "15:00"
+
+
+@pytest.mark.asyncio
+async def test_a_closed_day_is_answered_before_asking_for_a_time():
+    """休診日なら、時刻が揃うのを待たずにその日は取れないと答える。
+
+    2026-09-08 実機: 「今日このあとお願いします」で日付だけ確定したとき、
+    「9/8(火)のご予約ですね。ご希望のお時間を教えていただけますでしょうか？」と
+    返していた。休診日チェックが「時刻が無ければ聞き返す」の186行下にあり、
+    時刻が揃った回だけ休診日と答える状態だった。
+    """
+    from app.api.line import _handle_text_message
+
+    patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
+    state = {"mode": "waiting_datetime", "draft": {"menu_id": 5, "menu_name": "マッスルセラピー"},
+             "request_id": "rid-1", "context_data": {}}
+    parsed = {"intent": "new", "confidence": "high", "constraints": [],
+              "has_reservation_intent": True, "date": "2026-09-08"}
+    closed = SimpleNamespace(is_open=False, label="休診日")
+    situations: list[str] = []
+
+    async def fake_compose(situation, *_a, **_k):
+        situations.append(situation)
+        return "（返信）"
+
+    async def fake_merge(_db, _uid, update, *_a, **_k):
+        state["draft"].update({k: v for k, v in update.items() if v not in (None, "")})
+        return dict(state["draft"])
+
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.api.line.settings.line_autopilot_enabled", True))
+        for name, value in {
+            "get_user_state": state,
+            "get_user_mode": "waiting_datetime",
+            "_get_line_display_name": "時田",
+            "_find_line_patient": patient,
+            "_get_latest_reservation_for_line_user": None,
+            "build_clinic_context": {},
+            "parse_line_message": parsed,
+            "get_request": None,
+            "set_user_mode": None,
+            "reply_to_line": None,
+            "reply_text_with_quick_reply": None,
+            "get_business_hours_for_date": closed,
+            "next_open_dates": ["2026-09-09", "2026-09-10"],
+        }.items():
+            stack.enter_context(patch(f"app.api.line.{name}", new=AsyncMock(return_value=value)))
+        stack.enter_context(patch("app.api.line.merge_user_draft", new=fake_merge))
+        stack.enter_context(patch("app.api.line._compose_autopilot_reply", new=fake_compose))
+        created = stack.enter_context(
+            patch("app.api.line.create_reservation", new=AsyncMock(return_value={"id": 999}))
+        )
+        await _handle_text_message(
+            {
+                "replyToken": "reply-token",
+                "source": {"userId": "U-closed-day"},
+                "message": {"type": "text", "text": "今日このあとお願いします"},
+            },
+            _EmptyDB(),
+        )
+
+    created.assert_not_awaited()
+    assert "closed_day" in situations, situations
+    # 予約できない日に時刻を聞き返さない
+    assert "ask_datetime" not in situations, situations
+    assert "ask_time_for_date" not in situations, situations

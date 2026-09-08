@@ -74,3 +74,25 @@ def normalize_input_text(text: str | None) -> str:
     if not text:
         return ""
     return unicodedata.normalize("NFKC", text).strip()
+
+
+# 漢数字の一桁。候補は最大でも数件なので十以上は扱わない。
+_KANJI_DIGITS = str.maketrans("一二三四五六七八九", "123456789")
+
+
+def kanji_digits_to_ascii(text: str | None) -> str:
+    """一桁の漢数字を算用数字にする。**番号選択の入口でだけ使う。**
+
+    患者はフリック入力で番号を打つので、「2」のつもりが「二」になることがある。
+    NFKC は漢数字を変換しないので、ここで別に吸収する。
+
+    十以上は扱わない（候補は数件しか出さない）。文中の漢数字まで拾わないよう、
+    呼ぶ側は「本文が番号だけ」の判定と組み合わせること。
+    そうしないと「二人で行きます」が候補2の選択になる。
+
+    >>> kanji_digits_to_ascii("二")
+    '2'
+    >>> kanji_digits_to_ascii("三でお願いします")
+    '3でお願いします'
+    """
+    return (text or "").translate(_KANJI_DIGITS)
