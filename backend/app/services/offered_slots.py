@@ -25,6 +25,8 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.utils.normalize import normalize_input_text
+
 # 会話状態(draft)での保存キー。候補はここ以外に置かない。
 DRAFT_KEY = "autopilot_offer"
 
@@ -119,8 +121,13 @@ def selected_index(text: str) -> int | None:
 
     以前は本文から最初の孤立した1桁を拾っていたため、
     「1日の午後で」「1時間でお願いします」まで候補選択として扱っていた。
+
+    入口で字幅だけ揃える。日本語キーボードで全角の「１」と打たれても
+    半角と同じに読む（2026-09-08: 全角の選択が無視され、再提示ループに落ちていた）。
+    間違った枠を選ばせない保証は「本文が番号だけのときに限る」「保存した候補にだけ
+    照合する」「そのあと必ず確認を1回挟む」の3つで、いずれも数字の字幅とは無関係。
     """
-    match = _NUMBER_ONLY.match(text or "")
+    match = _NUMBER_ONLY.match(normalize_input_text(text))
     return int(match.group(1)) if match else None
 
 
@@ -130,7 +137,7 @@ def selected_index_by_time(text: str, offer: "Offer") -> int | None:
     「19:30からお願いします」のような答え方を受けるため。
     ただし **保存した候補にだけ** 照合し、1つに絞れたときしか採らない。
     """
-    normalized = (text or "").replace("：", ":")
+    normalized = normalize_input_text(text)
     hits: list[int] = []
     for index, candidate in enumerate(offer.candidates, 1):
         start = str(candidate.get("start") or "")

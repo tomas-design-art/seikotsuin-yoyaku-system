@@ -102,6 +102,7 @@ from app.services.reservation_service import create_reservation, reschedule_rese
 from app.services.schedule_service import is_practitioner_working
 from app.services.shadow_service import handle_shadow_message
 from app.utils.datetime_jst import JST, now_jst
+from app.utils.normalize import normalize_input_text
 
 logger = logging.getLogger(__name__)
 
@@ -1326,9 +1327,7 @@ def _is_affirmative(text: str) -> bool:
 
 
 def _extract_alternative_choice(text: str, count: int) -> int | None:
-    normalized = _normalize_confirmation_text(text).translate(
-        str.maketrans("０１２３４５６７８９", "0123456789")
-    )
+    normalized = _normalize_confirmation_text(normalize_input_text(text))
     match = re.search(r"(?<!\d)([1-9])(?!\d)", normalized)
     if not match:
         return None
@@ -1338,7 +1337,8 @@ def _extract_alternative_choice(text: str, count: int) -> int | None:
 
 def _extract_alternative_time_choice(text: str, alternatives: list[dict]) -> int | None:
     """提示済み候補の開始時刻を自然文で指定した明示選択を返す。"""
-    message = (text or "").replace("：", ":")
+    # 全角コロンだけを直すのでは足りない。「１４：００」のように数字も全角で来る。
+    message = normalize_input_text(text)
     if not _is_affirmative(message) and not re.search(r"(?:にして|にします|取(?:り|れ))", message):
         return None
 

@@ -1,7 +1,11 @@
-"""検索キーワード正規化ユーティリティ.
+"""文字列正規化ユーティリティ.
 
-ひらがな・カタカナ・半角カナ・全角英数の揺れを吸収し、
-統一された文字列で比較できるようにする。
+用途が2つある。取り違えないこと。
+
+- `normalize_search_text` … **検索・照合用**。ひらがな→カタカナまで踏み込む。
+  氏名の名寄せのように「読みが同じなら同じ」と見なしたいときに使う。
+- `normalize_input_text` … **入力の字幅を揃えるだけ**。NFKC と strip のみ。
+  患者が全角で打った「１」「１４：００」を素直に読むためのもの。
 """
 
 import re
@@ -45,3 +49,28 @@ def normalize_search_text(text: str | None) -> str:
     text = text.replace("\u3000", " ")
     text = re.sub(r"\s+", " ", text)
     return text.strip().lower()
+
+
+def normalize_input_text(text: str | None) -> str:
+    """患者が打った本文の字幅だけを揃える。NFKC と strip のみ。
+
+    NFKC が「１」→「1」「：」→「:」「　」→「 」を吸収する。
+    かなの統一も lower も **しない**。
+
+    `normalize_search_text` をここに使ってはいけない。
+    ひらがな→カタカナ変換が入るため「２番」が「2バン」になり、
+    「番」「にします」「でお願いします」のような日本語の接尾辞と照合できなくなる。
+
+    2026-09-08: 全角で「１」と答えた選択が候補選択として読まれず、
+    同じ候補一覧を返し続けるループの一因になっていた。
+
+    >>> normalize_input_text("１")
+    '1'
+    >>> normalize_input_text("１４：００")
+    '14:00'
+    >>> normalize_input_text("　2番　")
+    '2番'
+    """
+    if not text:
+        return ""
+    return unicodedata.normalize("NFKC", text).strip()

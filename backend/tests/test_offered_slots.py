@@ -63,19 +63,31 @@ def test_the_buttons_carry_which_offer_and_which_slot():
 
 @pytest.mark.parametrize("text,expected", [
     ("1", 1),
-    ("２", None),          # 全角はここでは拾わない（ボタンで選ばせる）
+    ("２", 2),             # 日本語キーボードの全角。半角と同じに読む
+    ("１番", 1),
+    ("３でお願いします", 3),
+    ("　２　", 2),          # 全角スペースで囲まれていても
     (" 2 ", 2),
     ("1番", 1),
     ("3でお願いします", 3),
     ("2にします", 2),
 ])
 def test_a_bare_number_is_treated_as_a_choice(text, expected):
+    """全角で答えた選択も、半角と同じに読む。
+
+    2026-09-08: 全角の「１」が候補選択として読まれず、同じ候補一覧を
+    返し続けるループの一因になっていた。半角を通して全角を落とす理屈はない
+    ―― 間違った枠を選ばせない保証（本文が番号だけのときに限る／保存した候補に
+    だけ照合する／そのあと必ず確認を1回挟む）は、どれも数字の字幅に依存しない。
+    """
     assert offered_slots.selected_index(text) == expected
 
 
 @pytest.mark.parametrize("text", [
     "1日の午後で",
     "1時間でお願いします",
+    "２日の午後で",          # 全角を通しても、文中の数字は選択にしない
+    "１時間でお願いします",
     "2人で行きます",
     "3日は空いてますか",
     "明日の15時で",
@@ -88,8 +100,27 @@ def test_a_number_inside_a_sentence_is_not_a_choice(text):
 
     以前は本文から最初の孤立した1桁を拾っていたため、
     「1日の午後で」が候補1の選択として処理されていた。
+
+    2026-09-08 に全角を読むようにしたが、門を広げ過ぎていないことをここで押さえる。
     """
     assert offered_slots.selected_index(text) is None
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("14:00", 1),
+    ("１４：００", 1),        # 全角の時刻
+    ("15時でお願いします", 2),
+    ("１５時でお願いします", 2),
+    ("16:00", None),        # 提示していない時刻
+    ("１６：００", None),
+])
+def test_the_clock_time_in_the_reply_picks_the_slot_it_names(text, expected):
+    """時刻での答え方も、全角のまま届くことがある。
+
+    照合先はあくまで保存した候補だけ。絞れないときは採らない。
+    """
+    offer = offered_slots.new_offer(_candidates())
+    assert offered_slots.selected_index_by_time(text, offer) == expected
 
 
 def test_the_slot_about_to_be_booked_must_match_the_one_that_was_chosen():
