@@ -372,3 +372,33 @@ async def test_build_same_day_candidates_never_offers_a_time_already_past(monkey
     assert await slot_scorer.build_same_day_candidates(
         db, late_now.date(), time(20, 45), 60, max_results=3,
     ) == []
+
+
+def test_the_candidate_label_reads_as_a_japanese_date_not_an_iso_string():
+    """候補一覧の日付を LINE がリンク化しない形にする。
+
+    2026-09-08 実機: 候補が「1. 2026-09-09 10:00〜11:00（担当: 上田）」と出て、
+    LINE が ISO 日付を自動でリンク化するため青い文字だらけで読みにくかった。
+
+    生成箇所が2つあり、担当者の書き方も「（時田）」「（担当:時田）」で
+    揃っていなかったので、ScoredSlot の中で1回だけ作る形にした。
+    片方だけ直しても落ちるよう、両方の生成経路を通る値を検査する。
+    """
+    slot = slot_scorer.ScoredSlot(
+        date(2026, 9, 9), time(10, 0), time(11, 0), 2, "上田", 0.0,
+    )
+
+    assert slot.label == "9/9(水) 10:00〜11:00（担当: 上田）"
+    assert "2026-" not in slot.label
+    # to_dict の date は ISO のまま（曜日の検算や日付の突き合わせが使う）
+    assert slot.to_dict()["date"] == "2026-09-09"
+    assert slot.to_dict()["label"] == slot.label
+
+
+def test_the_candidate_label_cannot_be_set_from_outside():
+    """ラベルを引数で渡せる余地を残すと、また2通りの書き方が生まれる。"""
+    with pytest.raises(TypeError):
+        slot_scorer.ScoredSlot(
+            date(2026, 9, 9), time(10, 0), time(11, 0), 2, "上田", 0.0,
+            "2026-09-09 10:00〜11:00（上田）",
+        )

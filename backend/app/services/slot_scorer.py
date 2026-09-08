@@ -18,6 +18,7 @@ from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation import Reservation
 from app.services.business_hours import get_business_hours_for_date
+from app.services.clinic_context import format_date_jp
 from app.utils.datetime_jst import now_jst
 from app.services.conflict_detector import ACTIVE_STATUSES, check_conflict
 from app.services.schedule_service import is_practitioner_working, get_practitioner_working_hours
@@ -61,7 +62,24 @@ class ScoredSlot:
     practitioner_id: int
     practitioner_name: str
     score: float
-    label: str
+    label: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        """患者に見せる1行。**組み立てはここ1箇所だけ。**
+
+        以前は生成箇所が2つあり、日付が ISO（2026-09-09）で、担当者の書き方も
+        「（時田）」と「（担当:時田）」で揃っていなかった。LINE は ISO 日付を
+        自動でリンク化するので、候補一覧が青い文字だらけで読みにくかった
+        （2026-09-08 実機で確認）。
+
+        確定・キャンセルの文面は「後から見返す記録」なので `2026/09/09` のまま
+        にしてある。ここは「選ぶための一時情報」なので、役割が違うものを揃えない。
+        """
+        self.label = (
+            f"{format_date_jp(self.date)} "
+            f"{self.start_time.strftime('%H:%M')}〜{self.end_time.strftime('%H:%M')}"
+            f"（担当: {self.practitioner_name}）"
+        )
 
     def to_dict(self) -> dict:
         return {
@@ -355,15 +373,10 @@ async def score_candidates(
 
                 st = time(slot // 60, slot % 60)
                 et = time(slot_end // 60, slot_end % 60)
-                label = (
-                    f"{check_date.isoformat()} "
-                    f"{st.strftime('%H:%M')}〜{et.strftime('%H:%M')}"
-                    f"（{info.practitioner.name}）"
-                )
                 all_candidates.append(ScoredSlot(
                     check_date, st, et,
                     info.practitioner.id, info.practitioner.name,
-                    sc, label,
+                    sc,
                 ))
 
             slot += SLOT_INTERVAL
@@ -572,8 +585,6 @@ async def build_same_day_candidates(
             results.append(ScoredSlot(
                 target_date, st, et,
                 info.practitioner.id, info.practitioner.name, 0.0,
-                f"{target_date.isoformat()} {st.strftime('%H:%M')}〜{et.strftime('%H:%M')}"
-                f"（担当:{info.practitioner.name}）",
             ))
             chosen.append(start)
 
