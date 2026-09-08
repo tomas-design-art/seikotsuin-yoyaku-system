@@ -2098,6 +2098,16 @@ def _offered_slot_bounds(offered: list[dict], target_date: date) -> tuple[int | 
 
 
 def _to_offered_slots(candidates: list[dict]) -> list[dict]:
+    """交渉のための覚え書きを作る。**患者に見せた候補そのものではない。**
+
+    行き先は draft の `autopilot_offered_slots`。担当者名もラベルも落ちるので、
+    ここから患者に見せた文言は復元できないし、**ここから予約を作ってもいけない。**
+    使い道は3つだけ（前回提示の日付／「もっと早く・遅く」の検索窓／
+    「候補提示済み」フラグ）。役割の説明は app/services/offered_slots.py の
+    DRAFT_KEY の上に書いてある。
+
+    患者に見せた候補は `offered_slots.new_offer` で `autopilot_offer` に入れる。
+    """
     return [
         {
             "date": candidate.get("date"),
@@ -3385,6 +3395,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     await _compose_autopilot_reply("change_target_missing", {"patient_message": text}, parsed),
                 )
             return
+        # ★ここは #2572 の対策が入っていない旧方式。次に直す筆頭。
+        #   offer_id もボタンも予約直前の検算も無く、番号照合は
+        #   _select_change_alternative → _extract_alternative_choice ＝
+        #   「本文中の孤立した1桁を拾う」で、事故の原因ロジックそのもの。
+        #   しかも **既存の予約を動かす** 経路なので、放置期間が長いほど痛い。
+        #   新規予約側と同じく offered_slots へ寄せること。
         change_offer = prev_draft.get("autopilot_change_offered_slots") or []
         selected_choice = _select_change_alternative(text, change_offer)
         if selected_choice is not None:

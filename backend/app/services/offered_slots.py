@@ -27,7 +27,38 @@ from typing import Any
 
 from app.utils.normalize import normalize_input_text
 
-# 会話状態(draft)での保存キー。候補はここ以外に置かない。
+# 会話状態(draft)での保存キー。
+#
+# ★draft に候補めいたキーは3つある。役割が違うので取り違えないこと。
+#   「候補はここ以外に置かない」と書いてあったが、事実ではなかった（2026-09-08 訂正）。
+#
+# 1. autopilot_offer（このモジュール）
+#    = **患者に見せた候補そのもの。唯一の正。**
+#    番号の照合・ボタン・予約直前の検算は、ここだけを見る。
+#
+# 2. autopilot_offered_slots（app/api/line.py）
+#    = 候補の写しではなく **交渉のための覚え書き**。date/start/end/practitioner_id の
+#    4項目に間引いた別表現で、読者は3つだけ:
+#      - line.py の starts_new_search 判定 … 前回提示の「日付」だけを使う。
+#        別の日を言われたら古い autopilot_filters を引き継がないため
+#      - line.py の _offered_slot_bounds … 「もっと早く/遅く」の検索窓と
+#        target_date の固定に、提示済みの最早/最遅を使う
+#      - line.py の再検索への分岐 … 「候補提示済み」フラグ。
+#        **autopilot_slot_confirm 等、モード集合に無い状態から再検索へ逃がす唯一の道**
+#    **ここから予約を作ってはいけない。**
+#
+# 3. autopilot_change_offered_slots（app/api/line.py・変更フロー専用）
+#    = **未移行の旧方式。** offer_id もボタンも matches_slot も無く、番号照合は
+#    _extract_alternative_choice（本文中の孤立1桁）＝ #2572 の原因ロジックそのもの。
+#    既存の予約を動かす経路なので、放置期間が長いほど痛い。次に直す筆頭。
+#
+# 2 を全廃してよくなる条件（次にやる人へ）:
+#   - 候補0件のとき旧キーを [] で上書きしないこと（2026-09-08 に修正済み）
+#   - 候補生成の max_results が 5 以下であること
+#     （旧キーは [:5] に切るので、超えると _offered_slot_bounds の窓が広がる。
+#      現状は全経路 max_results=3 なので一度も切っていない）
+#   - test_autopilot_negotiation_reoffers_earlier_shorter_slot_without_handoff の
+#     フィクスチャを offer.to_draft() へ寄せられること
 DRAFT_KEY = "autopilot_offer"
 
 # 本文が「番号だけ」のときしか選択として扱わない。
