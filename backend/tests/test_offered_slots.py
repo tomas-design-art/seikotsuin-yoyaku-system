@@ -161,6 +161,64 @@ def test_the_slot_about_to_be_booked_must_match_the_one_that_was_chosen():
     ) is False
 
 
+def test_a_pick_records_which_offer_and_which_index_it_came_from():
+    """枠だけを保存すると、予約直前に突き合わせる相手が自分自身しか無くなる。"""
+    offer = offered_slots.new_offer(_candidates(), duration_minutes=60)
+    record = offered_slots.picked_record(offer, 2)
+
+    assert record["offer_id"] == offer.offer_id
+    assert record["index"] == 2
+    assert record["start"] == "15:00"
+    assert record["practitioner_id"] == 1
+    assert offered_slots.picked_record(offer, 9) is None
+
+
+def test_a_pick_that_matches_the_offer_it_came_from_is_accepted():
+    offer = offered_slots.new_offer(_candidates())
+    assert offered_slots.verify_pick(offer, offered_slots.picked_record(offer, 1)) is None
+
+
+@pytest.mark.parametrize("picked,reason", [
+    (None, "提示の記録が無い"),
+    ({"date": "2026-09-07", "start": "14:00"}, "提示の記録が無い"),  # 旧形式
+])
+def test_a_pick_without_its_provenance_is_rejected(picked, reason):
+    """出どころの無い選択で予約を作らない。"""
+    offer = offered_slots.new_offer(_candidates())
+    assert offered_slots.verify_pick(offer, picked) == reason
+
+
+def test_a_pick_from_a_replaced_offer_is_rejected():
+    """選んだあとに別の候補を提示していたら、その選択は使わない。"""
+    first = offered_slots.new_offer(_candidates())
+    picked = offered_slots.picked_record(first, 1)
+    second = offered_slots.new_offer(_candidates())
+
+    assert offered_slots.verify_pick(second, picked) == "提示が入れ替わっている"
+    assert offered_slots.verify_pick(None, picked) == "提示が残っていない"
+
+
+def test_a_pick_whose_slot_no_longer_matches_the_offer_is_rejected():
+    """同じ提示・同じ番号でも、中身が差し替わっていたら止める。
+
+    #2572 の形。これを検出できることが、この検算の存在理由。
+    """
+    offer = offered_slots.new_offer(_candidates())
+    picked = offered_slots.picked_record(offer, 1)  # 14:00 時田
+
+    # 提示の1番目だけが別の枠に差し替わった
+    offer.candidates[0] = {
+        "date": "2026-09-07", "start": "10:00", "end": "11:00",
+        "practitioner_id": 2, "practitioner_name": "上田",
+    }
+    assert offered_slots.verify_pick(offer, picked) == "枠が入れ替わっている"
+
+    # 番号が範囲外になった
+    shrunk = offered_slots.new_offer(_candidates()[:1])
+    shrunk.offer_id = offer.offer_id
+    assert offered_slots.verify_pick(shrunk, offered_slots.picked_record(offer, 2)) == "番号が範囲外"
+
+
 def test_each_offer_gets_its_own_id():
     """新しく提示したら、古いボタンと見分けられること。"""
     first = offered_slots.new_offer(_candidates())

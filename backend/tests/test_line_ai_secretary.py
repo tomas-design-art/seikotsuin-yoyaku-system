@@ -10,6 +10,8 @@ import re
 
 import pytest
 
+from app.services import offered_slots
+
 
 def test_build_reservation_review_flex_has_three_actions():
     from app.services.line_alerts import build_reservation_review_flex
@@ -728,7 +730,7 @@ async def test_confirming_books_exactly_the_slot_that_was_chosen():
     draft = {
         "menu_id": 5,
         "menu_name": "マッスルセラピー",
-        "autopilot_picked_slot": offer.candidates[0],
+        "autopilot_picked_slot": offered_slots.picked_record(offer, 1),
         **offer.to_draft(),
     }
 
@@ -739,6 +741,63 @@ async def test_confirming_books_exactly_the_slot_that_was_chosen():
     assert booked.practitioner_id == 1
     assert booked.start_time.strftime("%Y-%m-%d %H:%M") == "2026-09-07 14:00"
     assert booked.end_time.strftime("%H:%M") == "15:00"
+
+
+@pytest.mark.asyncio
+async def test_booking_stops_when_the_offer_changed_between_choosing_and_confirming():
+    """選んだあとに提示が入れ替わっていたら、予約を作らず人へ渡す。
+
+    2026-09-08 まで、予約直前の検算は picked を picked と比べていた
+    （引数4つとも同じ値から作られていた）ので必ず合格し、
+    #2572 の形＝提示と違う枠での確定を原理的に検出できなかった。
+    """
+    chosen_offer = _offered_two_slots()
+    replacement = _offered_two_slots()  # offer_id が違う別の提示
+    draft = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "autopilot_picked_slot": offered_slots.picked_record(chosen_offer, 1),
+        **replacement.to_draft(),
+    }
+    handoff = AsyncMock()
+
+    result = await _run_turn(
+        "U-offer-swapped",
+        "autopilot_slot_confirm",
+        draft,
+        "はい",
+        extra_patches={"_handoff_autopilot_to_human": handoff},
+    )
+
+    result["created"].assert_not_awaited()
+    handoff.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_a_picked_slot_without_its_offer_record_is_not_booked():
+    """出どころの無い選択（旧形式）で予約を作らない。
+
+    テストを緩めたのではないことの証明としてここに置く。
+    """
+    offer = _offered_two_slots()
+    draft = {
+        "menu_id": 5,
+        "menu_name": "マッスルセラピー",
+        "autopilot_picked_slot": dict(offer.candidates[0]),  # offer_id も index も無い
+        **offer.to_draft(),
+    }
+    handoff = AsyncMock()
+
+    result = await _run_turn(
+        "U-picked-no-record",
+        "autopilot_slot_confirm",
+        draft,
+        "はい",
+        extra_patches={"_handoff_autopilot_to_human": handoff},
+    )
+
+    result["created"].assert_not_awaited()
+    handoff.assert_awaited_once()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -774,7 +833,7 @@ async def test_a_new_time_during_the_slot_confirmation_does_not_book():
     draft = {
         "menu_id": 5,
         "menu_name": "マッスルセラピー",
-        "autopilot_picked_slot": offer.candidates[0],  # 14:00
+        "autopilot_picked_slot": offered_slots.picked_record(offer, 1),  # 14:00
         **offer.to_draft(),
     }
 
@@ -846,7 +905,7 @@ async def test_a_matching_time_in_the_confirmation_still_books():
     draft = {
         "menu_id": 5,
         "menu_name": "マッスルセラピー",
-        "autopilot_picked_slot": offer.candidates[0],  # 14:00
+        "autopilot_picked_slot": offered_slots.picked_record(offer, 1),  # 14:00
         **offer.to_draft(),
     }
 
@@ -868,7 +927,7 @@ async def test_a_confirmation_button_still_books_after_the_stricter_reading():
     draft = {
         "menu_id": 5,
         "menu_name": "マッスルセラピー",
-        "autopilot_picked_slot": offer.candidates[0],
+        "autopilot_picked_slot": offered_slots.picked_record(offer, 1),
         **offer.to_draft(),
     }
 
@@ -893,7 +952,7 @@ async def test_an_unclear_confirmation_counts_up_instead_of_booking():
     draft = {
         "menu_id": 5,
         "menu_name": "マッスルセラピー",
-        "autopilot_picked_slot": offer.candidates[0],
+        "autopilot_picked_slot": offered_slots.picked_record(offer, 1),
         **offer.to_draft(),
     }
     handoff = AsyncMock()
@@ -921,7 +980,7 @@ async def test_the_third_unclear_confirmation_is_handed_to_a_human():
     draft = {
         "menu_id": 5,
         "menu_name": "マッスルセラピー",
-        "autopilot_picked_slot": offer.candidates[0],
+        "autopilot_picked_slot": offered_slots.picked_record(offer, 1),
         _CONFIRM_UNCLEAR_KEY: _CONFIRM_UNCLEAR_LIMIT - 1,
         **offer.to_draft(),
     }

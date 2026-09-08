@@ -150,10 +150,53 @@ def selected_index_by_time(text: str, offer: "Offer") -> int | None:
     return hits[0] if len(hits) == 1 else None
 
 
+def picked_record(offer: Offer, index: int) -> dict | None:
+    """選ばれた枠に「どの提示の何番目か」を添えて返す。
+
+    枠だけを保存すると、予約を作る直前に突き合わせる相手が
+    自分自身しか無くなる。出どころを一緒に持たせて、後から
+    提示そのものを引き直せるようにする。
+
+    別のキーに分けないのは、選択を捨てる操作を
+    `{"autopilot_picked_slot": {}}` の1回で終わらせるため
+    （draft はキーを削除できず、上書きしかできない）。
+    """
+    candidate = offer.at(index)
+    if candidate is None:
+        return None
+    return {**candidate, "offer_id": offer.offer_id, "index": index}
+
+
+def verify_pick(offer: Offer | None, picked: dict | None) -> str | None:
+    """保存した選択が、いまの提示の同じ番号と一致するか。
+
+    ずれていれば理由を返す。合格なら None。
+    bool ではなく理由を返すのは、止めた理由を記録と通知に載せるため。
+    """
+    if not isinstance(picked, dict) or not picked.get("offer_id") or not picked.get("index"):
+        return "提示の記録が無い"
+    if offer is None:
+        return "提示が残っていない"
+    if offer.offer_id != picked.get("offer_id"):
+        return "提示が入れ替わっている"
+    current = offer.at(int(picked["index"]))
+    if current is None:
+        return "番号が範囲外"
+    for field_name in ("date", "start", "end", "practitioner_id"):
+        if str(current.get(field_name)) != str(picked.get(field_name)):
+            return "枠が入れ替わっている"
+    return None
+
+
 def matches_slot(candidate: dict | None, *, practitioner_id: Any, start_iso: str, end_iso: str) -> bool:
     """これから予約する枠が、患者が選んだ枠と同じか。
 
-    予約を作る直前の最後の検算。ここが唯一の構造的な保証になる。
+    予約を作る直前の最後の検算。
+
+    **`candidate` には、患者が選んだ枠そのものを渡してはいけない。**
+    draft から読み直した提示（`offer.at(index)`）を渡し、右辺には実際に
+    予約へ渡す値を渡す。同じ dict の別表現を比べても、防ぎたい食い違いは
+    原理的に検出できない（2026-09-08: 4引数すべてが同じ値から作られていた）。
     """
     if not isinstance(candidate, dict):
         return False

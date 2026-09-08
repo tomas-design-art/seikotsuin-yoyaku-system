@@ -1193,12 +1193,22 @@ async def _confirm_picked_slot(
     db: AsyncSession,
     user_id: str,
     reply_token: str | None,
-    candidate: dict,
+    *,
+    offer: offered_slots.Offer,
+    index: int,
     menu_name: str | None = None,
     request_id: str | None = None,
 ) -> None:
-    """選ばれた枠を確認へ回す。ここでは予約を作らない。"""
-    await merge_user_draft(db, user_id, {"autopilot_picked_slot": dict(candidate)}, request_id)
+    """選ばれた枠を確認へ回す。ここでは予約を作らない。
+
+    枠だけでなく「どの提示の何番目か」も保存する。予約を作る直前に、
+    提示そのものを引き直して突き合わせるため。枠を引数で受け取る形にすると
+    提示と食い違ったものを渡せてしまうので、offer と番号だけを受ける。
+    """
+    candidate = offered_slots.picked_record(offer, index)
+    if candidate is None:
+        return
+    await merge_user_draft(db, user_id, {"autopilot_picked_slot": candidate}, request_id)
     await set_user_mode(db, user_id, "autopilot_slot_confirm", request_id)
     await _reply_plan(reply_token, "slot", _picked_slot_plan(candidate, menu_name))
 
@@ -3019,17 +3029,28 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
             return
 
-        # ★予約を作る直前の検算。患者が選んだ枠と、これから作る枠が同じか。
-        #   画面に出ていない枠が確定した事故（2026-09-07・本番DB #2572）を、
-        #   ここで構造的に止める。
-        if not offered_slots.matches_slot(
-            picked,
-            practitioner_id=picked.get("practitioner_id"),
+        # ★予約を作る直前の検算。画面に出ていない枠が確定した事故
+        #   （2026-09-07・本番DB #2572）を、ここで構造的に止める。
+        #
+        #   突き合わせる相手は **別の経路から取り直した値** でなければ意味がない。
+        #   2026-09-08 まで、ここは picked を picked と比べていた（引数4つとも
+        #   picked 由来）ので、常に一致し、防ぎたい食い違いを検出できなかった。
+        #
+        #   1. 提示そのものを draft から読み直し、選んだときの提示と同じか
+        #   2. その提示の同じ番号の枠と、これから create_reservation へ渡す値が同じか
+        current_offer = offered_slots.from_draft(prev_draft)
+        mismatch = offered_slots.verify_pick(current_offer, picked)
+        if not mismatch and not offered_slots.matches_slot(
+            current_offer.at(int(picked["index"])),
+            practitioner_id=int(picked["practitioner_id"]),
             start_iso=start_dt.isoformat(),
             end_iso=end_dt.isoformat(),
         ):
+            mismatch = "これから作る枠が提示と違う"
+        if mismatch:
             logger.error(
-                "LINE autopilot picked slot mismatch: picked=%s start=%s",
+                "LINE autopilot picked slot mismatch (%s): picked=%s start=%s",
+                mismatch,
                 picked,
                 start_dt.isoformat(),
             )
@@ -3040,7 +3061,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 patient=line_patient,
                 text=text,
                 parsed_intent=parsed_intent,
-                notification=f"LINE予約の枠が選択と一致せず中止: {line_patient.id}",
+                notification=f"LINE予約の枠が選択と一致せず中止（{mismatch}）: {line_patient.id}",
             )
             return
 
@@ -3133,9 +3154,10 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 db,
                 user_id,
                 reply_token,
-                candidate,
-                prev_draft.get("menu_name"),
-                user_state.get("request_id"),
+                offer=stored_offer,
+                index=picked_index,
+                menu_name=prev_draft.get("menu_name"),
+                request_id=user_state.get("request_id"),
             )
             return
 
@@ -4724,7 +4746,13 @@ async def _handle_pick_postback(
         return
 
     await _confirm_picked_slot(
-        db, actor_user_id, reply_token, candidate, draft.get("menu_name"), state.get("request_id")
+        db,
+        actor_user_id,
+        reply_token,
+        offer=offer,
+        index=index,
+        menu_name=draft.get("menu_name"),
+        request_id=state.get("request_id"),
     )
 
 
