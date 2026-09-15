@@ -29,22 +29,45 @@ _POLISH_RETRY_NOTE = (
 #
 # 「承知いたしました」「かしこまりました」「ありがとうございます」は
 # 何度言っても自然なので落とさない。落とすのは関係性の挨拶だけ。
+#
+# ★2026-09-16 訂正: 以前は「いつも」から最初の「ありがとうございます」までを
+# 何でも飲み込んでいたので、
+#   「いつもの 全身・60分・時田でよろしいですか？ご連絡ありがとうございます。\nはい / いいえ」
+# が「はい / いいえ」だけになっていた（確認の中身が消える）。プロンプトは
+# 「いつもの◯◯でお探ししますね」という書き方を勧めている。
+# 挨拶の語（当院・ご利用・ご来院・お世話）で始まることを必須にし、
+# 文の区切り（。？！・改行）をまたがず、長さにも上限を付ける。
 _OPENING_GREETING = re.compile(
     r"^[\s　]*(?:"
-    r"いつも[^。\n]*(?:ありがとうございます|ありがとうございました|お世話になっております)"
+    r"いつも(?:当院|ご利用|ご来院|お世話)[^。．\n？?！!]{0,20}"
+    r"(?:ありがとうございます|ありがとうございました|なっております)"
     r"|お世話になって(?:おります|います)"
-    r"|平素[^。\n]*ありがとうございます"
+    r"|平素(?:より)?[^。．\n？?！!]{0,20}ありがとうございます"
     r")[。．！!]?[\s　]*\n?"
 )
 
 
-def strip_opening_greeting(message: str) -> str:
-    """2通目以降の頭に付いた関係性の挨拶を落とす。
+def has_opening_greeting(message: str | None) -> bool:
+    """頭に関係性の挨拶があり、削っても本文が残るか（＝strip_opening_greeting が削るか）。
 
+    「今日はもう挨拶した」と記録する判定に使う。前後の空白の違いだけで
+    挨拶ありと数えないよう、差分ではなく一致で見る。
+    """
+    text = message or ""
+    return bool(_OPENING_GREETING.match(text)) and bool(_OPENING_GREETING.sub("", text, count=1).strip())
+
+
+def strip_opening_greeting(message: str) -> str:
+    """頭に付いた関係性の挨拶を落とす。
+
+    挨拶が無ければ1文字も変えない。
     落とした結果が空になるなら元の文を返す（挨拶しか無い返信を消してしまわない）。
     """
-    stripped = _OPENING_GREETING.sub("", message or "", count=1).strip()
-    return stripped or (message or "")
+    text = message or ""
+    if not _OPENING_GREETING.match(text):
+        return text
+    stripped = _OPENING_GREETING.sub("", text, count=1).strip()
+    return stripped or text
 
 SITUATION_GUIDES = {
     "confirm_slot": "提示した日時・担当・メニューを省略せず、この内容で良いか確認する。はい/いいえで答えられると伝える。",
@@ -649,14 +672,23 @@ def _has_unprompted_price_reference(context: dict, reply: str) -> bool:
 
 
 def _has_repeated_reply_opening(context: dict, reply: str) -> bool:
-    """直近のAI返信をそのまま繰り返す定型調を送信前に止める。"""
-    normalized_reply = re.sub(r"[\s、。！？!?]+", "", reply)
+    """直近のAI返信をそのまま繰り返す定型調を送信前に止める。
+
+    比べる前に、両方から頭の関係性の挨拶を外す。挨拶は正規化すると23文字あり、
+    先頭24文字の比較では「挨拶＋ご予約の確認…」と「挨拶＋ご希望の番号…」が
+    同じ書き出しと判定される。すると作り直し→定型文へ落ちて院長へ通知が飛び、
+    かえってテンプレ臭くなる。挨拶は _apply_daily_greeting が1日1回に絞るので、
+    ここでは中身の書き出しだけを比べる（2026-09-16）。
+    """
+    normalized_reply = re.sub(r"[\s、。！？!?]+", "", strip_opening_greeting(reply))
     if len(normalized_reply) < 16:
         return False
     for item in reversed(context.get("recent_history") or []):
         if not isinstance(item, dict) or item.get("role") != "assistant":
             continue
-        previous = re.sub(r"[\s、。！？!?]+", "", str(item.get("content") or ""))
+        previous = re.sub(
+            r"[\s、。！？!?]+", "", strip_opening_greeting(str(item.get("content") or ""))
+        )
         if len(previous) >= 16 and normalized_reply[:24] == previous[:24]:
             return True
         return False

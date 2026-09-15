@@ -124,3 +124,28 @@
 - 修正: 同一患者の別processing行はtimestamp順に関係なく後続claimの障壁にする。短時間claim lockは未commit同士の競合防止として併用する。
 - 併発: 復旧テストに `sqlalchemy.select` のimport漏れがあり `NameError`。テスト側へ明示importした。
 - 状態: L3（遅着イベント実DBテストで固定）
+
+## 2026-09-16: 会話状態の入れ子の更新が DB に保存されていなかった（2026-08-15 から）
+
+- 症状: 「いつも当院をご利用いただきありがとうございます。」が毎回付く。プロンプトの「挨拶は繰り返さない」も、9/8 に入れた「2通目以降は挨拶を削る」も効かない。
+- 原因: `line_state._normalize_context` が `dict(context_data)` の浅いコピーだった。`context_data` は素の JSONB 列なので、SQLAlchemy は「代入された値が前の値と == で等しいか」で変更を判定する。入れ子のリスト/dict は読み込んだ値と共有されたままなので、`append_conversation_history` の append や `update_request` の update が読み込んだ値そのものを書き換え、代入しても新旧が等しくなり UPDATE が出ない。本物の PostgreSQL（asyncpg・JSONB）で確認: 会話履歴に assistant が1件も残らない／依頼の status・alternatives が残らない。直後に別の書き込みが続いても残らない。
+- なぜ気づけなかったか: 既存テストは DB を `AsyncMock`、状態を `SimpleNamespace` で代用しており、SQLAlchemy の変更検出を通らない。
+- 修正: `_normalize_context` を `copy.deepcopy` にした。
+- 手順: **JSONB 列の入れ子を書き換える処理のテストは、本物の DB で「別セッションで読み直して残っているか」を見る。**モックでは緑になる。
+- 状態: L3（`tests/test_line_state_persistence.py`。浅いコピーへ戻すと本命4件が落ちることを確認済み）
+
+## 2026-09-16: 履歴が保存されるようになったことで表に出た3件
+
+- **確定文の書き戻し**: 確定の分岐は `clear_user_draft` → `_compose_autopilot_reply("confirmed")` の順。返信が保存されるようになると、消した直後の履歴へ「ご予約を確定しました 9/10 14:00」が入り、次の会話の解析へ持ち込まれる。会話を終える5場面（confirmed / cancel_done / change_done / cancel_aborted / change_aborted）は履歴に書かない。L3。
+- **挨拶の削りすぎ**: 旧正規表現は「いつも」から最初の「ありがとうございます」までを何でも削っていたので、「いつもの 全身・60分・時田でよろしいですか？ご連絡ありがとうございます。\nはい / いいえ」が「はい / いいえ」だけになった。挨拶の語（当院・ご利用・ご来院・お世話）必須・文の区切りをまたがない・20文字上限にした。骨格経路では削った後に `rejects()` をもう一度かけ、欠けたら削らずに送る。L3。
+- **繰り返し検出の誤爆**: `_has_repeated_reply_opening`（先頭24文字が前回と同じなら作り直し→定型文＋院長通知）は履歴が無く一度も動いていなかった。挨拶は正規化後23文字なので、挨拶付き同士が「繰り返し」扱いになる。比較前に両方から挨拶を外す。L3。
+- 鉄則: **壊れていた保存を直すと、「保存されないこと」を前提に動いていた箇所が一斉に動き出す。**直す前に、その値を読む箇所を全部洗う。
+
+## 2026-09-16: 手元の PostgreSQL（Windows サービス）が接続を切り、実DBテストが落ちる
+
+- 症状: `tests/test_line_inbox.py` と `tests/test_line_state_persistence.py` が `ConnectionResetError: [WinError 64]` で落ちる（手元の `DATABASE_URL` は localhost:5432）。
+- 手順: 使い捨てのコンテナに向けて回す。
+  `docker run -d --rm --name yoyaku-test-pg -e POSTGRES_PASSWORD=probe -e POSTGRES_DB=probe -p 127.0.0.1:55432:5432 postgres:15`
+  `DATABASE_URL="postgresql+asyncpg://postgres:probe@127.0.0.1:55432/probe?ssl=disable" pytest -q tests`
+  起動直後は初期化で一度再起動するので、`select 1` が安定して通るまで待つ。この条件で 636 passed / 既知4 failed。
+- 状態: L1（手元の PostgreSQL サービスの原因は未調査）

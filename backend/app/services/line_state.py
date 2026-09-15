@@ -1,6 +1,7 @@
 """LINE AI秘書の対話状態管理（DB永続化）。"""
 from __future__ import annotations
 
+import copy
 import uuid
 
 from sqlalchemy import select
@@ -11,8 +12,21 @@ from app.utils.datetime_jst import now_jst
 
 
 def _normalize_context(context_data: dict | None) -> dict:
+    """会話状態を書き換え用に取り出す。**必ず深いコピーにすること。**
+
+    context_data は素の JSONB 列で、SQLAlchemy は「代入された値が前の値と == で
+    等しいか」で変更を判定する。浅いコピー（dict(...)）だと、中のリストや dict は
+    読み込んだ値と共有されたままになり、履歴の append や依頼の update が
+    読み込んだ値そのものを書き換える。代入しても新旧が等しくなり、UPDATE が出ない。
+
+    2026-09-16 に本物の PostgreSQL（asyncpg・JSONB）で確認した実害:
+      - 会話履歴に assistant の返信が1件も残らなかった（最初のひと言だけ）
+      - update_request の status・alternatives の更新が残らなかった
+    2026-08-15 に会話履歴が入って以来、ずっとこの状態だった。
+    モックの DB を使うテストでは変更検出を通らないので、緑のまま気づけなかった。
+    """
     if isinstance(context_data, dict):
-        return dict(context_data)
+        return copy.deepcopy(context_data)
     return {}
 
 
@@ -233,6 +247,20 @@ async def clear_recent_completed_booking(db: AsyncSession, line_user_id: str) ->
     state = await _get_or_create_state(db, line_user_id)
     context = _normalize_context(state.context_data)
     context.pop("recent_completed_booking", None)
+    state.context_data = context
+    await db.flush()
+
+
+# 関係性の挨拶（「いつも当院をご利用いただき…」）をした日。
+# 会話履歴や draft とは別に持つ。予約確定・キャンセル確定で履歴を消しても、
+# その日のうちに二度目の挨拶をしないため（2026-09-15 まことさん決定）。
+GREETED_ON_KEY = "last_greeted_on"
+
+
+async def mark_greeted_on(db: AsyncSession, line_user_id: str, day_iso: str) -> None:
+    state = await _get_or_create_state(db, line_user_id)
+    context = _normalize_context(state.context_data)
+    context[GREETED_ON_KEY] = day_iso
     state.context_data = context
     await db.flush()
 

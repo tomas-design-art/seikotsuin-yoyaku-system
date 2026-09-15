@@ -33,7 +33,12 @@ from app.models.setting import Setting
 from app.schemas.reservation import ReservationCreate
 from app.services.line_alerts import build_reservation_review_flex, push_admin_reservation_review
 from app.services.booking_form import Form as BookingForm
-from app.services.line_composer import compose_from_plan, compose_reply, strip_opening_greeting
+from app.services.line_composer import (
+    compose_from_plan,
+    compose_reply,
+    has_opening_greeting,
+    strip_opening_greeting,
+)
 from app.services import confirmation, offered_slots
 from app.services.reply_plan import ReplyPlan, plan_for
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
@@ -73,6 +78,7 @@ from app.services.line_reply import (
     reply_to_line as _reply_to_line_api,
 )
 from app.services.line_state import (
+    GREETED_ON_KEY,
     append_conversation_history,
     clear_user_draft,
     clear_recent_completed_booking,
@@ -80,6 +86,7 @@ from app.services.line_state import (
     get_request,
     get_user_mode,
     get_user_state,
+    mark_greeted_on,
     merge_user_draft,
     remember_completed_booking,
     reset_user_conversation,
@@ -1034,20 +1041,47 @@ def _cancel_confirmation_plan(reservation: Reservation, remaining: int = 0) -> R
     )
 
 
-async def _polished_from_plan(plan: ReplyPlan) -> str:
-    """骨格を整えた文面。2通目以降は頭の関係性の挨拶を落とす。
+async def _apply_daily_greeting(reply: str) -> str:
+    """関係性の挨拶（「いつも当院をご利用いただき…」）は、その日のうち最初の1通だけ。
 
-    `_compose_autopilot_reply` を通らない経路（確認の骨格）でも同じ扱いにする。
+    普通、人は「いつもありがとうございます」を1日に何度も言わない（2026-09-15 まことさん）。
+    挨拶した日は会話履歴とは別に持つので、予約確定・キャンセル確定で履歴を消しても
+    その日のうちに二度目は出ない。
+
+    削るのは足された挨拶の1文だけで、残りは LLM の文をそのまま生かす。
+    「承知いたしました」「かしこまりました」は何度言っても自然なので対象外。
+
+    2026-09-08 版は「この会話で既に返信したか」を会話履歴で判定していたが、
+    履歴に返信が保存されていなかったので本番では一度も効かなかった。
     """
-    reply = await compose_from_plan(plan)
     db = _AUTOPILOT_DB_CONTEXT.get()
     user_id = _AUTOPILOT_USER_CONTEXT.get()
     if db is None or not user_id:
         return reply
+
+    today = now_jst().date().isoformat()
     state = await get_user_state(db, user_id)
-    history = (state.get("context_data") or {}).get("conversation_history") or []
-    if _has_already_replied_in_this_conversation(history):
+    if (state.get("context_data") or {}).get(GREETED_ON_KEY) == today:
         return strip_opening_greeting(reply)
+
+    if has_opening_greeting(reply):
+        # 今日はまだ挨拶していない。この1通の挨拶は残し、今日の分として記録する。
+        await mark_greeted_on(db, user_id, today)
+    return reply
+
+
+async def _polished_from_plan(plan: ReplyPlan) -> str:
+    """骨格を整えた文面。挨拶は1日1回に絞る。
+
+    `_compose_autopilot_reply` を通らない経路（確認の骨格）でも同じ扱いにする。
+    骨格の検査（rejects）は整えた直後に済んでいるので、挨拶を削った後の文にも
+    もう一度かける。削ったせいで日時・担当などの確定事実が欠けたら、削らずに送る。
+    """
+    polished = await compose_from_plan(plan)
+    reply = await _apply_daily_greeting(polished)
+    if reply != polished and plan.rejects(reply):
+        logger.warning("LINE greeting strip reverted: plan rejected the stripped reply")
+        return polished
     return reply
 
 
@@ -1214,6 +1248,7 @@ async def _reask_confirmation(
     form: str,
     plan: ReplyPlan | None = None,
     message: str | None = None,
+    compose_message: Callable[[], Awaitable[str]] | None = None,
 ) -> None:
     """確認の返事が読めなかった。実行せず、事実を出し直して尋ね直す。
 
@@ -1223,6 +1258,10 @@ async def _reask_confirmation(
 
     繰り返すなら人へ渡す。ここに打ち切りが無かったため、肯定でも否定でもない
     返事に対して同じ枠確認を無限に返していた。
+
+    LLM に文面を作らせる場合は `compose_message` で渡し、**送ると決まってから作る**。
+    先に作ると、人へ渡すことになったときに送らない文が会話履歴に残り、
+    その日の挨拶もその捨てた文で使い切ってしまう（2026-09-16 レビュー指摘）。
     """
     failures = int(((await get_user_state(db, user_id)).get("draft") or {}).get(_CONFIRM_UNCLEAR_KEY) or 0) + 1
 
@@ -1244,7 +1283,10 @@ async def _reask_confirmation(
     await merge_user_draft(db, user_id, {_CONFIRM_UNCLEAR_KEY: failures}, request_id)
     if plan is not None:
         await _reply_plan(reply_token, form, plan)
-    elif message is not None:
+        return
+    if message is None and compose_message is not None:
+        message = await compose_message()
+    if message is not None:
         await _reply_confirmation(reply_token, form, message)
 
 
@@ -1470,17 +1512,13 @@ async def _assert_bookable_duration(
         )
 
 
-def _has_already_replied_in_this_conversation(recent_history: object) -> bool:
-    """この会話でもう1回でも返信しているか。挨拶を許すのは1通目だけ。
-
-    履歴は直近6件しか保持しないが、返信は毎ターン記録されるので、
-    2ターン目以降は必ず assistant の記録が入っている。
-    """
-    if not isinstance(recent_history, list):
-        return False
-    return any(
-        isinstance(entry, dict) and entry.get("role") == "assistant" for entry in recent_history
-    )
+# 会話を終える返信。直前に clear_user_draft で会話の記憶を消しているので、
+# ここで履歴へ書き戻さない。書き戻すと確定した日時・担当が次の会話の解析へ
+# 持ち込まれ、「確定時は記憶を消す」（2026-09-16 まことさん決定）が成り立たない。
+# 履歴に返信が保存されるようになった（_normalize_context の修正）ことで表に出た。
+_CONVERSATION_CLOSING_SITUATIONS = frozenset(
+    {"confirmed", "cancel_done", "change_done", "cancel_aborted", "change_aborted"}
+)
 
 
 async def _compose_autopilot_reply(
@@ -1490,6 +1528,7 @@ async def _compose_autopilot_reply(
 ) -> str:
     db = _AUTOPILOT_DB_CONTEXT.get()
     user_id = _AUTOPILOT_USER_CONTEXT.get()
+    record_history = situation not in _CONVERSATION_CLOSING_SITUATIONS
     enriched_context = dict(context)
     # 次に何を患者へ確認・案内するかは、履歴を読んだGeminiの会話判断を優先する。
     # コードはDB事実の取得と予約確定だけを担う。
@@ -1517,7 +1556,7 @@ async def _compose_autopilot_reply(
         enriched_context["assumed_time"] = enriched_context.pop("time")
     if db is not None and user_id:
         patient_message = context.get("patient_message")
-        if patient_message:
+        if patient_message and record_history:
             await append_conversation_history(db, user_id, "patient", str(patient_message))
         state = await get_user_state(db, user_id)
         history = state.get("context_data", {}).get("conversation_history") or []
@@ -1557,13 +1596,11 @@ async def _compose_autopilot_reply(
     else:
         reply = await compose_reply(situation, enriched_context)
 
-    # 会話の頭でしか言わない挨拶を、2通目以降から落とす。
-    # プロンプトに「毎回の挨拶は不要」と書いてあるのに毎回付いていた（2026-09-08 実機）。
-    # 骨格ごと差し替えず、足された1文だけを削ってLLMの文は生かす。
-    if _has_already_replied_in_this_conversation(enriched_context.get("recent_history")):
-        reply = strip_opening_greeting(reply)
+    # 関係性の挨拶は1日1回。プロンプトに「毎回の挨拶は不要」と書いてあっても
+    # 毎回付いていた（2026-09-08 実機）ので、足された1文だけを決定的に削る。
+    reply = await _apply_daily_greeting(reply)
 
-    if db is not None and user_id:
+    if db is not None and user_id and record_history:
         await append_conversation_history(db, user_id, "assistant", reply)
     parser_summary = {
         key: parsed.get(key)
@@ -3644,7 +3681,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 text=text,
                 parsed_intent=parsed_intent,
                 form="usual",
-                message=await _compose_autopilot_reply(
+                # 送ると決まってから作る（人へ渡すときに捨てる文を履歴に残さない）
+                compose_message=lambda: _compose_autopilot_reply(
                     "usual_confirm",
                     {
                         "menu": preset["menu_name"],
