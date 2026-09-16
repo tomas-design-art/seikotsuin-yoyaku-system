@@ -5583,3 +5583,95 @@ async def test_the_cancel_confirmation_is_executed_on_the_first_yes():
     )
 
     cancelled.assert_awaited_once()
+
+
+# ─────────────────────────────────────────────────────────────
+# 事実はコードが調べて渡し、AIは言い回しだけ（2026-09-16 実機 9:35〜9:37 の再発防止）
+# ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_parser_is_not_given_the_conversation_history():
+    """解析AIに会話の履歴を渡さない。
+
+    AIが自分の過去の返事（「時田はいっぱい」）を読み、以後の解析と返信の目的を
+    それに合わせてしまい、実際に空いていた時田の午後を断り続けた。
+    """
+    parser = AsyncMock(return_value={"intent": "new", "confidence": "high", "constraints": [], "has_reservation_intent": True})
+
+    await _run_turn(
+        "U-parser-no-history",
+        "idle",
+        {"menu_id": 5, "menu_name": "マッスルセラピー"},
+        "時田先生の空いているお時間は？",
+        extra_patches={"parse_line_message": parser},
+    )
+
+    parser.assert_awaited()
+    assert parser.await_args.kwargs.get("recent_history") is None
+
+
+@pytest.mark.asyncio
+async def test_an_availability_question_searches_the_named_practitioners_slots():
+    """「時田先生の空いているお時間は？」は時田の枠を探す。
+
+    以前は担当を渡さず全員から朝の早い順に3件だけ取っていたので、上田の午前で
+    埋まると時田の枠がAIに渡らず、AIが「時田はいっぱい」と答えた。
+    """
+    from app.services import line_facts
+
+    tokita = SimpleNamespace(id=1, name="時田")
+    slot = SimpleNamespace(practitioner_id=1, to_dict=lambda: {"start": "13:35", "practitioner_name": "時田"})
+    searched = AsyncMock(return_value=[slot])
+
+    with patch.object(line_facts, "_find_mentioned_practitioner", new=AsyncMock(return_value=tokita)), patch.object(
+        line_facts, "build_same_day_candidates", new=searched
+    ), patch.object(
+        line_facts, "get_business_hours_for_date", new=AsyncMock(return_value=SimpleNamespace(is_open=True))
+    ), patch.object(
+        line_facts, "is_practitioner_working", new=AsyncMock(return_value=(True, None, None))
+    ):
+        facts = await line_facts.collect_question_facts(
+            _EmptyDB(), "時田先生の空いているお時間は？", {"date": "2026-09-16"}
+        )
+
+    assert searched.await_args.kwargs["preferred_practitioner_id"] == 1
+    assert searched.await_args.kwargs["preferred_first"] is True
+    assert facts["requested_practitioner"] == "時田"
+    assert facts["requested_practitioner_is_working"] is True
+    assert facts["requested_practitioner_has_slot"] is True
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-09-16", "2026-09-16"),
+    ("2026/09/16", "2026-09-16"),   # 2026-09-16 実機の返事がこの形だった
+    ("2026/9/6", "2026-09-06"),
+    ("2026年9月16日", "2026-09-16"),
+    ("明日", "明日"),                # 読めない値は捨てない（下のテストの理由）
+    ("9月20日", "9月20日"),
+    ("2026/02/30", "2026/02/30"),
+    (None, None),
+])
+def test_the_parsed_date_is_always_in_the_form_the_code_reads(raw, expected):
+    """解析AIが返した日付を YYYY-MM-DD に揃える。
+
+    後段は date.fromisoformat で読むので、形が違うと候補探しを黙って飛ばし、
+    空きを調べないまま「ご希望のお時間は？」と聞き返していた。
+    """
+    from app.agents.line_parser import _normalize_result
+
+    assert _normalize_result({"date": raw}, None, {})["date"] == expected
+
+
+@pytest.mark.parametrize("raw_date", ["9月20日", "20日", "2026/02/30"])
+def test_an_unreadable_date_in_a_confirmation_reply_is_still_a_different_wish(raw_date):
+    """確認待ちの「はい、20日の方でお願いします」を、はいと読まない。
+
+    日付を揃える処理で読めない値を None にすると、「日付は述べていない」扱いになり、
+    別の希望なしの「はい」と読まれて取消や予約確定まで進む（2026-09-16 レビューで検出）。
+    """
+    from app.agents.line_parser import _normalize_result
+    from app.services.confirmation import UNCLEAR, read_answer
+
+    parsed = _normalize_result({"date": raw_date, "polarity": "affirmative"}, None, {})
+    assert read_answer("はい、20日の方でお願いします", parsed) == UNCLEAR

@@ -402,3 +402,60 @@ def test_the_candidate_label_cannot_be_set_from_outside():
             date(2026, 9, 9), time(10, 0), time(11, 0), 2, "上田", 0.0,
             "2026-09-09 10:00〜11:00（上田）",
         )
+
+
+@pytest.mark.asyncio
+async def test_the_usual_practitioners_slot_comes_first_even_if_it_is_later_in_the_day(monkeypatch):
+    """いつもの担当（希望担当）の枠を先頭に出す。
+
+    2026-09-16 実機: いつもの担当は時田なのに「1. 10:40 上田 / 2. 11:40 上田 / 3. 13:35 時田」
+    と出た。時田の枠を先に集めていたのに、最後に全体を時刻順へ並べ直していた。
+    """
+    target_date = date(2026, 8, 13)
+    tokita = SimpleNamespace(id=1, name="時田", role="院長", display_order=1)
+    ueda = SimpleNamespace(id=2, name="上田", role="施術者", display_order=2)
+
+    # 時田: 13:35〜15:00 だけ空き（朝は埋まり、15時で上がり）。上田: 10:40〜13:00 が空き。
+    day_infos = [
+        slot_scorer._DayInfo(tokita, True, [(600, 815)], [], 600, 900),
+        slot_scorer._DayInfo(ueda, True, [(600, 640), (780, 1260)], [], 600, 1260),
+    ]
+    db, fake_bh, fake_load = _make_candidate_db(day_infos)
+    monkeypatch.setattr(slot_scorer, "get_business_hours_for_date", fake_bh)
+    monkeypatch.setattr(slot_scorer, "_load_day_infos", fake_load)
+
+    results = await slot_scorer.build_same_day_candidates(
+        db, target_date, time(9, 0), 60, preferred_practitioner_id=1, max_results=3,
+        preferred_first=True,
+    )
+
+    assert [r.practitioner_id for r in results][0] == 1
+    assert results[0].start_time == time(13, 35)
+    # 希望担当の後ろは、他の担当を時刻順に
+    others = [r for r in results if r.practitioner_id != 1]
+    assert [r.start_time for r in others] == sorted(r.start_time for r in others)
+
+
+
+@pytest.mark.asyncio
+async def test_without_preferred_first_the_candidates_stay_in_time_order(monkeypatch):
+    """既定は時刻順のまま。予約変更の「もっと早く」は早い順の先頭1件を提示するので、
+    並びを変えると提示する枠そのものが変わる（2026-09-16 レビューで検出）。
+    """
+    target_date = date(2026, 8, 13)
+    tokita = SimpleNamespace(id=1, name="時田", role="院長", display_order=1)
+    ueda = SimpleNamespace(id=2, name="上田", role="施術者", display_order=2)
+    day_infos = [
+        slot_scorer._DayInfo(tokita, True, [(600, 815)], [], 600, 900),
+        slot_scorer._DayInfo(ueda, True, [(600, 640), (780, 1260)], [], 600, 1260),
+    ]
+    db, fake_bh, fake_load = _make_candidate_db(day_infos)
+    monkeypatch.setattr(slot_scorer, "get_business_hours_for_date", fake_bh)
+    monkeypatch.setattr(slot_scorer, "_load_day_infos", fake_load)
+
+    results = await slot_scorer.build_same_day_candidates(
+        db, target_date, time(9, 0), 60, preferred_practitioner_id=1, max_results=3,
+    )
+
+    starts = [r.start_time for r in results]
+    assert starts == sorted(starts)

@@ -79,7 +79,6 @@ from app.services.line_reply import (
 )
 from app.services.line_state import (
     GREETED_ON_KEY,
-    append_conversation_history,
     clear_user_draft,
     clear_recent_completed_booking,
     create_pending_request,
@@ -1512,15 +1511,6 @@ async def _assert_bookable_duration(
         )
 
 
-# 会話を終える返信。直前に clear_user_draft で会話の記憶を消しているので、
-# ここで履歴へ書き戻さない。書き戻すと確定した日時・担当が次の会話の解析へ
-# 持ち込まれ、「確定時は記憶を消す」（2026-09-16 まことさん決定）が成り立たない。
-# 履歴に返信が保存されるようになった（_normalize_context の修正）ことで表に出た。
-_CONVERSATION_CLOSING_SITUATIONS = frozenset(
-    {"confirmed", "cancel_done", "change_done", "cancel_aborted", "change_aborted"}
-)
-
-
 async def _compose_autopilot_reply(
     situation: str,
     context: dict,
@@ -1528,10 +1518,19 @@ async def _compose_autopilot_reply(
 ) -> str:
     db = _AUTOPILOT_DB_CONTEXT.get()
     user_id = _AUTOPILOT_USER_CONTEXT.get()
-    record_history = situation not in _CONVERSATION_CLOSING_SITUATIONS
     enriched_context = dict(context)
-    # 次に何を患者へ確認・案内するかは、履歴を読んだGeminiの会話判断を優先する。
-    # コードはDB事実の取得と予約確定だけを担う。
+    # ★会話の履歴は、返信を作るAIにも解析するAIにも渡さない（2026-09-16 決定）。
+    #
+    # 事実はコードが調べて渡し、AIは言い回しだけを整える。会話の進行を決めるのは箱。
+    # 8/15 から 9/16 まで会話の記録は壊れていて空のまま届いており、8/18 以降の
+    # 「AIに履歴を渡す」「AIの返信目的を優先する」仕組みは、その状態で調整されていた。
+    # 9/16 に記録を直した途端、AIが自分の過去の返事（「時田はいっぱい」）を読んで
+    # 返信の目的を決め、実際に空いていた時田の午後を断り続けた（実機 9:35〜9:37）。
+    #
+    # 挨拶を1日1回にするのは _apply_daily_greeting がコードで判定するので、
+    # AIに履歴を読ませる必要は無い。
+    #
+    # 以下は 8/24 からの仕組み。AIが決めた返信の目的を状況より優先する。
     #
     # ただし「はい/いいえ」を待つ場面は例外で、何を聞くかはコードが決める。
     # ここで conversation_goal を渡すと、Geminiが別の質問（例:「改めて別の日程で
@@ -1555,12 +1554,7 @@ async def _compose_autopilot_reply(
     if parsed and parsed.get("time_inherited") and enriched_context.get("time"):
         enriched_context["assumed_time"] = enriched_context.pop("time")
     if db is not None and user_id:
-        patient_message = context.get("patient_message")
-        if patient_message and record_history:
-            await append_conversation_history(db, user_id, "patient", str(patient_message))
         state = await get_user_state(db, user_id)
-        history = state.get("context_data", {}).get("conversation_history") or []
-        enriched_context["recent_history"] = history[-6:]
         # 登録情報から補った条件は患者が述べたことではない。
         # 予約条件を扱う場面にだけ事実として渡し、断言させず確認させる。
         # 直前にこの会話で確定した予約は「いま話している予約」。これを渡さないと、
@@ -1600,8 +1594,6 @@ async def _compose_autopilot_reply(
     # 毎回付いていた（2026-09-08 実機）ので、足された1文だけを決定的に削る。
     reply = await _apply_daily_greeting(reply)
 
-    if db is not None and user_id and record_history:
-        await append_conversation_history(db, user_id, "assistant", reply)
     parser_summary = {
         key: parsed.get(key)
         for key in ("intent", "date", "time", "polarity", "confidence", "needs_human", "constraints")
@@ -2772,15 +2764,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             preset=await _get_patient_default_preset(db, line_patient),
         )
         _AUTOPILOT_CLINIC_CONTEXT.set(clinic_facts)
-        # 直前の会話を解析にも渡す。これが無いと「9月は？」のような
-        # 省略された質問を単独文として読み、話題を取り違える。
-        conversation_history = (user_state.get("context_data") or {}).get("conversation_history") or []
+        # 会話の履歴は解析AIに渡さない（_compose_autopilot_reply の冒頭の説明を参照）。
+        # 「9月は？」のような主題の省略は、コードが覚えている直前の話題
+        # （draft の last_question_category）で解決する。
         parsed_intent = await parse_line_message(
             text,
             profile_name=display_name,
             previous=prev_draft,
             clinic_context=clinic_facts,
-            recent_history=conversation_history[-6:],
+            recent_history=None,
             conversation_state=(user_state.get("context_data") or {}).get("recent_completed_booking"),
         )
 
@@ -4322,6 +4314,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                             window_start_min=slot_filters.window_start_min,
                             window_end_min=slot_filters.window_end_min,
                             max_results=3,
+                            # いつもの担当の枠を先頭に出す（2026-09-16 まことさん）
+                            preferred_first=True,
                         )
                         candidates = [candidate.to_dict() for candidate in scored]
                         day_availability = await build_day_availability_summary(
@@ -4542,6 +4536,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 exclude_weekdays=slot_filters.exclude_weekdays,
                 max_results=3,
                 search_days=1,
+                # いつもの担当・指名の担当の枠を先頭に出す（2026-09-16 まことさん）
+                preferred_first=True,
             )
         else:
             scored = await score_candidates(

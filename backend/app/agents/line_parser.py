@@ -386,9 +386,41 @@ def _mirror_fields_into_constraints(result: dict) -> list[str]:
     return list(dict.fromkeys(constraints))
 
 
+_DATE_PARTS = re.compile(r"^\s*(\d{4})\s*[-/.年]\s*(\d{1,2})\s*[-/.月]\s*(\d{1,2})\s*日?\s*$")
+
+
+def _to_iso_date(value: object) -> object:
+    """解析AIが返した日付を、読める形なら YYYY-MM-DD に揃える。
+
+    日付の形はプロンプトで頼んでいるだけで、AIは「2026/09/16」のように返すことがある。
+    後段は date.fromisoformat で読むので、形が違うと候補探しを黙って飛ばし、
+    空きを調べないまま「ご希望のお時間は？」と聞き返してしまう
+    （2026-09-16 実機の返事が「2026/09/16ですね」だった）。
+
+    **読めない値は捨てずにそのまま返す。**None にすると「日付は述べていない」扱いになり、
+    確認待ちの「はい、20日の方でお願いします」が別の希望なしの「はい」と読まれて、
+    取消や予約確定まで進む（2026-09-16 レビューで検出。9/8 の事故と同じ型）。
+    """
+    if value in (None, ""):
+        return None
+    text = str(value)
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        pass
+    match = _DATE_PARTS.match(text)
+    if not match:
+        return value
+    try:
+        return date(int(match.group(1)), int(match.group(2)), int(match.group(3))).isoformat()
+    except ValueError:
+        return value
+
+
 def _normalize_result(parsed: dict, profile_name: str | None, previous: dict | None) -> dict:
     previous = previous or {}
     result = dict(parsed)
+    result["date"] = _to_iso_date(result.get("date"))
     result["customer_name"] = _normalize_name(result.get("customer_name") or result.get("name")) or previous.get("customer_name") or _normalize_name(profile_name)
     result["menu_name"] = result.get("menu_name") or result.get("menu_hint") or previous.get("menu_name")
     # 担当者は「今回のメッセージで示されたか」だけを持つ。前回値の埋め戻しはしない

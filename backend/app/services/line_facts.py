@@ -294,18 +294,37 @@ async def collect_question_facts(
         if not hours.is_open:
             return {"category": category, **await _business_hours_facts(db, target_date), "available_candidates": []}
         duration = int((parsed or {}).get("duration_minutes") or 60)
+        # 担当を名指しされたら、その担当の枠を必ず探す。
+        # 渡さないと全員から朝の早い順に3件だけ取るので、他の担当の午前の枠で埋まり、
+        # 名指しされた担当の枠がAIに1件も渡らない。AIはそれを見て「◯◯はいっぱい」と書く。
+        # 2026-09-16 実機: 「時田先生の空いているお時間は？」に、実際は空いていた
+        # 時田の午後を「時田はあいにく予約がいっぱい」と答えた。
+        practitioner = await _find_mentioned_practitioner(db, text)
         candidates = await build_same_day_candidates(
             db,
             target_date,
             time(9, 0),
             duration,
+            preferred_practitioner_id=practitioner.id if practitioner else None,
             max_results=3,
+            preferred_first=True,
         )
-        return {
+        facts = {
             "category": category,
             "date": target_date.isoformat(),
             "available_candidates": [candidate.to_dict() for candidate in candidates],
         }
+        if practitioner:
+            # 「その担当に空きがあるか」「その日そもそも出勤か」はコードが数えて渡す。
+            # AIに推測させない。空きが無い理由が「満席」か「お休み」かを取り違えると、
+            # 「時田はいっぱい」と同じ型の誤答になる。
+            working, _, _ = await is_practitioner_working(db, practitioner.id, target_date)
+            facts["requested_practitioner"] = practitioner.name
+            facts["requested_practitioner_is_working"] = working
+            facts["requested_practitioner_has_slot"] = any(
+                candidate.practitioner_id == practitioner.id for candidate in candidates
+            )
+        return facts
 
     if category == "menu_info":
         menus = (

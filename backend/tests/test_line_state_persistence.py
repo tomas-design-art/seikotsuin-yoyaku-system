@@ -85,10 +85,11 @@ def _roles(context: dict) -> list[str]:
 
 @pytest.mark.asyncio
 async def test_replies_are_kept_in_the_conversation_history():
-    """1イベント＝1セッションで回し、返信が履歴に残ること。
+    """保存層の固定: append_conversation_history が別セッションでも残ること。
 
-    ここが残らないと、AIは自分が前に何を言ったか分からず、
-    「挨拶は繰り返さない」という指示も守りようがない。
+    浅いコピーのままだと、入れ子の append が UPDATE にならず何も残らなかった。
+    ※2026-09-16 以降、返信の経路はこの履歴を記録も参照もしない（AIに渡さないため）。
+    ここで見ているのは _normalize_context の保存の正しさだけ。
     """
     uid = f"U-{uuid4().hex}"
     async with isolated_state_sessions() as sessions:
@@ -239,8 +240,8 @@ async def test_the_greeting_is_said_once_a_day_through_the_real_reply_path():
     assert replies[2] == "こちらのご予約をキャンセルしてよろしいですか？"
     assert replies[3].startswith(GREETING)
     assert stored[line_state.GREETED_ON_KEY] == "2026-09-17"
-    # 返信が履歴に残っている（これが無いと上の判定も LLM の文脈も成り立たない）
-    assert "assistant" in _roles(stored)
+    # 挨拶の判定は挨拶した日だけで行い、会話の履歴は使わない（記録もしない）
+    assert _roles(stored) == []
 
 
 @pytest.mark.asyncio
@@ -259,11 +260,10 @@ async def test_a_reply_without_a_greeting_does_not_use_up_todays_greeting():
 
 @pytest.mark.asyncio
 async def test_the_closing_reply_is_not_written_back_into_the_forgotten_conversation():
-    """確定・キャンセル確定では会話の記憶を消す。その直後の確定文を書き戻さない。
+    """確定・キャンセル確定の直後の返信が、会話の記録に残らないこと。
 
-    本番の確定の分岐は clear_user_draft → _compose_autopilot_reply("confirmed") の順。
-    返信が履歴に保存されるようになったので、書き戻すと
-    「ご予約を確定しました 9/10 14:00」が次の会話の解析に持ち込まれる（2026-09-16 レビュー指摘）。
+    残ると「ご予約を確定しました 9/10 14:00」が次の会話へ持ち込まれる。
+    2026-09-16 以降は返信の経路そのものが記録しないので、ここは念のための固定。
     """
     uid = f"U-{uuid4().hex}"
     day = datetime(2026, 9, 16, 10, 0, tzinfo=JST)
@@ -312,3 +312,40 @@ async def test_a_confirmation_that_is_handed_to_a_human_does_not_record_an_unsen
 
     handoff.assert_awaited_once()
     composed.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_the_reply_ai_is_not_given_the_conversation_history():
+    """返信を作るAIに会話の履歴を渡さない。記録もしない。
+
+    事実はコードが調べて渡し、AIは言い回しだけ。2026-09-16 に記録を直した途端、
+    AIが自分の過去の返事（「時田はいっぱい」）を読んで以後の返事をそれに合わせ、
+    実際に空いていた時田の午後を断り続けた。挨拶の1日1回はコードが判定する。
+    """
+    from app.api import line as line_module
+
+    uid = f"U-{uuid4().hex}"
+    day = datetime(2026, 9, 16, 9, 36, tzinfo=JST)
+    composer = AsyncMock(return_value="空いているお時間をご案内いたします。")
+
+    async with isolated_state_sessions() as sessions:
+        for text in ("時田先生の空いているお時間は？", "そうなの？午後も？"):
+            async with sessions() as db:
+                db_token = line_module._AUTOPILOT_DB_CONTEXT.set(db)
+                user_token = line_module._AUTOPILOT_USER_CONTEXT.set(uid)
+                try:
+                    with patch.object(line_module, "plan_for", return_value=None), patch.object(
+                        line_module, "compose_reply", new=composer
+                    ), patch.object(line_module, "now_jst", return_value=day):
+                        await line_module._compose_autopilot_reply(
+                            "answer_question", {"patient_message": text}
+                        )
+                    await db.commit()
+                finally:
+                    line_module._AUTOPILOT_USER_CONTEXT.reset(user_token)
+                    line_module._AUTOPILOT_DB_CONTEXT.reset(db_token)
+        stored = await _stored_context(sessions, uid)
+
+    for call in composer.await_args_list:
+        assert not call.args[1].get("recent_history"), call.args[1].get("recent_history")
+    assert not stored.get("conversation_history")

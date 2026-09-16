@@ -488,8 +488,12 @@ async def build_same_day_candidates(
     window_start_min: int | None = None,
     window_end_min: int | None = None,
     max_results: int = 3,
+    preferred_first: bool = False,
 ) -> list[ScoredSlot]:
     """その日の空きを、時間帯を散らして提示順に返す。
+
+    preferred_first=True なら希望担当の枠を先頭に並べる（新規予約の候補・空きの質問）。
+    既定は時刻順（予約変更の交渉など、早い順に意味がある経路）。
 
     担当指定は「探索の入口」ではなく候補集合の絞り込みとして扱う。
     希望担当がいればその人の枠で先に埋め、足りない分だけ他の担当で補う。
@@ -593,7 +597,21 @@ async def build_same_day_candidates(
         _collect(only_preferred=True)
     _collect(only_preferred=False)
 
-    results.sort(key=lambda candidate: (candidate.start_time.hour, candidate.start_time.minute))
+    if preferred_first and preferred_practitioner_id:
+        # 希望担当（いつもの担当・名指しの担当）の枠を先頭に、その中は時刻順。
+        # 全体を時刻順に並べ直すと、先に集めた希望担当の枠が他の担当の朝の枠より
+        # 後ろに回る（2026-09-16 実機: いつもの時田が3番目だった）。
+        results.sort(
+            key=lambda candidate: (
+                candidate.practitioner_id != preferred_practitioner_id,
+                candidate.start_time.hour,
+                candidate.start_time.minute,
+            )
+        )
+    else:
+        # 既定は時刻順。予約変更の「もっと早く／遅く」は早い順の先頭1件を使うので、
+        # ここを変えると提示する枠そのものが変わる。
+        results.sort(key=lambda candidate: (candidate.start_time.hour, candidate.start_time.minute))
     return results[:max_results]
 
 
@@ -610,6 +628,7 @@ async def build_candidates_over_days(
     exclude_weekdays: set[int] | None = None,
     max_results: int = 3,
     search_days: int = 1,
+    preferred_first: bool = False,
 ) -> list[ScoredSlot]:
     """希望条件（時間帯・除外日）を守ったまま、当日から順に候補を集める。"""
     exclude_dates = exclude_dates or set()
@@ -629,6 +648,7 @@ async def build_candidates_over_days(
             window_start_min=window_start_min,
             window_end_min=window_end_min,
             max_results=max_results - len(results),
+            preferred_first=preferred_first,
         )
         results.extend(day_results)
         if len(results) >= max_results:
