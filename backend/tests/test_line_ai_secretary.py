@@ -4,7 +4,7 @@ from __future__ import annotations
 from contextlib import ExitStack
 from unittest.mock import Mock
 from unittest.mock import AsyncMock, patch
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from types import SimpleNamespace
 import re
 
@@ -5521,3 +5521,65 @@ async def test_a_closed_day_is_answered_before_asking_for_a_time():
     # 予約できない日に時刻を聞き返さない
     assert "ask_datetime" not in situations, situations
     assert "ask_time_for_date" not in situations, situations
+
+
+# ─────────────────────────────────────────────────────────────
+# 確認の答えを、直前のメッセージと繋げない
+#
+# 2026-09-16 実機: 「やっぱりキャンセルしたい」→[はい] で、10秒の合成が
+# 本文を「やっぱりキャンセルしたい\nはい」にしていた。確認の答えは
+# 「本文がちょうど はい」で判定するので読めず、同じ確認を3回返し、
+# 合成が切れた4回目でようやくキャンセルが実行された。
+# ─────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("answer", ["はい", "いいえ", "うん", " はい。"])
+def test_a_bare_yes_or_no_is_never_merged_into_the_previous_message(answer):
+    from app.services.line_debounce import clear_debounce, merge_debounced_message
+
+    uid = f"U-merge-{abs(hash(answer)) % 10000}"
+    clear_debounce(uid)
+    merge_debounced_message(uid, "やっぱりキャンセルしたい")
+    assert merge_debounced_message(uid, answer) == answer
+
+
+def test_messages_split_across_two_bubbles_are_still_merged():
+    """分割送信の合成そのものは残す（元の目的）。"""
+    from app.services.line_debounce import clear_debounce, merge_debounced_message
+
+    uid = "U-merge-split"
+    clear_debounce(uid)
+    merge_debounced_message(uid, "今日の午後で")
+    assert merge_debounced_message(uid, "60分でお願いします") == "今日の午後で\n60分でお願いします"
+
+
+@pytest.mark.asyncio
+async def test_the_cancel_confirmation_is_executed_on_the_first_yes():
+    """直前の発言がバッファに残っていても、確認の「はい」で実行されること。"""
+    from app.services.line_debounce import clear_debounce, merge_debounced_message
+
+    uid = "U-cancel-first-yes"
+    clear_debounce(uid)
+    merge_debounced_message(uid, "やっぱりキャンセルしたい")  # 直前の発言が残っている状態
+
+    cancelled = AsyncMock(
+        return_value=SimpleNamespace(start_time=datetime(2026, 9, 16, 13, 35, tzinfo=timezone(timedelta(hours=9))))
+    )
+    # 解析が会話の流れから日時を拾った場合でも、ボタンの答えは答えとして読む
+    parsed = AsyncMock(
+        return_value={
+            "intent": "cancel", "confidence": "high", "constraints": [],
+            "has_reservation_intent": True, "polarity": "affirmative",
+            "date": "2026-09-16", "time": "13:35",
+        }
+    )
+
+    await _run_turn(
+        uid,
+        "autopilot_cancel_confirm",
+        {"autopilot_cancel_reservation_id": 55},
+        "はい",
+        extra_patches={"transition_status": cancelled, "parse_line_message": parsed},
+    )
+
+    cancelled.assert_awaited_once()

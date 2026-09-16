@@ -20,7 +20,18 @@ def _intent_hint(text: str) -> str | None:
     return None
 
 
+# 「はい」「いいえ」だけの返事は確認への答え。前のメッセージと繋げない。
+# 繋げると本文が「やっぱりキャンセルしたい\nはい」になり、
+# 確認の答え（本文がちょうど「はい」）として読めなくなる。
+# 2026-09-16 実機: キャンセルの「はい」が3回効かず、10秒の合成が切れた4回目で実行された。
+_BARE_YES_NO = re.compile(
+    r"^[\s　。、!！?？]*(?:はい|いいえ|うん|ええ|yes|no)[\s　。、!！?？]*$", re.IGNORECASE
+)
+
+
 def _should_merge(previous: str, current: str) -> bool:
+    if _BARE_YES_NO.match(current or ""):
+        return False
     if re.fullmatch(r"[\s。、!！?？]*(?:ありがとう(?:ございます)?|了解です?|わかりました|助かります)[\s。、!！?？]*", current or ""):
         return False
     previous_intent = _intent_hint(previous)

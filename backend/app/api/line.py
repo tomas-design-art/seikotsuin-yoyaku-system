@@ -2683,7 +2683,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         logger.info("Autopilot: duplicate message skipped (user=%s)", user_id[:12])
         return
     if is_autopilot_patient and not _is_booking_or_change_menu_trigger(text):
-        text = merge_debounced_message(user_id, text)
+        # ★はい/いいえ を待っている間は、直前のメッセージと繋げない。
+        # 繋げると本文が「やっぱりキャンセルしたい\nはい」になり、
+        # ボタンの答え（本文がちょうど「はい」）として読めなくなる。
+        # 2026-09-16 実機: キャンセルの「はい」が3回効かず、10秒の合成が切れた
+        # 4回目でようやく実行された。
+        if (user_state or {}).get("mode") in _CONFIRM_FORM_MODES.values():
+            clear_debounce(user_id)
+        else:
+            text = merge_debounced_message(user_id, text)
 
     # ── 管理者コマンド: Botくん1号 DM から「押さえる」「確定」で最新 pending を承認 ──
     admin_dev_uid = settings.admin_line_developer_user_id
