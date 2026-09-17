@@ -173,7 +173,7 @@
 - 原因: 3つの一覧（pending-sync / reservations-by-date / reconcile-queue）が `Reservation.color` を先読みしていなかった。`build_reservation_response` が色を読むと、非同期セッションでは遅延読み込み → `MissingGreenlet`。一覧に同じ色を持つメニューの予約があると `Menu.color`（lazy="joined"）で色がセッションに載って落ちないため、落ちたり直ったりした。引き金は 9/16 登録の「メニューなし・色1」の電話予約（2679）。コード自体は 2026-04 から。
 - 見落とした理由: 既存テスト（test_hotpepper_api_endpoints.py）は DB を AsyncMock にしていて遅延読み込みを通らない。**`rpa_call_logs` は、エンドポイントが例外で落ちた 500 を記録しない**（BaseHTTPMiddleware で call_next が例外を投げ、記録の前に抜ける）。そのため「RPA が来ていない」と誤読した。
 - 手順: 3つの一覧は `_response_load_options()` で色まで先読みする。`build_reservation_response` に渡す予約は、読む関連（patient / practitioner / menu / color）を全部先読みする。RPA の不調調査で `rpa_call_logs` に行が無いときは「来ていない」と「落ちて記録されなかった」の両方を疑い、エンドポイントを直接叩いてステータスを見る。
-- 状態: L3（本物の PostgreSQL で「色つき・メニューなし」を再現する tests/test_hotpepper_rpa_queues_real_db.py。修正前に3件とも MissingGreenlet で落ちることを確認）。500 を記録しない件は未対応。
+- 状態: L3（本物の PostgreSQL で「色つき・メニューなし」を再現する tests/test_hotpepper_rpa_queues_real_db.py。修正前に3件とも MissingGreenlet で落ちることを確認）。再発に備え、一覧は1件ずつ作り、作れない予約だけ飛ばして残りは渡す（飛ばした予約は /health の unlistable_pending に出る）。例外で落ちた回も rpa_call_logs に status 500・`_error` 付きで残す。どちらも修正前のコードで落ちるテストで固定。
 
 ## 2026-09-17: 先読みの設定をモジュールの読み込み時に作り、アプリの起動で mapper 初期化が落ちた（2回目）
 

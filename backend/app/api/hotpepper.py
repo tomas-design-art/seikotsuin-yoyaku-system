@@ -40,6 +40,26 @@ def _response_load_options() -> tuple:
     )
 
 
+def _responses_for_rpa(reservations, *, endpoint: str) -> tuple[list[dict], list[dict]]:
+    """RPA に渡す一覧を1件ずつ作る。作れない予約があっても、残りは渡す。
+
+    以前は1件でも作れないと一覧全体が 500 になり、他の予約まで何時間も転記されなかった
+    （2026-09-17）。作れなかった予約は飛ばしてログに残し、/health の unlistable_pending にも出す。
+    戻り値は (渡す一覧, 飛ばした予約の id とエラー種別)。
+    """
+    items: list[dict] = []
+    skipped: list[dict] = []
+    for reservation in reservations:
+        try:
+            items.append(build_reservation_response(reservation))
+        except Exception as error:  # noqa: BLE001
+            skipped.append({"id": reservation.id, "error": type(error).__name__})
+            logger.exception(
+                "hotpepper_list_item_skipped endpoint=%s reservation_id=%s", endpoint, reservation.id
+            )
+    return items, skipped
+
+
 def _unsynced_base_filters() -> list:
     return [
         Reservation.hotpepper_synced == False,
@@ -109,7 +129,8 @@ async def pending_sync(db: AsyncSession = Depends(get_db)):
         .order_by(Reservation.start_time)
     )
     reservations = result.scalars().all()
-    return [build_reservation_response(r) for r in reservations]
+    items, _skipped = _responses_for_rpa(reservations, endpoint="pending-sync")
+    return items
 
 
 class BulkMarkPastSyncedRequest(BaseModel):
@@ -230,7 +251,8 @@ async def reservations_by_date(
         .order_by(Reservation.start_time)
     )
     reservations = result.scalars().all()
-    return [build_reservation_response(r) for r in reservations]
+    items, _skipped = _responses_for_rpa(reservations, endpoint="reservations-by-date")
+    return items
 
 
 class MarkSyncedRequest(BaseModel):
@@ -325,7 +347,8 @@ async def reconcile_queue(
         .order_by(Reservation.start_time)
     )
     reservations = result.scalars().all()
-    return [build_reservation_response(r) for r in reservations]
+    items, _skipped = _responses_for_rpa(reservations, endpoint="reconcile-queue")
+    return items
 
 
 def _interleave_by_patient(reservations: list[Reservation]) -> list[Reservation]:
@@ -614,7 +637,17 @@ async def hotpepper_health(
             "is_series": r.series_id is not None,
         })
 
+    # RPA に渡す一覧を実際に作ってみて、作れない予約（＝RPA に届かない予約）を出す
+    pending_for_rpa = (await db.execute(
+        select(Reservation)
+        .where(*pending_sync_filters(now, app_settings.rpa_horizon_days))
+        .options(*_response_load_options())
+        .order_by(Reservation.start_time)
+    )).scalars().all()
+    _, unlistable_pending = _responses_for_rpa(pending_for_rpa, endpoint="health")
+
     # RPA 死亡判定（rpa-queue/pending-sync が直近1hに無い）
+    # ※予約システムの「HP押さえ」画面も pending-sync を30秒ごとに呼ぶので、画面が開いていると true になる
     rpa_alive = False
     if last_queue_info and last_queue_info.get("minutes_since") is not None:
         rpa_alive = last_queue_info["minutes_since"] < 60
@@ -630,6 +663,7 @@ async def hotpepper_health(
         "mark_synced_calls_last_24h": mark_counts,
         "rpa_worker_alive": rpa_alive,
         "stuck_candidates": stuck_candidates,
+        "unlistable_pending": unlistable_pending,
     }
 
 

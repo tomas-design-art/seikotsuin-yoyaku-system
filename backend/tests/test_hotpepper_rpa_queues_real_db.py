@@ -39,6 +39,7 @@ from app.models.practitioner import Practitioner
 from app.models.reservation import Reservation
 from app.models.reservation_color import ReservationColor
 from app.models.reservation_series import ReservationSeries
+from app.models.rpa_call_log import RpaCallLog
 from app.utils.datetime_jst import now_jst
 
 _TABLES = [
@@ -49,6 +50,7 @@ _TABLES = [
     Patient.__table__,
     ReservationSeries.__table__,
     Reservation.__table__,
+    RpaCallLog.__table__,
 ]
 
 
@@ -163,3 +165,142 @@ async def test_reservations_by_date_lists_a_colored_reservation_without_menu():
 
     item = next(i for i in items if i["id"] == reservation_id)
     assert item["color"]["id"] == color_id
+
+
+# ── ルールの固定（まことさん 2026-09-17 確認）──────────────────────────────
+# ・ホットペッパーから入った予約（色はオレンジ「ホットペッパー予約」）は RPA に渡さない。
+#   渡すとホットペッパーの予約をサロンボードへ押さえ直してしまう。判定は色ではなく入口（channel）。
+#   ホットペッパーのメール取り込みが channel=HOTPEPPER・オレンジ・同期済みで作る。
+# ・保険診療・自費診療・ホームページ予約は一度渡し、RPA が転記を報告したら次から渡さない。
+# ・人が「押さえ済み」にしたもの（synced_by=human）は通常の一覧には出さず、起動時の救済（reconcile）にだけ出す。
+
+
+async def _seed_rules(sessions) -> dict[str, int]:
+    start = (now_jst() + timedelta(days=2)).replace(hour=10, minute=0, second=0, microsecond=0)
+    async with sessions() as db:
+        practitioner = Practitioner(name="担当")
+        db.add(practitioner)
+        await db.flush()
+
+        def make(offset_hours: int, channel: str, synced: bool, synced_by: str | None) -> Reservation:
+            begin = start + timedelta(hours=offset_hours)
+            return Reservation(
+                practitioner_id=practitioner.id,
+                start_time=begin,
+                end_time=begin + timedelta(minutes=30),
+                status="CONFIRMED",
+                channel=channel,
+                hotpepper_synced=synced,
+                synced_by=synced_by,
+            )
+
+        rows = {
+            "from_hotpepper": make(0, "HOTPEPPER", True, "rpa"),
+            "from_hotpepper_not_marked": make(1, "HOTPEPPER", False, None),
+            "new_phone": make(2, "PHONE", False, None),
+            "new_homepage": make(3, "CHATBOT", False, None),
+            "transcribed_by_rpa": make(4, "PHONE", True, "rpa"),
+            "marked_by_human": make(5, "WALK_IN", True, "human"),
+        }
+        db.add_all(rows.values())
+        await db.commit()
+        return {name: row.id for name, row in rows.items()}
+
+
+@pytest.mark.asyncio
+async def test_hotpepper_reservations_are_never_handed_to_the_rpa():
+    async with isolated_sessions() as sessions:
+        ids = await _seed_rules(sessions)
+        async with sessions() as db:
+            pending_ids = {i["id"] for i in await pending_sync(db=db)}
+        async with sessions() as db:
+            reconcile_ids = {i["id"] for i in await reconcile_queue(days=7, db=db)}
+
+    for name in ("from_hotpepper", "from_hotpepper_not_marked"):
+        assert ids[name] not in pending_ids
+        assert ids[name] not in reconcile_ids
+
+
+@pytest.mark.asyncio
+async def test_a_reservation_is_handed_to_the_rpa_until_it_reports_the_transcription():
+    async with isolated_sessions() as sessions:
+        ids = await _seed_rules(sessions)
+        async with sessions() as db:
+            pending_ids = {i["id"] for i in await pending_sync(db=db)}
+        async with sessions() as db:
+            reconcile_ids = {i["id"] for i in await reconcile_queue(days=7, db=db)}
+
+    assert ids["new_phone"] in pending_ids
+    assert ids["new_homepage"] in pending_ids
+    assert ids["transcribed_by_rpa"] not in pending_ids
+    assert ids["transcribed_by_rpa"] not in reconcile_ids
+    assert ids["marked_by_human"] not in pending_ids
+    assert ids["marked_by_human"] in reconcile_ids
+
+
+# ── 1件作れなくても残りは渡す／作れない予約は /health に出す ───────────────
+
+
+@pytest.mark.asyncio
+async def test_one_unbuildable_reservation_does_not_stop_the_others(monkeypatch):
+    import app.api.hotpepper as hotpepper_api
+    from app.api.hotpepper import hotpepper_health
+
+    async with isolated_sessions() as sessions:
+        ids = await _seed_rules(sessions)
+        broken_id = ids["new_phone"]
+        real_build = hotpepper_api.build_reservation_response
+
+        def build_or_fail(reservation):
+            if reservation.id == broken_id:
+                raise RuntimeError("この予約だけ作れない")
+            return real_build(reservation)
+
+        monkeypatch.setattr(hotpepper_api, "build_reservation_response", build_or_fail)
+        async with sessions() as db:
+            pending_ids = {i["id"] for i in await pending_sync(db=db)}
+        async with sessions() as db:
+            health = await hotpepper_health(db=db)
+
+    assert broken_id not in pending_ids
+    assert ids["new_homepage"] in pending_ids
+    assert health["unlistable_pending"] == [{"id": broken_id, "error": "RuntimeError"}]
+
+
+# ── エンドポイントが例外で落ちた回も rpa_call_logs に残す ─────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_rpa_request_is_still_recorded(monkeypatch):
+    import httpx
+    from sqlalchemy import select
+
+    import app.middlewares.rpa_call_log as call_log_module
+    from app.database import get_db
+    from app.main import app as fastapi_app
+
+    class CrashingSession:
+        async def execute(self, *args, **kwargs):
+            raise RuntimeError("DB で落ちた")
+
+    async def crashing_db():
+        yield CrashingSession()
+
+    async with isolated_sessions() as sessions:
+        monkeypatch.setattr(call_log_module, "async_session", sessions)
+        fastapi_app.dependency_overrides[get_db] = crashing_db
+        try:
+            transport = httpx.ASGITransport(app=fastapi_app, raise_app_exceptions=False)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                response = await client.get("/api/hotpepper/pending-sync", headers={"user-agent": "node"})
+        finally:
+            fastapi_app.dependency_overrides.pop(get_db, None)
+
+        async with sessions() as db:
+            logs = (await db.execute(select(RpaCallLog))).scalars().all()
+
+    assert response.status_code == 500
+    assert [(log.endpoint, log.status_code, log.user_agent) for log in logs] == [
+        ("/api/hotpepper/pending-sync", 500, "node")
+    ]
+    assert logs[0].body_summary == {"_error": "RuntimeError"}

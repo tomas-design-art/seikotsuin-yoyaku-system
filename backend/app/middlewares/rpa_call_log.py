@@ -91,7 +91,21 @@ class RpaCallLogMiddleware(BaseHTTPMiddleware):
             except Exception:  # noqa: BLE001
                 body_summary = None
 
-        response: Response = await call_next(request)
+        try:
+            response: Response = await call_next(request)
+        except Exception as exc:
+            # エンドポイントが例外で落ちた回も残す（落ちた回が記録に無いと「RPA が来ていない」と
+            # 読み違える。2026-09-17 に実際に読み違えた）。応答は変えず、そのまま投げ直す。
+            await self._write_log(
+                request,
+                path,
+                status_code=500,
+                body_summary={**(body_summary or {}), "_error": type(exc).__name__},
+                resp_count=None,
+                resp_ids=None,
+                duration_ms=int((time.perf_counter() - start) * 1000),
+            )
+            raise
 
         duration_ms = int((time.perf_counter() - start) * 1000)
 
@@ -124,6 +138,28 @@ class RpaCallLogMiddleware(BaseHTTPMiddleware):
             except Exception as e:  # noqa: BLE001
                 logger.debug("rpa_call_log body sniff failed: %s", e)
 
+        await self._write_log(
+            request,
+            path,
+            status_code=response.status_code,
+            body_summary=body_summary,
+            resp_count=resp_count,
+            resp_ids=resp_ids,
+            duration_ms=duration_ms,
+        )
+        return response
+
+    async def _write_log(
+        self,
+        request: Request,
+        path: str,
+        *,
+        status_code: int,
+        body_summary: dict | None,
+        resp_count: int | None,
+        resp_ids: list[int] | None,
+        duration_ms: int,
+    ) -> None:
         # 書き込み（失敗しても黙殺）
         try:
             client_ip = request.client.host if request.client else None
@@ -134,7 +170,7 @@ class RpaCallLogMiddleware(BaseHTTPMiddleware):
                 log = RpaCallLog(
                     endpoint=path[:200],
                     method=request.method,
-                    status_code=response.status_code,
+                    status_code=status_code,
                     query_params=query_params,
                     body_summary=body_summary,
                     response_count=resp_count,
@@ -147,5 +183,3 @@ class RpaCallLogMiddleware(BaseHTTPMiddleware):
                 await db.commit()
         except Exception as e:  # noqa: BLE001
             logger.warning("rpa_call_log write failed path=%s err=%s", path, e)
-
-        return response
