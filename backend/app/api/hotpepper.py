@@ -27,6 +27,18 @@ router = APIRouter(prefix="/api/hotpepper", tags=["hotpepper"])
 
 SYNC_TARGET_STATUSES = ["CONFIRMED", "PENDING", "HOLD"]
 
+# build_reservation_response が読む関連は全部先読みする。1つでも漏れると非同期セッションでは
+# 遅延読み込みになり MissingGreenlet で一覧全体が 500 になる（2026-09-17: color が漏れていて、
+# メニューなし・色つきの予約1件で RPA の転記が止まった）。
+# 関数にしているのは、import 時に作ると ReservationColor の登録前に mapper の初期化が走って落ちるため。
+def _response_load_options() -> tuple:
+    return (
+        selectinload(Reservation.patient),
+        selectinload(Reservation.practitioner),
+        selectinload(Reservation.menu),
+        selectinload(Reservation.color),
+    )
+
 
 def _unsynced_base_filters() -> list:
     return [
@@ -93,11 +105,7 @@ async def pending_sync(db: AsyncSession = Depends(get_db)):
     result = await db.execute(
         select(Reservation)
         .where(*pending_sync_filters(now, app_settings.rpa_horizon_days))
-        .options(
-            selectinload(Reservation.patient),
-            selectinload(Reservation.practitioner),
-            selectinload(Reservation.menu),
-        )
+        .options(*_response_load_options())
         .order_by(Reservation.start_time)
     )
     reservations = result.scalars().all()
@@ -218,11 +226,7 @@ async def reservations_by_date(
             Reservation.start_time >= day_start,
             Reservation.start_time < day_end,
         )
-        .options(
-            selectinload(Reservation.patient),
-            selectinload(Reservation.practitioner),
-            selectinload(Reservation.menu),
-        )
+        .options(*_response_load_options())
         .order_by(Reservation.start_time)
     )
     reservations = result.scalars().all()
@@ -317,11 +321,7 @@ async def reconcile_queue(
             Reservation.start_time <= horizon,
             (Reservation.synced_by.is_(None)) | (Reservation.synced_by == "human"),
         )
-        .options(
-            selectinload(Reservation.patient),
-            selectinload(Reservation.practitioner),
-            selectinload(Reservation.menu),
-        )
+        .options(*_response_load_options())
         .order_by(Reservation.start_time)
     )
     reservations = result.scalars().all()

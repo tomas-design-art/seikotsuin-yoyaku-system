@@ -166,3 +166,18 @@
 - 修正: 返信AIにも解析AIにも会話履歴を渡さず、記録もしない（9/16 以前に本番で動いていた条件に戻す）。挨拶の1日1回はコードの `last_greeted_on` で判定するので履歴は不要。空きの質問で名指しの担当の枠を探し、その担当が出勤か・空きがあるかをコードが数えて渡す。新規予約の候補と空きの質問は、いつもの担当の枠を先頭に（変更の交渉は時刻順のまま）。date は読める形なら YYYY-MM-DD に揃え、**読めない値は捨てない**（捨てると確認の「はい、20日の方で」がはいと読まれ、取消まで進む。レビューで検出）。
 - 鉄則: **壊れていた入力を直すときは、その入力を「受け取るはずだった側」が、壊れていた間に何を前提に作られたかを先に洗う。**AIへの入力が増える変更は、AIに判断を任せる経路を増やす変更として扱う。
 - 状態: L3（`test_the_parser_is_not_given_the_conversation_history`、`test_the_reply_ai_is_not_given_the_conversation_history`、`test_an_availability_question_searches_the_named_practitioners_slots`、`test_an_unreadable_date_in_a_confirmation_reply_is_still_a_different_wish` ほか。変更前のコードで新しいテストが落ちることを確認済み）
+
+## 2026-09-17: RPA 用の一覧が「メニューなし・色つき」の予約1件で 500 になり、サロンボードへの転記が止まった
+
+- 症状: `GET /api/hotpepper/pending-sync`・`reconcile-queue` が 500。院の RPA は「転記元 pending-sync 取得失敗: HTTP 500」で毎分失敗し、ブラウザも開かない。9/17 12:01 以降の予約（当日 18:30 を含む）が未転記。9/10 16:29〜19:57・9/14 09:54〜13:15 も同じ途切れ方。
+- 原因: 3つの一覧（pending-sync / reservations-by-date / reconcile-queue）が `Reservation.color` を先読みしていなかった。`build_reservation_response` が色を読むと、非同期セッションでは遅延読み込み → `MissingGreenlet`。一覧に同じ色を持つメニューの予約があると `Menu.color`（lazy="joined"）で色がセッションに載って落ちないため、落ちたり直ったりした。引き金は 9/16 登録の「メニューなし・色1」の電話予約（2679）。コード自体は 2026-04 から。
+- 見落とした理由: 既存テスト（test_hotpepper_api_endpoints.py）は DB を AsyncMock にしていて遅延読み込みを通らない。**`rpa_call_logs` は、エンドポイントが例外で落ちた 500 を記録しない**（BaseHTTPMiddleware で call_next が例外を投げ、記録の前に抜ける）。そのため「RPA が来ていない」と誤読した。
+- 手順: 3つの一覧は `_response_load_options()` で色まで先読みする。`build_reservation_response` に渡す予約は、読む関連（patient / practitioner / menu / color）を全部先読みする。RPA の不調調査で `rpa_call_logs` に行が無いときは「来ていない」と「落ちて記録されなかった」の両方を疑い、エンドポイントを直接叩いてステータスを見る。
+- 状態: L3（本物の PostgreSQL で「色つき・メニューなし」を再現する tests/test_hotpepper_rpa_queues_real_db.py。修正前に3件とも MissingGreenlet で落ちることを確認）。500 を記録しない件は未対応。
+
+## 2026-09-17: 先読みの設定をモジュールの読み込み時に作り、アプリの起動で mapper 初期化が落ちた（2回目）
+
+- 症状: `selectinload(Reservation.color)` を hotpepper.py のモジュール定数にしたら、テスト収集で `ReservationColor failed to locate a name`。本番なら起動しない。
+- 原因: 2026-09-04 の「部分 import で mapper 未登録」と同じ型。`selectinload(関連)` は作った時点で mapper の初期化を走らせる。ルーターの import 時点では ReservationColor がまだ登録されていない。
+- 手順: `selectinload` などの関連を参照するオプションは、モジュール定数にせず関数の中で作る（クエリ実行時に作る）。
+- 状態: L3（`import app.main` するテストの収集で必ず落ちる。今回もそれで検出）。2回目のため記録を残す。
