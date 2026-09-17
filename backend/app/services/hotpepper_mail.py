@@ -17,7 +17,7 @@ from app.models.patient import Patient
 from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation_color import ReservationColor
-from app.models.reservation import Reservation
+from app.models.reservation import Reservation, moved_by_hotpepper
 from app.models.setting import Setting
 from app.services.notification_service import create_notification
 from app.agents.mail_parser import ai_review_hotpepper_required, parse_hotpepper_mail
@@ -565,6 +565,8 @@ async def _handle_changed(db: AsyncSession, parsed: dict) -> dict:
         parsed["end_time"] = parsed["start_time"] + timedelta(minutes=snapped_duration)
         parsed["duration_minutes"] = snapped_duration
 
+    # ホットペッパー側の変更なので、サロンボードへ押さえ直させない（オレンジは RPA に渡さない）
+    moved_by_hotpepper(reservation)
     reservation.start_time = parsed["start_time"]
     reservation.end_time = parsed["end_time"]
     reservation.color_id = await _resolve_hotpepper_color_id(db)

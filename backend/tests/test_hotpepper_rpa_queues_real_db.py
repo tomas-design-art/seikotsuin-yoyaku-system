@@ -39,6 +39,7 @@ from app.models.practitioner import Practitioner
 from app.models.reservation import Reservation
 from app.models.reservation_color import ReservationColor
 from app.models.reservation_series import ReservationSeries
+from app.models.notification_log import NotificationLog
 from app.models.rpa_call_log import RpaCallLog
 from app.utils.datetime_jst import now_jst
 
@@ -51,6 +52,7 @@ _TABLES = [
     ReservationSeries.__table__,
     Reservation.__table__,
     RpaCallLog.__table__,
+    NotificationLog.__table__,
 ]
 
 
@@ -468,3 +470,192 @@ async def test_health_counts_only_successful_calls():
     assert health["last_queue_call"]["status_code"] == 500
     assert health["last_successful_queue_call"]["minutes_since"] >= 29
     assert health["mark_synced_calls_last_24h"] == {"rpa": 1, "human": 0, "unknown": 0}
+
+
+
+# ── 転記後に動かした予約は「番号-回数」で RPA に渡し直す（2026-09-17 まことさん仕様）────────
+# 院PCの RPA は転記済みの予約番号を二度と転記しない。動かしたら 2582 → 2582-2 → 2582-3 と
+# 別の番号で渡す。古い枠の削除は手作業（キャンセルは RPA にさせない）。
+
+
+async def _seed_transcribed(sessions, *, channel: str = "PHONE") -> tuple[int, int]:
+    start = (now_jst() + timedelta(days=3)).replace(hour=10, minute=0, second=0, microsecond=0)
+    async with sessions() as db:
+        first, second = Practitioner(name="担当A"), Practitioner(name="担当B")
+        db.add_all([first, second])
+        await db.flush()
+        reservation = Reservation(
+            practitioner_id=first.id,
+            start_time=start,
+            end_time=start + timedelta(hours=1),
+            status="CONFIRMED",
+            channel=channel,
+            hotpepper_synced=True,
+            synced_by="rpa",
+        )
+        db.add(reservation)
+        await db.commit()
+        return reservation.id, second.id
+
+
+async def _reload(sessions, reservation_id: int) -> Reservation:
+    async with sessions() as db:
+        return await db.get(Reservation, reservation_id)
+
+
+async def _rpa_ids(sessions) -> list:
+    async with sessions() as db:
+        return [item["id"] for item in await pending_sync(db=db)]
+
+
+async def _move(sessions, reservation_id: int, hours: int) -> None:
+    async with sessions() as db:
+        reservation = await db.get(Reservation, reservation_id)
+        reservation.start_time = reservation.start_time + timedelta(hours=hours)
+        reservation.end_time = reservation.end_time + timedelta(hours=hours)
+        await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_moving_a_transcribed_reservation_hands_it_to_the_rpa_as_a_new_number():
+    async with isolated_sessions() as sessions:
+        reservation_id, _ = await _seed_transcribed(sessions)
+        await _move(sessions, reservation_id, 5)
+        moved = await _reload(sessions, reservation_id)
+        rpa_ids = await _rpa_ids(sessions)
+
+    assert (moved.hotpepper_sync_round, moved.hotpepper_synced, moved.synced_by) == (2, False, None)
+    assert rpa_ids == [f"{reservation_id}-2"]
+
+
+@pytest.mark.asyncio
+async def test_changing_the_practitioner_is_also_a_move():
+    async with isolated_sessions() as sessions:
+        reservation_id, other_practitioner_id = await _seed_transcribed(sessions)
+        async with sessions() as db:
+            reservation = await db.get(Reservation, reservation_id)
+            reservation.practitioner_id = other_practitioner_id
+            await db.commit()
+        rpa_ids = await _rpa_ids(sessions)
+
+    assert rpa_ids == [f"{reservation_id}-2"]
+
+
+@pytest.mark.asyncio
+async def test_changes_that_do_not_move_the_slot_are_not_handed_again():
+    async with isolated_sessions() as sessions:
+        reservation_id, _ = await _seed_transcribed(sessions)
+        async with sessions() as db:
+            reservation = await db.get(Reservation, reservation_id)
+            reservation.end_time = reservation.end_time + timedelta(minutes=30)
+            reservation.notes = "備考だけ変更"
+            reservation.start_time = reservation.start_time  # 同じ値を入れ直しただけ
+            await db.commit()
+        kept = await _reload(sessions, reservation_id)
+        rpa_ids = await _rpa_ids(sessions)
+
+    assert (kept.hotpepper_sync_round, kept.hotpepper_synced, kept.synced_by) == (1, True, "rpa")
+    assert rpa_ids == []
+
+
+@pytest.mark.asyncio
+async def test_moving_a_hotpepper_reservation_never_hands_it_to_the_rpa():
+    async with isolated_sessions() as sessions:
+        reservation_id, _ = await _seed_transcribed(sessions, channel="HOTPEPPER")
+        await _move(sessions, reservation_id, 2)
+        kept = await _reload(sessions, reservation_id)
+        rpa_ids = await _rpa_ids(sessions)
+
+    assert (kept.hotpepper_sync_round, kept.hotpepper_synced) == (1, True)
+    assert rpa_ids == []
+
+
+@pytest.mark.asyncio
+async def test_quick_successive_moves_hand_only_the_latest_slot():
+    """17時→18時とすぐ動かし直したら、途中の回（-2）は渡さず最新（-3）だけを渡す。"""
+    async with isolated_sessions() as sessions:
+        reservation_id, _ = await _seed_transcribed(sessions)
+        await _move(sessions, reservation_id, 7)
+        await _move(sessions, reservation_id, 1)
+        rpa_ids = await _rpa_ids(sessions)
+
+    assert rpa_ids == [f"{reservation_id}-3"]
+
+
+@pytest.mark.asyncio
+async def test_a_transcription_report_for_an_older_round_is_ignored():
+    """RPA が押さえている最中に動かされたら、古い回の報告では転記済みにしない。"""
+    from app.api.hotpepper import MarkSyncedRequest, mark_synced
+
+    async with isolated_sessions() as sessions:
+        reservation_id, _ = await _seed_transcribed(sessions)
+        await _move(sessions, reservation_id, 3)
+
+        async with sessions() as db:
+            stale = await mark_synced(str(reservation_id), MarkSyncedRequest(synced_by="rpa"), db)
+        after_stale = await _reload(sessions, reservation_id)
+
+        async with sessions() as db:
+            current = await mark_synced(f"{reservation_id}-2", MarkSyncedRequest(synced_by="rpa"), db)
+        after_current = await _reload(sessions, reservation_id)
+
+    assert stale["status"] == "stale"
+    assert stale["current_key"] == f"{reservation_id}-2"
+    assert after_stale.hotpepper_synced is False
+    assert current["status"] == "ok"
+    assert (after_current.hotpepper_synced, after_current.synced_by) == (True, "rpa")
+
+
+@pytest.mark.asyncio
+async def test_a_person_can_mark_the_moved_reservation_with_its_plain_number():
+    from app.api.hotpepper import MarkSyncedRequest, mark_synced
+
+    async with isolated_sessions() as sessions:
+        reservation_id, _ = await _seed_transcribed(sessions)
+        await _move(sessions, reservation_id, 3)
+        async with sessions() as db:
+            result = await mark_synced(str(reservation_id), MarkSyncedRequest(synced_by="human"), db)
+        after = await _reload(sessions, reservation_id)
+
+    assert result["status"] == "ok"
+    assert (after.hotpepper_synced, after.synced_by) == (True, "human")
+
+
+@pytest.mark.asyncio
+async def test_an_unreadable_reservation_number_is_not_found():
+    from fastapi import HTTPException
+
+    from app.api.hotpepper import MarkSyncedRequest, mark_synced
+
+    async with isolated_sessions() as sessions:
+        async with sessions() as db:
+            with pytest.raises(HTTPException) as caught:
+                await mark_synced("2582-x", MarkSyncedRequest(synced_by="rpa"), db)
+
+    assert caught.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_a_hotpepper_change_mail_does_not_hand_a_linked_reservation_to_the_rpa():
+    """受付が手で入れた予約にホットペッパーのメールが紐付いたもの（channel は電話のまま）が、
+    ホットペッパーの変更メールで時間と担当を変えられても RPA には渡さない。
+    変更メールの処理は、時間を書いた後に担当を探す問い合わせを挟む（自動保存が途中で走る）。"""
+    from sqlalchemy import select
+
+    from app.models.reservation import moved_by_hotpepper
+
+    async with isolated_sessions() as sessions:
+        reservation_id, other_practitioner_id = await _seed_transcribed(sessions)
+        async with sessions() as db:
+            reservation = await db.get(Reservation, reservation_id)
+            moved_by_hotpepper(reservation)
+            reservation.start_time = reservation.start_time + timedelta(hours=2)
+            reservation.end_time = reservation.end_time + timedelta(hours=2)
+            await db.execute(select(Practitioner.id))  # 途中の問い合わせ（自動保存が走る）
+            reservation.practitioner_id = other_practitioner_id
+            await db.commit()
+        kept = await _reload(sessions, reservation_id)
+        rpa_ids = await _rpa_ids(sessions)
+
+    assert (kept.hotpepper_sync_round, kept.hotpepper_synced, kept.synced_by) == (1, True, "rpa")
+    assert rpa_ids == []

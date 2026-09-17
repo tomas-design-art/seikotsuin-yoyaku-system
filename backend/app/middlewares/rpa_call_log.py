@@ -30,10 +30,11 @@ def _extract_count_and_ids(payload: Any) -> tuple[int | None, list[int] | None]:
     """JSON レスポンスから件数と ID 一覧を抽出。形式違いは None を返す。"""
     try:
         if isinstance(payload, list):
+            # 転記後に動かした予約は "2582-2" のような文字列で渡している
             ids = [
-                int(item["id"])
+                item["id"]
                 for item in payload
-                if isinstance(item, dict) and "id" in item and isinstance(item.get("id"), int)
+                if isinstance(item, dict) and isinstance(item.get("id"), (int, str))
             ]
             return len(payload), ids[:20] if ids else None
         if isinstance(payload, dict):

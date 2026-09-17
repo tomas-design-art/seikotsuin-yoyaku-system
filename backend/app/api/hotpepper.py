@@ -13,7 +13,7 @@ from sqlalchemy.orm import selectinload
 from app.api.auth import require_admin
 from app.config import settings as app_settings
 from app.database import get_db
-from app.models.reservation import Reservation
+from app.models.reservation import Reservation, parse_rpa_reservation_key, rpa_reservation_key
 from app.models.setting import Setting
 from app.services.audit_log_service import log_action
 from app.services.reservation_service import build_reservation_response
@@ -55,7 +55,10 @@ def _responses_for_rpa(
     skipped: list[dict] = []
     for reservation in reservations:
         try:
-            items.append(build_reservation_response(reservation))
+            item = build_reservation_response(reservation)
+            # 転記後に動かした予約は「番号-回数」で渡す（RPA が別の予約として押さえ直す）
+            item["id"] = rpa_reservation_key(reservation)
+            items.append(item)
         except Exception as error:  # noqa: BLE001
             skipped.append({"id": reservation.id, "error": type(error).__name__})
             logger.exception(
@@ -283,13 +286,21 @@ class MarkSyncedRequest(BaseModel):
 
 @router.post("/{reservation_id}/mark-synced")
 async def mark_synced(
-    reservation_id: int,
+    reservation_id: str,
     body: MarkSyncedRequest | None = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """HP側押さえ済みマーク"""
+    """HP側押さえ済みマーク
+
+    reservation_id は一覧で渡した番号（「2582」または転記後に動かした予約の「2582-2」）。
+    """
     from app.api.sse import broadcast_event
     from app.models.notification_log import NotificationLog
+    parsed_key = parse_rpa_reservation_key(reservation_id)
+    if parsed_key is None:
+        raise HTTPException(status_code=404, detail="予約が見つかりません")
+    rpa_key = reservation_id
+    reservation_id, reported_round = parsed_key
     result = await db.execute(
         select(Reservation)
         .where(Reservation.id == reservation_id)
@@ -305,6 +316,20 @@ async def mark_synced(
     synced_by_value = body.synced_by if body else "human"
     if synced_by_value not in ("rpa", "human"):
         raise HTTPException(status_code=400, detail="synced_by は 'rpa' か 'human'")
+
+    # RPA が押さえている間に予約が動かされていたら、その報告は古い回のもの。転記済みにせず、
+    # 最新の回（番号-回数）を一覧に残して押さえ直させる。200 を返すのは、RPA がこの番号を
+    # 失敗扱いにして何度もやり直さないようにするため。人の「押さえ済み」はいまの状態への操作なので受け付ける。
+    current_round = reservation.hotpepper_sync_round or 1
+    if synced_by_value == "rpa" and reported_round != current_round:
+        logger.info(
+            "hotpepper_mark_synced_stale key=%s current=%s", rpa_key, rpa_reservation_key(reservation)
+        )
+        return {
+            "status": "stale",
+            "reservation_id": reservation_id,
+            "current_key": rpa_reservation_key(reservation),
+        }
     # rpa マーク済みなら上書きしない（rpa > human の優先度）
     if reservation.synced_by != "rpa":
         reservation.synced_by = synced_by_value

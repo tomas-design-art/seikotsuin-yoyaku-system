@@ -56,7 +56,7 @@ def test_alembic_revision_chain_has_expected_single_head():
         if down_revision:
             down_revisions.add(down_revision)
 
-    assert revisions - down_revisions == {"028_line_reservation_source_ref"}
+    assert revisions - down_revisions == {"029_reservation_sync_round"}
 
 
 def test_patient_line_id_has_non_unique_lookup_index():

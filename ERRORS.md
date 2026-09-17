@@ -181,3 +181,9 @@
 - 原因: 2026-09-04 の「部分 import で mapper 未登録」と同じ型。`selectinload(関連)` は作った時点で mapper の初期化を走らせる。ルーターの import 時点では ReservationColor がまだ登録されていない。
 - 手順: `selectinload` などの関連を参照するオプションは、モジュール定数にせず関数の中で作る（クエリ実行時に作る）。
 - 状態: L3（`import app.main` するテストの収集で必ず落ちる。今回もそれで検出）。2回目のため記録を残す。
+
+## 2026-09-17: Alembic のリビジョン ID が 32 文字を超えかけた
+
+- 症状: `029_reservation_hotpepper_sync_round`（36文字）で migration を作った。`alembic_version.version_num` は VARCHAR(32) なので、本番の起動時 `alembic upgrade head` で書き込みに失敗するところだった（push 前に気づいた）。
+- 手順: revision は 32 文字以内にする（既存の最長は 32 文字の `009_add_middle_name_reading_mode`）。新しい migration は空の DB で `alembic upgrade head` を通してから push する。
+- 状態: L1（初回記録）

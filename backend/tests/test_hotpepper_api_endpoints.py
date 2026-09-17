@@ -25,6 +25,7 @@ def create_dummy_reservation(id_: int, start_time: datetime, status: str, hotpep
     r.conflict_note = None
     r.hotpepper_synced = hotpepper_synced
     r.synced_by = "rpa" if hotpepper_synced else None
+    r.hotpepper_sync_round = 1
     r.hold_expires_at = None
     r.series_id = None
     r.series = None
