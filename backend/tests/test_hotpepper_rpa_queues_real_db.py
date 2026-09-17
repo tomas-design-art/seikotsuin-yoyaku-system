@@ -7,7 +7,7 @@ MissingGreenlet で一覧全体が 500 になる。
 
 ただし一覧の中に「同じ色を持つメニュー」の予約が1件でもあると、Menu.color（lazy="joined"）
 経由でその色がセッションに載っているため落ちない。だから本番では
-「メニューなしで色だけ付いた予約（9/20 9:00 の電話予約）」が残り、同じ色のメニューの予約が
+「メニューなしで色だけ付いた予約」が残り、同じ色のメニューの予約が
 一覧から消えた瞬間だけ 500 になり、RPA が転記を止めた（9/10・9/14 にも同じ途切れ方）。
 
 既存の test_hotpepper_api_endpoints.py は DB を AsyncMock にしているので、この遅延読み込みを
@@ -133,6 +133,13 @@ async def test_pending_sync_lists_a_colored_reservation_without_menu():
     item = next(i for i in items if i["id"] == reservation_id)
     assert item["menu"] is None
     assert item["color"]["id"] == color_id
+    # RPA が読むレスポンスの形は変えない
+    assert set(item) == {
+        "id", "patient", "practitioner_id", "practitioner_name", "menu", "color", "color_id",
+        "start_time", "end_time", "status", "channel", "source_ref", "notes", "conflict_note",
+        "hotpepper_synced", "synced_by", "hold_expires_at", "series_id", "series_info",
+        "created_at", "updated_at",
+    }
 
 
 @pytest.mark.asyncio
