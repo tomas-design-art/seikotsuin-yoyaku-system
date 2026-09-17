@@ -138,6 +138,11 @@ class RpaCallLogMiddleware(BaseHTTPMiddleware):
             except Exception as e:  # noqa: BLE001
                 logger.debug("rpa_call_log body sniff failed: %s", e)
 
+        # 一覧で飛ばした予約（hotpepper._responses_for_rpa が request.state に置く）も残す
+        skipped = getattr(request.state, "rpa_skipped", None)
+        if skipped:
+            body_summary = {**(body_summary or {}), "_skipped": skipped}
+
         await self._write_log(
             request,
             path,

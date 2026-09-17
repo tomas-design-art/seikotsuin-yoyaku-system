@@ -5,7 +5,7 @@ from collections import Counter
 from datetime import datetime, time as dtime, timedelta
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
@@ -40,11 +40,15 @@ def _response_load_options() -> tuple:
     )
 
 
-def _responses_for_rpa(reservations, *, endpoint: str) -> tuple[list[dict], list[dict]]:
+def _responses_for_rpa(
+    reservations, *, endpoint: str, request: Request | None = None
+) -> tuple[list[dict], list[dict]]:
     """RPA に渡す一覧を1件ずつ作る。作れない予約があっても、残りは渡す。
 
     以前は1件でも作れないと一覧全体が 500 になり、他の予約まで何時間も転記されなかった
     （2026-09-17）。作れなかった予約は飛ばしてログに残し、/health の unlistable_pending にも出す。
+    request を渡すと、飛ばした予約を rpa_call_logs の body_summary._skipped にも残す
+    （RpaCallLogMiddleware が request.state.rpa_skipped を読む）。
     戻り値は (渡す一覧, 飛ばした予約の id とエラー種別)。
     """
     items: list[dict] = []
@@ -57,7 +61,22 @@ def _responses_for_rpa(reservations, *, endpoint: str) -> tuple[list[dict], list
             logger.exception(
                 "hotpepper_list_item_skipped endpoint=%s reservation_id=%s", endpoint, reservation.id
             )
+    if skipped and request is not None:
+        request.state.rpa_skipped = skipped
     return items, skipped
+
+
+def _raise_if_nothing_listable(reservations, items: list[dict]) -> None:
+    """対象の予約があるのに1件も作れなかったら 500 にする。
+
+    空の一覧を 200 で返すと「転記する予約なし」と区別がつかず、RPA も記録も黙ってしまう。
+    1件も渡せないなら、失っているものは無いので失敗として見えるほうを選ぶ。
+    """
+    if reservations and not items:
+        raise HTTPException(
+            status_code=500,
+            detail="RPA に渡す予約を1件も作れませんでした（/api/hotpepper/health の unlistable_pending を参照）",
+        )
 
 
 def _unsynced_base_filters() -> list:
@@ -119,7 +138,7 @@ class ParseEmailResponse(BaseModel):
 
 
 @router.get("/pending-sync")
-async def pending_sync(db: AsyncSession = Depends(get_db)):
+async def pending_sync(db: AsyncSession = Depends(get_db), request: Request = None):
     """HotPepper側未押さえの予約一覧（現在時刻〜90日先まで／SalonBoardカレンダー上限）"""
     now = now_jst()
     result = await db.execute(
@@ -129,7 +148,8 @@ async def pending_sync(db: AsyncSession = Depends(get_db)):
         .order_by(Reservation.start_time)
     )
     reservations = result.scalars().all()
-    items, _skipped = _responses_for_rpa(reservations, endpoint="pending-sync")
+    items, _skipped = _responses_for_rpa(reservations, endpoint="pending-sync", request=request)
+    _raise_if_nothing_listable(reservations, items)
     return items
 
 
@@ -223,6 +243,7 @@ async def mark_past_unsynced(
 async def reservations_by_date(
     date: str,
     db: AsyncSession = Depends(get_db),
+    request: Request = None,
 ):
     """指定日（JST）の全予約を返す（同期済み・未同期の両方）。RPA差分転記用。
 
@@ -251,7 +272,8 @@ async def reservations_by_date(
         .order_by(Reservation.start_time)
     )
     reservations = result.scalars().all()
-    items, _skipped = _responses_for_rpa(reservations, endpoint="reservations-by-date")
+    items, _skipped = _responses_for_rpa(reservations, endpoint="reservations-by-date", request=request)
+    _raise_if_nothing_listable(reservations, items)
     return items
 
 
@@ -321,6 +343,7 @@ async def mark_synced(
 async def reconcile_queue(
     days: int = 7,
     db: AsyncSession = Depends(get_db),
+    request: Request = None,
 ):
     """RPAによる『直近◯日の取りこぼし救済』用キュー。
 
@@ -347,7 +370,8 @@ async def reconcile_queue(
         .order_by(Reservation.start_time)
     )
     reservations = result.scalars().all()
-    items, _skipped = _responses_for_rpa(reservations, endpoint="reconcile-queue")
+    items, _skipped = _responses_for_rpa(reservations, endpoint="reconcile-queue", request=request)
+    _raise_if_nothing_listable(reservations, items)
     return items
 
 
@@ -596,12 +620,36 @@ async def hotpepper_health(
             ),
         }
 
-    # mark-synced 呼び出し回数（直近24h、synced_by 別）
+    # 最後に「成功した」一覧取得（2026-09-17 から 500 も記録されるので、上の last_queue_call は失敗の回もある）
+    last_success_row = (await db.execute(
+        select(RpaCallLog)
+        .where(
+            RpaCallLog.endpoint.in_([
+                "/api/hotpepper/rpa-queue",
+                "/api/hotpepper/pending-sync",
+                "/api/hotpepper/reconcile-queue",
+            ]),
+            RpaCallLog.method == "GET",
+            RpaCallLog.status_code < 400,
+        )
+        .order_by(RpaCallLog.timestamp.desc())
+        .limit(1)
+    )).scalar_one_or_none()
+    last_success_info = None
+    if last_success_row is not None and last_success_row.timestamp:
+        last_success_info = {
+            "endpoint": last_success_row.endpoint,
+            "timestamp": last_success_row.timestamp.isoformat(),
+            "minutes_since": int((now - last_success_row.timestamp).total_seconds() // 60),
+        }
+
+    # mark-synced の成功回数（直近24h、synced_by 別）。失敗した回（500 など）は数えない
     mark_rows = (await db.execute(
         select(RpaCallLog)
         .where(
             RpaCallLog.endpoint.like("/api/hotpepper/%/mark-synced"),
             RpaCallLog.timestamp >= last_24h,
+            RpaCallLog.status_code < 400,
         )
     )).scalars().all()
     mark_counts = {"rpa": 0, "human": 0, "unknown": 0}
@@ -646,8 +694,9 @@ async def hotpepper_health(
     )).scalars().all()
     _, unlistable_pending = _responses_for_rpa(pending_for_rpa, endpoint="health")
 
-    # RPA 死亡判定（rpa-queue/pending-sync が直近1hに無い）
+    # RPA 死亡判定（rpa-queue/pending-sync が直近1hに無い。失敗した回も「来ている」に数える）
     # ※予約システムの「HP押さえ」画面も pending-sync を30秒ごとに呼ぶので、画面が開いていると true になる
+    # ※取得に成功しているかは last_successful_queue_call を見る
     rpa_alive = False
     if last_queue_info and last_queue_info.get("minutes_since") is not None:
         rpa_alive = last_queue_info["minutes_since"] < 60
@@ -660,6 +709,7 @@ async def hotpepper_health(
         "oldest_pending": oldest_summary,
         "rpa_call_counts_last_24h": call_counts,
         "last_queue_call": last_queue_info,
+        "last_successful_queue_call": last_success_info,
         "mark_synced_calls_last_24h": mark_counts,
         "rpa_worker_alive": rpa_alive,
         "stuck_candidates": stuck_candidates,

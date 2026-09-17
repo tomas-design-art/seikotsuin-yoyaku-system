@@ -304,3 +304,167 @@ async def test_a_crashed_rpa_request_is_still_recorded(monkeypatch):
         ("/api/hotpepper/pending-sync", 500, "node")
     ]
     assert logs[0].body_summary == {"_error": "RuntimeError"}
+
+
+@pytest.mark.asyncio
+async def test_a_crashed_rpa_request_is_recorded_and_the_original_error_still_propagates(monkeypatch):
+    """記録を足したことで、元の例外が握りつぶされたり別の例外に変わったりしない。"""
+    import httpx
+    from sqlalchemy import select
+
+    import app.middlewares.rpa_call_log as call_log_module
+    from app.database import get_db
+    from app.main import app as fastapi_app
+
+    class CrashingSession:
+        async def execute(self, *args, **kwargs):
+            raise RuntimeError("DB で落ちた")
+
+    async def crashing_db():
+        yield CrashingSession()
+
+    async with isolated_sessions() as sessions:
+        monkeypatch.setattr(call_log_module, "async_session", sessions)
+        fastapi_app.dependency_overrides[get_db] = crashing_db
+        try:
+            transport = httpx.ASGITransport(app=fastapi_app, raise_app_exceptions=True)
+            async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                with pytest.raises(RuntimeError, match="DB で落ちた"):
+                    await client.get("/api/hotpepper/pending-sync")
+        finally:
+            fastapi_app.dependency_overrides.pop(get_db, None)
+
+        async with sessions() as db:
+            logs = (await db.execute(select(RpaCallLog))).scalars().all()
+
+    assert [(log.status_code, log.body_summary) for log in logs] == [(500, {"_error": "RuntimeError"})]
+
+
+async def _call_pending_sync_over_http(sessions, monkeypatch):
+    import httpx
+    from sqlalchemy import select
+
+    import app.middlewares.rpa_call_log as call_log_module
+    from app.database import get_db
+    from app.main import app as fastapi_app
+
+    async def isolated_db():
+        async with sessions() as db:
+            yield db
+
+    monkeypatch.setattr(call_log_module, "async_session", sessions)
+    fastapi_app.dependency_overrides[get_db] = isolated_db
+    try:
+        transport = httpx.ASGITransport(app=fastapi_app, raise_app_exceptions=False)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.get("/api/hotpepper/pending-sync", headers={"user-agent": "node"})
+    finally:
+        fastapi_app.dependency_overrides.pop(get_db, None)
+    async with sessions() as db:
+        logs = (await db.execute(select(RpaCallLog))).scalars().all()
+    return response, logs
+
+
+@pytest.mark.asyncio
+async def test_skipped_reservations_are_recorded_in_the_rpa_call_log(monkeypatch):
+    import app.api.hotpepper as hotpepper_api
+
+    async with isolated_sessions() as sessions:
+        ids = await _seed_rules(sessions)
+        broken_id = ids["new_phone"]
+        real_build = hotpepper_api.build_reservation_response
+
+        def build_or_fail(reservation):
+            if reservation.id == broken_id:
+                raise RuntimeError("この予約だけ作れない")
+            return real_build(reservation)
+
+        monkeypatch.setattr(hotpepper_api, "build_reservation_response", build_or_fail)
+        response, logs = await _call_pending_sync_over_http(sessions, monkeypatch)
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()] == [ids["new_homepage"]]
+    assert [(log.status_code, log.response_count) for log in logs] == [(200, 1)]
+    assert logs[0].body_summary == {"_skipped": [{"id": broken_id, "error": "RuntimeError"}]}
+
+
+@pytest.mark.asyncio
+async def test_when_no_reservation_can_be_listed_the_rpa_gets_an_error_not_an_empty_list(monkeypatch):
+    """1件も作れないのに 200 の空一覧を返すと「転記する予約なし」と区別できず、全員が黙る。"""
+    import app.api.hotpepper as hotpepper_api
+
+    async with isolated_sessions() as sessions:
+        ids = await _seed_rules(sessions)
+
+        def always_fail(reservation):
+            raise RuntimeError("作れない")
+
+        monkeypatch.setattr(hotpepper_api, "build_reservation_response", always_fail)
+        response, logs = await _call_pending_sync_over_http(sessions, monkeypatch)
+
+    assert response.status_code == 500
+    assert [log.status_code for log in logs] == [500]
+    assert {s["id"] for s in logs[0].body_summary["_skipped"]} == {ids["new_phone"], ids["new_homepage"]}
+
+
+@pytest.mark.asyncio
+async def test_a_real_lazy_load_failure_does_not_break_the_following_reservations():
+    """本番で起きた MissingGreenlet で1件目が落ちても、同じセッションの後続は作れて、DB もまだ使える。"""
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from app.api.hotpepper import _response_load_options, _responses_for_rpa
+
+    async with isolated_sessions() as sessions:
+        broken_id, _ = await _seed_colored_reservation_without_menu(sessions)
+        async with sessions() as db:
+            # 修正前と同じく色を先読みしない読み方で、メニューなし・色つきの予約を読む
+            broken = (await db.execute(
+                select(Reservation)
+                .where(Reservation.id == broken_id)
+                .options(
+                    selectinload(Reservation.patient),
+                    selectinload(Reservation.practitioner),
+                    selectinload(Reservation.menu),
+                )
+            )).scalar_one()
+            healthy = (await db.execute(
+                select(Reservation)
+                .where(Reservation.id != broken_id)
+                .options(*_response_load_options())
+            )).scalar_one()
+
+            items, skipped = _responses_for_rpa([broken, healthy], endpoint="test")
+            still_usable = (await db.execute(select(Reservation.id))).scalars().all()
+
+    assert skipped == [{"id": broken_id, "error": "MissingGreenlet"}]
+    assert [item["id"] for item in items] == [healthy.id]
+    assert len(still_usable) == 2
+
+
+@pytest.mark.asyncio
+async def test_health_counts_only_successful_calls():
+    """500 も記録するようになったので、成功の件数と「最後に取得に成功した時刻」は失敗の回を数えない。"""
+    from app.api.hotpepper import hotpepper_health
+
+    now = now_jst()
+    async with isolated_sessions() as sessions:
+        async with sessions() as db:
+            db.add_all([
+                RpaCallLog(endpoint="/api/hotpepper/pending-sync", method="GET", status_code=200,
+                           timestamp=now - timedelta(minutes=30)),
+                RpaCallLog(endpoint="/api/hotpepper/pending-sync", method="GET", status_code=500,
+                           timestamp=now - timedelta(minutes=1)),
+                RpaCallLog(endpoint="/api/hotpepper/1/mark-synced", method="POST", status_code=200,
+                           body_summary={"synced_by": "rpa"}, timestamp=now - timedelta(minutes=40)),
+                RpaCallLog(endpoint="/api/hotpepper/2/mark-synced", method="POST", status_code=500,
+                           body_summary={"synced_by": "rpa", "_error": "RuntimeError"},
+                           timestamp=now - timedelta(minutes=2)),
+            ])
+            await db.commit()
+        async with sessions() as db:
+            health = await hotpepper_health(db=db)
+
+    assert health["last_queue_call"]["status_code"] == 500
+    assert health["last_successful_queue_call"]["minutes_since"] >= 29
+    assert health["mark_synced_calls_last_24h"] == {"rpa": 1, "human": 0, "unknown": 0}
