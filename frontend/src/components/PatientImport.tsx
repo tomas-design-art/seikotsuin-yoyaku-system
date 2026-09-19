@@ -1,3 +1,4 @@
+import HelpTip from './HelpTip';
 import { useState, useRef } from 'react';
 import { Upload, X, ChevronRight, ChevronLeft, Check, AlertTriangle, Download, UserCheck, RefreshCw, SkipForward } from 'lucide-react';
 import type { ImportPreviewResponse, ImportExecuteResponse, ImportDuplicate, RowAction } from '../types';
@@ -104,7 +105,7 @@ export default function PatientImport({ onClose, onComplete }: Props) {
             <div className="bg-white rounded-lg shadow-xl w-full max-w-4xl max-h-[90vh] flex flex-col">
                 {/* ヘッダー */}
                 <div className="flex items-center justify-between px-6 py-4 border-b">
-                    <h2 className="text-lg font-bold">患者一括取り込み</h2>
+                    <h2 className="text-lg font-bold flex items-center gap-2">患者一括取り込み <HelpTip helpKey="patientImport" /></h2>
                     <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded"><X size={20} /></button>
                 </div>
 

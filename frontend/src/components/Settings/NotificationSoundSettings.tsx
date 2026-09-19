@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useState } from 'react';
 import { Play, Save, Volume2, AlertTriangle } from 'lucide-react';
 import { updateSetting } from '../../api/client';
@@ -66,7 +67,7 @@ export default function NotificationSoundSettings() {
     return (
         <div className="max-w-2xl mx-auto p-6">
             <h1 className="text-2xl font-bold mb-2 flex items-center gap-2">
-                <Volume2 size={24} /> 通知音に関する設定
+                <Volume2 size={24} /> 通知音に関する設定 <HelpTip helpKey="notificationSound" />
             </h1>
             <p className="text-sm text-gray-600 mb-6">
                 HotPepper・LINE・ホームページ（チャットボット）から<strong>スタッフの操作なしに自動で入ってくる予約</strong>を、

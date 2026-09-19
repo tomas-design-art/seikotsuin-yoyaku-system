@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useState, useEffect } from 'react';
 import { Save, Power, PowerOff } from 'lucide-react';
 import { getSettings, updateSetting } from '../../api/client';
@@ -66,7 +67,7 @@ export default function ChatbotSettings() {
 
     return (
         <div className="max-w-2xl mx-auto p-6">
-            <h1 className="text-2xl font-bold mb-6">チャットボット設定</h1>
+            <h1 className="text-2xl font-bold mb-6 flex items-center gap-2">チャットボット設定 <HelpTip helpKey="chatbot" /></h1>
 
             {error && (
                 <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">{error}</div>

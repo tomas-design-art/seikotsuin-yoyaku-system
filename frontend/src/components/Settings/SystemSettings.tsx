@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useState, useEffect } from 'react';
 import { Save, Lock, Upload, FileDown, Trash2, AlertTriangle } from 'lucide-react';
 import type { Setting } from '../../types';
@@ -108,7 +109,7 @@ export default function SystemSettings() {
 
   return (
     <div className="max-w-2xl mx-auto p-6">
-      <h1 className="text-2xl font-bold mb-6">システム設定</h1>
+      <h1 className="text-2xl font-bold mb-6 flex items-center gap-2">システム設定 <HelpTip helpKey="systemSettings" /></h1>
       {error && (
         <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">{error}</div>
       )}

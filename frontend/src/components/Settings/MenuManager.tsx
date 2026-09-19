@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Plus, Edit2, Trash2, X, GripVertical } from 'lucide-react';
 import type { Menu, ReservationColor, MenuPriceTier } from '../../types';
@@ -188,7 +189,7 @@ export default function MenuManager() {
   return (
     <div className="max-w-2xl mx-auto p-6">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold">メニュー管理</h1>
+        <h1 className="text-2xl font-bold flex items-center gap-2">メニュー管理 <HelpTip helpKey="menus" /></h1>
         <div className="flex gap-2">
           {reordering ? (
             <>

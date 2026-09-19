@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useState, useEffect } from 'react';
 import { Save, Trash2, Plus, Calendar } from 'lucide-react';
 import type { WeeklySchedule, Setting, DateOverride } from '../../types';
@@ -185,7 +186,7 @@ export default function WeeklyScheduleManager() {
     return (
         <div className="max-w-3xl mx-auto p-6">
             <div className="flex items-center justify-between mb-6">
-                <h1 className="text-2xl font-bold">院営業スケジュール設定</h1>
+                <h1 className="text-2xl font-bold flex items-center gap-2">院営業スケジュール設定 <HelpTip helpKey="businessSchedule" /></h1>
                 <button
                     onClick={handleSaveAll}
                     disabled={saving !== null}

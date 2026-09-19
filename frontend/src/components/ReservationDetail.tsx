@@ -1,3 +1,4 @@
+import HelpTip from './HelpTip';
 import { useState, useEffect, useMemo } from 'react';
 import { X, CheckCircle, XCircle, ArrowRightLeft, Clock, Pencil, Repeat, Trash2 } from 'lucide-react';
 import type { Reservation, Practitioner, Patient, Menu } from '../types';
@@ -304,7 +305,7 @@ export default function ReservationDetail({ reservation, onClose, onUpdate, onSt
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
       <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4 max-h-[90vh] overflow-y-auto">
         <div className="flex items-center justify-between p-4 border-b">
-          <h3 className="font-semibold">予約詳細</h3>
+          <h3 className="font-semibold flex items-center gap-2">予約詳細 <HelpTip helpKey="reservationDetail" /></h3>
           <button onClick={onClose} className="p-1 hover:bg-gray-100 rounded"><X size={18} /></button>
         </div>
 

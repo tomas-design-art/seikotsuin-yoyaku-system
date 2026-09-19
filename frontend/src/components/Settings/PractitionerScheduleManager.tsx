@@ -1,3 +1,5 @@
+import HelpTip, { HelpNotice } from '../HelpTip';
+import { STAFF_SCHEDULE_NOTICE } from '../../help/helpContent';
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { Save, Plus, Trash2, AlertTriangle, ArrowRight, X, Clock, History, ChevronDown, ChevronRight } from 'lucide-react';
 import type { Practitioner, ScheduleOverride, AffectedReservation, WeeklySchedule, UnavailableTime } from '../../types';
@@ -322,7 +324,8 @@ export default function PractitionerScheduleManager() {
 
     return (
         <div className="p-6 max-w-4xl mx-auto space-y-6">
-            <h2 className="text-xl font-bold text-gray-800">職員勤務スケジュール管理</h2>
+            <h2 className="text-xl font-bold text-gray-800 flex items-center gap-2">職員勤務スケジュール管理 <HelpTip helpKey="staffSchedule" /></h2>
+            <HelpNotice>{STAFF_SCHEDULE_NOTICE}</HelpNotice>
 
             {/* 通知 */}
             {message && (

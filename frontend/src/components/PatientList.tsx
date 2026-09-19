@@ -1,3 +1,4 @@
+import HelpTip from './HelpTip';
 import { useState, useEffect, useRef } from 'react';
 import { Search, Edit2, ChevronLeft, ChevronRight, EyeOff, Eye, Trash2 } from 'lucide-react';
 import type { Patient, CandidateResponse, Menu, Practitioner } from '../types';
@@ -324,7 +325,7 @@ export default function PatientList() {
   return (
     <div className="max-w-5xl mx-auto p-6">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold">患者管理</h1>
+        <h1 className="text-2xl font-bold flex items-center gap-2">患者管理 <HelpTip helpKey="patients" /></h1>
         <div className="flex gap-2">
           <button
             onClick={() => {

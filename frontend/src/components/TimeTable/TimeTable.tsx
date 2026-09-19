@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { ChevronLeft, ChevronRight, Minus, Plus, Calendar as CalendarIcon } from 'lucide-react';
 import type { Practitioner, Reservation, ReservationColor, WeeklySchedule, PractitionerDayStatus, BusinessHoursDay } from '../../types';
@@ -981,6 +982,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             })()}
           </div>
           <button onClick={goToday} className="ml-1 md:ml-2 px-2 md:px-3 py-1 text-xs md:text-sm bg-blue-500 text-white rounded hover:bg-blue-600">今日</button>
+          <span className="ml-1 shrink-0"><HelpTip helpKey="timetable" /></span>
           {/* Zoom controls */}
           <div className="flex items-center gap-0.5 ml-2 border-l pl-2 border-gray-200">
             <button

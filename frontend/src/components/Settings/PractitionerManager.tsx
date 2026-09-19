@@ -1,3 +1,5 @@
+import HelpTip, { HelpNotice } from '../HelpTip';
+import { PRACTITIONER_VISIBILITY_NOTICE } from '../../help/helpContent';
 import { useState, useEffect } from 'react';
 import { Plus, Edit2, Trash2, GripVertical, Eye, EyeOff } from 'lucide-react';
 import type { Practitioner } from '../../types';
@@ -113,7 +115,7 @@ export default function PractitionerManager() {
   return (
     <div className="max-w-2xl mx-auto p-6">
       <div className="flex items-center justify-between mb-6">
-        <h1 className="text-2xl font-bold">施術者管理</h1>
+        <h1 className="text-2xl font-bold flex items-center gap-2">施術者管理 <HelpTip helpKey="practitioners" /></h1>
         <button
           onClick={() => { setShowForm(true); setEditingId(null); setName(''); setRole(roles[0] || ''); setDailyReportCode(''); setEditingWasInactive(false); }}
           className="flex items-center gap-1 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
@@ -121,6 +123,8 @@ export default function PractitionerManager() {
           <Plus size={16} /> 追加
         </button>
       </div>
+
+      <HelpNotice>{PRACTITIONER_VISIBILITY_NOTICE}</HelpNotice>
 
       {error && (
         <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded text-red-700 text-sm">{error}</div>

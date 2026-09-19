@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useState, useEffect, useMemo } from 'react';
 import { X } from 'lucide-react';
 import type { Menu, Practitioner, ReservationCreate, Channel, ReservationColor, Patient, BulkReservationResult } from '../../types';
@@ -300,6 +301,7 @@ export default function ReservationForm({ isOpen, onClose, onSuccess, initialDat
         <div className="flex items-center justify-between p-4 border-b">
           <div className="flex items-center gap-3 min-w-0">
             <h2 className="text-lg font-semibold whitespace-nowrap">新規予約登録</h2>
+            <HelpTip helpKey="reservationForm" />
             <button
               type="button"
               onClick={handleImmediateBlock}

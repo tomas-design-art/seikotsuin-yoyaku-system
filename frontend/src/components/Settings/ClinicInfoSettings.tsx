@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useState } from 'react';
 import { Stethoscope, Menu as MenuIcon, Palette, CalendarDays } from 'lucide-react';
 import PractitionerManager from './PractitionerManager';
@@ -25,7 +26,7 @@ export default function ClinicInfoSettings() {
     return (
         <div>
             <div className="max-w-4xl mx-auto px-6 pt-6">
-                <h1 className="text-2xl font-bold mb-4">院情報設定</h1>
+                <h1 className="text-2xl font-bold mb-4 flex items-center gap-2">院情報設定 <HelpTip helpKey="clinicInfo" /></h1>
                 <div className="flex gap-1 border-b overflow-x-auto">
                     {TABS.map((tab) => {
                         const Icon = tab.icon;

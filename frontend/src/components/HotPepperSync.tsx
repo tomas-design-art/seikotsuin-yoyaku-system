@@ -1,3 +1,4 @@
+import HelpTip from './HelpTip';
 import { useState, useEffect } from 'react';
 import { Check, AlertCircle } from 'lucide-react';
 import type { Reservation } from '../types';
@@ -118,7 +119,7 @@ export default function HotPepperSync() {
   return (
     <div className="max-w-4xl mx-auto p-6 flex flex-col" style={{ height: 'calc(100vh - 64px)' }}>
       <div className="flex-shrink-0">
-        <h1 className="text-2xl font-bold mb-2">🔥 HotPepper同期管理</h1>
+        <h1 className="text-2xl font-bold mb-2 flex items-center gap-2">🔥 HotPepper同期管理 <HelpTip helpKey="hotpepperSync" /></h1>
         <p className="text-gray-600 mb-4">HotPepper側で枠を押さえていない予約の一覧です。押さえ済みになったらチェックしてください。</p>
         {pendingSync.length > 0 && (
           <div className="flex items-center justify-between mb-4">

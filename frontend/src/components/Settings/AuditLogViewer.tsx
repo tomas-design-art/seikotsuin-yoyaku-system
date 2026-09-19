@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useEffect, useState } from 'react';
 import { getAuditLogs } from '../../api/client';
 import type { AuditLog } from '../../types';
@@ -114,7 +115,7 @@ export default function AuditLogViewer() {
     return (
         <div className="max-w-6xl mx-auto p-6">
             <div className="flex items-center justify-between mb-4">
-                <h1 className="text-2xl font-bold">監査ログ</h1>
+                <h1 className="text-2xl font-bold flex items-center gap-2">監査ログ <HelpTip helpKey="auditLog" /></h1>
                 <button
                     onClick={load}
                     className="px-3 py-2 text-sm rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50"

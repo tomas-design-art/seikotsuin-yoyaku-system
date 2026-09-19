@@ -1,3 +1,4 @@
+import HelpTip from '../HelpTip';
 import { useState, useEffect } from 'react';
 import { Plus, Pencil, Trash2, Check, X } from 'lucide-react';
 import type { ReservationColor } from '../../types';
@@ -83,7 +84,7 @@ export default function ColorManager() {
     return (
         <div className="max-w-2xl mx-auto p-6">
             <div className="flex items-center justify-between mb-6">
-                <h2 className="text-xl font-bold">予約色設定</h2>
+                <h2 className="text-xl font-bold flex items-center gap-2">予約色設定 <HelpTip helpKey="colors" /></h2>
                 <button
                     onClick={() => setShowAdd(true)}
                     className="flex items-center gap-1 px-3 py-2 bg-blue-500 text-white rounded text-sm hover:bg-blue-600"
