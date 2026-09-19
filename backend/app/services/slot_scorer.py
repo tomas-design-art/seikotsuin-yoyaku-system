@@ -318,13 +318,13 @@ async def score_candidates(
         prac_q = await db.execute(
             select(Practitioner).where(
                 Practitioner.id == practitioner_id,
-                Practitioner.is_active == True,
+                Practitioner.bookable(),
             )
         )
     else:
         prac_q = await db.execute(
             select(Practitioner)
-            .where(Practitioner.is_active == True)
+            .where(Practitioner.bookable())
             .order_by(Practitioner.display_order)
         )
     practitioners = list(prac_q.scalars().all())
@@ -402,7 +402,7 @@ async def find_best_practitioner(
     start_dt = datetime.combine(target_date, start_time, tzinfo=JST)
     end_dt = start_dt + timedelta(minutes=duration_minutes)
 
-    practitioner_query = select(Practitioner).where(Practitioner.is_active == True)
+    practitioner_query = select(Practitioner).where(Practitioner.bookable())
     if practitioner_id is not None:
         practitioner_query = practitioner_query.where(Practitioner.id == practitioner_id)
     prac_q = await db.execute(practitioner_query.order_by(Practitioner.display_order))
@@ -505,7 +505,7 @@ async def build_same_day_candidates(
     """
     prac_q = await db.execute(
         select(Practitioner)
-        .where(Practitioner.is_active == True)
+        .where(Practitioner.bookable())
         .order_by(Practitioner.display_order)
     )
     practitioners = list(prac_q.scalars().all())
@@ -679,7 +679,7 @@ async def build_day_availability_summary(
     """
     prac_q = await db.execute(
         select(Practitioner)
-        .where(Practitioner.is_active == True)
+        .where(Practitioner.bookable())
         .order_by(Practitioner.display_order)
     )
     practitioners = list(prac_q.scalars().all())

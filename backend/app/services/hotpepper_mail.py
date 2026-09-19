@@ -857,7 +857,7 @@ async def _assign_practitioner(
 
     if name:
         result = await db.execute(
-            select(Practitioner).where(Practitioner.name == name, Practitioner.is_active == True)
+            select(Practitioner).where(Practitioner.name == name, Practitioner.bookable())
         )
         prac = result.scalar_one_or_none()
         if prac:
@@ -870,7 +870,7 @@ async def _assign_practitioner(
 
     # 希望なし時の優先順位: 施術者 → 院長（その中で display_order昇順）
     result = await db.execute(
-        select(Practitioner).where(Practitioner.is_active == True).order_by(Practitioner.display_order, Practitioner.id)
+        select(Practitioner).where(Practitioner.bookable()).order_by(Practitioner.display_order, Practitioner.id)
     )
     practitioners = result.scalars().all()
 

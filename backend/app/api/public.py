@@ -150,7 +150,7 @@ async def get_public_available_slots(
 
     # ── 施術者情報ロード（勤務フラグ + 時間 + 予約 + 休み） ──
     pracs = (await db.execute(
-        select(Practitioner).where(Practitioner.is_active == True)
+        select(Practitioner).where(Practitioner.bookable())
     )).scalars().all()
 
     start_of_day = datetime.combine(parsed_date, time(0, 0), tzinfo=JST)

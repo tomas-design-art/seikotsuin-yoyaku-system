@@ -139,7 +139,7 @@ async def _practitioner_facts(db: AsyncSession, start: date, horizon_days: int) 
     practitioners = (
         await db.execute(
             select(Practitioner)
-            .where(Practitioner.is_active == True)
+            .where(Practitioner.bookable())
             .order_by(Practitioner.display_order)
         )
     ).scalars().all()

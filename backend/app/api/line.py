@@ -586,7 +586,7 @@ async def _resolve_booking_defaults(
     director = (
         await db.execute(
             select(Practitioner)
-            .where(Practitioner.is_active == True, Practitioner.role == "院長")
+            .where(Practitioner.bookable(), Practitioner.role == "院長")
             .order_by(Practitioner.display_order)
         )
     ).scalars().first()
@@ -2080,7 +2080,7 @@ async def _extract_requested_practitioner(
     practitioners = [
         p
         for p in (
-            await db.execute(select(Practitioner).where(Practitioner.is_active == True))
+            await db.execute(select(Practitioner).where(Practitioner.bookable()))
         ).scalars().all()
         if p.name
     ]
@@ -4499,7 +4499,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         director = (
             await db.execute(
                 select(Practitioner)
-                .where(Practitioner.is_active == True, Practitioner.role == "院長")
+                .where(Practitioner.bookable(), Practitioner.role == "院長")
                 .order_by(Practitioner.display_order)
             )
         ).scalars().first()

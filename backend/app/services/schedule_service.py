@@ -237,7 +237,7 @@ async def find_transfer_candidates(
     result = await db.execute(
         select(Practitioner).where(
             and_(
-                Practitioner.is_active == True,
+                Practitioner.bookable(),
                 Practitioner.id != practitioner_id,
             )
         ).order_by(Practitioner.display_order)

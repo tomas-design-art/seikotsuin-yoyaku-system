@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, and_
 from sqlalchemy.sql import func
 
 from app.database import Base
@@ -16,3 +16,14 @@ class Practitioner(Base):
     display_order = Column(Integer, default=0)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    @classmethod
+    def bookable(cls):
+        """自動で予約を割り当ててよい施術者（有効かつ表示）。
+
+        非表示の施術者はタイムテーブルに列が出ないので、自動で予約を入れると誰の画面にも出ない
+        （2026-09-19、非表示のバイトに土曜の勤務チェックが入っていて、ホットペッパーと
+        ホームページの予約が入った）。予約画面で人が選べる施術者（有効かつ表示）と同じ条件にする。
+        表示にした時点で、勤務スケジュールでチェックした曜日の枠が開く。
+        """
+        return and_(cls.is_active == True, cls.is_visible == True)  # noqa: E712

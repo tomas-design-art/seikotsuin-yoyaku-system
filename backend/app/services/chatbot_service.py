@@ -154,7 +154,7 @@ async def tool_check_availability(
 
     # アクティブな施術者を取得
     prac_result = await db.execute(
-        select(Practitioner).where(Practitioner.is_active == True)
+        select(Practitioner).where(Practitioner.bookable())
     )
     practitioners = prac_result.scalars().all()
     if not practitioners:

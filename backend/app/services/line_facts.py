@@ -181,7 +181,7 @@ async def _upcoming_reservation_facts(db: AsyncSession, patient_id: int) -> list
 
 async def _find_mentioned_practitioner(db: AsyncSession, text: str) -> Practitioner | None:
     practitioners = (
-        await db.execute(select(Practitioner).where(Practitioner.is_active == True))
+        await db.execute(select(Practitioner).where(Practitioner.bookable()))
     ).scalars().all()
     for practitioner in practitioners:
         name = (practitioner.name or "").strip()
