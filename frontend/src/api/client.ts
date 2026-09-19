@@ -92,6 +92,8 @@ api.interceptors.response.use(
 
 // ---- Practitioners ----
 export const getPractitioners = () => api.get<Practitioner[]>('/practitioners/');
+export const reorderPractitioners = (items: { id: number; display_order: number }[]) =>
+  api.put<Practitioner[]>('/practitioners/reorder', items);
 export const createPractitioner = (data: Partial<Practitioner>) =>
   api.post<Practitioner>('/practitioners/', data);
 export const updatePractitioner = (id: number, data: Partial<Practitioner>) =>

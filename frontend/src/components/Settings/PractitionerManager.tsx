@@ -1,9 +1,9 @@
 import HelpTip, { HelpNotice } from '../HelpTip';
 import { PRACTITIONER_VISIBILITY_NOTICE } from '../../help/helpContent';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { Plus, Edit2, Trash2, GripVertical, Eye, EyeOff } from 'lucide-react';
 import type { Practitioner } from '../../types';
-import { getPractitioners, createPractitioner, updatePractitioner, deletePractitioner, purgePractitioner, getSettings } from '../../api/client';
+import { getPractitioners, createPractitioner, updatePractitioner, deletePractitioner, purgePractitioner, getSettings, reorderPractitioners } from '../../api/client';
 import { extractErrorMessage } from '../../utils/errorUtils';
 
 const DEFAULT_ROLES = ['院長', '施術者'];
@@ -18,6 +18,10 @@ export default function PractitionerManager() {
   const [dailyReportCode, setDailyReportCode] = useState('');
   const [editingWasInactive, setEditingWasInactive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 並び替え（タイムテーブルの列の順番・指名なしのホットペッパー予約を入れる順番になる）
+  const [reordering, setReordering] = useState(false);
+  const [dragIdx, setDragIdx] = useState<number | null>(null);
+  const dragItem = useRef<number | null>(null);
 
   const fetchData = async () => {
     try {
@@ -101,6 +105,38 @@ export default function PractitionerManager() {
     }
   };
 
+  const handleDragStart = useCallback((index: number) => {
+    dragItem.current = index;
+    setDragIdx(index);
+  }, []);
+
+  const handleDragEnter = useCallback((index: number) => {
+    if (dragItem.current === null || dragItem.current === index) return;
+    setPractitioners((prev) => {
+      const updated = [...prev];
+      const [dragged] = updated.splice(dragItem.current!, 1);
+      updated.splice(index, 0, dragged);
+      dragItem.current = index;
+      return updated;
+    });
+  }, []);
+
+  const handleDragEnd = useCallback(() => {
+    dragItem.current = null;
+    setDragIdx(null);
+  }, []);
+
+  const saveReorder = async () => {
+    setError(null);
+    try {
+      const res = await reorderPractitioners(practitioners.map((p, i) => ({ id: p.id, display_order: i })));
+      setPractitioners(res.data ?? []);
+      setReordering(false);
+    } catch (err) {
+      setError(extractErrorMessage(err, '並び替えの保存に失敗しました'));
+    }
+  };
+
   const handlePermanentDelete = async (id: number) => {
     const confirmed = window.confirm('本当に削除しますか？\n削除されたデータは復元できません。');
     if (!confirmed) return;
@@ -116,12 +152,30 @@ export default function PractitionerManager() {
     <div className="max-w-2xl mx-auto p-6">
       <div className="flex items-center justify-between mb-6">
         <h1 className="text-2xl font-bold flex items-center gap-2">施術者管理 <HelpTip helpKey="practitioners" /></h1>
-        <button
-          onClick={() => { setShowForm(true); setEditingId(null); setName(''); setRole(roles[0] || ''); setDailyReportCode(''); setEditingWasInactive(false); }}
-          className="flex items-center gap-1 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
-        >
-          <Plus size={16} /> 追加
-        </button>
+        <div className="flex gap-2">
+          {reordering ? (
+            <>
+              <button onClick={saveReorder} className="px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600 text-sm">
+                並び順を保存
+              </button>
+              <button onClick={() => { setReordering(false); fetchData(); }} className="px-4 py-2 border rounded hover:bg-gray-100 text-sm">
+                キャンセル
+              </button>
+            </>
+          ) : (
+            <>
+              <button onClick={() => { setReordering(true); setShowForm(false); }} className="flex items-center gap-1 px-4 py-2 border rounded hover:bg-gray-100 text-sm">
+                <GripVertical size={16} /> 並び替え
+              </button>
+              <button
+                onClick={() => { setShowForm(true); setEditingId(null); setName(''); setRole(roles[0] || ''); setDailyReportCode(''); setEditingWasInactive(false); }}
+                className="flex items-center gap-1 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
+              >
+                <Plus size={16} /> 追加
+              </button>
+            </>
+          )}
+        </div>
       </div>
 
       <HelpNotice>{PRACTITIONER_VISIBILITY_NOTICE}</HelpNotice>
@@ -171,10 +225,29 @@ export default function PractitionerManager() {
         {practitioners.length === 0 && (
           <p className="text-center text-gray-400 text-sm py-8">施術者が登録されていません</p>
         )}
-        {practitioners.map((p) => (
-          <div key={p.id} className={`flex items-center justify-between p-3 bg-white rounded border ${!p.is_active ? 'opacity-50' : ''}`}>
+        {reordering ? (
+          <p className="text-sm text-blue-700 bg-blue-50 border border-blue-200 rounded px-3 py-2">
+            先生の行をつかんで上下に動かし、「並び順を保存」を押してください。この順番が、タイムテーブルの列の順番と、指名なしのホットペッパー予約を入れる順番（同じ役割の中で）になります。
+          </p>
+        ) : practitioners.length > 0 && (
+          <div className="flex justify-end gap-1 pr-3 text-[11px] font-medium text-gray-500">
+            <span className="w-10 text-center">表示</span>
+            <span className="w-10 text-center">編集</span>
+            <span className="w-10 text-center">削除</span>
+          </div>
+        )}
+        {practitioners.map((p, idx) => (
+          <div
+            key={p.id}
+            draggable={reordering}
+            onDragStart={() => handleDragStart(idx)}
+            onDragEnter={() => handleDragEnter(idx)}
+            onDragEnd={handleDragEnd}
+            onDragOver={(e) => e.preventDefault()}
+            className={`flex items-center justify-between p-3 bg-white rounded border ${!p.is_active ? 'opacity-50' : ''} ${reordering ? 'cursor-grab active:cursor-grabbing' : ''} ${dragIdx === idx ? 'opacity-40 border-blue-400' : ''}`}
+          >
             <div className="flex items-center gap-3">
-              <GripVertical size={16} className="text-gray-400" />
+              {reordering && <GripVertical size={16} className="text-gray-400" />}
               <div>
                 <span className="font-medium">{p.name}</span>
                 <span className="ml-2 text-sm text-gray-500">({p.role})</span>
@@ -183,30 +256,34 @@ export default function PractitionerManager() {
                 {p.is_active && !p.is_visible && <span className="ml-2 text-xs bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded">非表示</span>}
               </div>
             </div>
+            {!reordering && (
             <div className="flex gap-1">
-              {p.is_active && (
+              {p.is_active ? (
                 <button
                   onClick={() => handleToggleVisible(p)}
-                  className={`p-1.5 rounded ${p.is_visible ? 'hover:bg-gray-100 text-blue-500' : 'hover:bg-gray-100 text-gray-400'}`}
+                  className={`w-10 flex justify-center p-1.5 rounded ${p.is_visible ? 'hover:bg-gray-100 text-blue-500' : 'hover:bg-gray-100 text-gray-400'}`}
                   title={p.is_visible ? '予約画面に表示中' : '予約画面で非表示'}
                 >
                   {p.is_visible ? <Eye size={14} /> : <EyeOff size={14} />}
                 </button>
+              ) : (
+                <span className="w-10" />
               )}
-              <button onClick={() => handleEdit(p)} className="p-1.5 hover:bg-gray-100 rounded" title="編集">
+              <button onClick={() => handleEdit(p)} className="w-10 flex justify-center p-1.5 hover:bg-gray-100 rounded" title="編集">
                 <Edit2 size={14} />
               </button>
               {p.is_active && (
-                <button onClick={() => handleDelete(p.id)} className="p-1.5 hover:bg-red-50 text-red-500 rounded" title="無効化">
+                <button onClick={() => handleDelete(p.id)} className="w-10 flex justify-center p-1.5 hover:bg-red-50 text-red-500 rounded" title="無効化">
                   <Trash2 size={14} />
                 </button>
               )}
               {!p.is_active && (
-                <button onClick={() => handlePermanentDelete(p.id)} className="p-1.5 hover:bg-red-50 text-red-600 rounded" title="完全削除">
+                <button onClick={() => handlePermanentDelete(p.id)} className="w-10 flex justify-center p-1.5 hover:bg-red-50 text-red-600 rounded" title="完全削除">
                   <Trash2 size={14} />
                 </button>
               )}
             </div>
+            )}
           </div>
         ))}
       </div>

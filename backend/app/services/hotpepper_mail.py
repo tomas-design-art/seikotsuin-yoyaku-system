@@ -27,6 +27,8 @@ from app.services.schedule_service import is_practitioner_working
 from app.database import async_session
 from app.utils.datetime_jst import JST
 
+from app.models.reservation_color import HOTPEPPER_COLOR_CODE  # noqa: E402
+
 logger = logging.getLogger(__name__)
 
 PROCESSED_MID_HASHES_KEY = "hotpepper_processed_mid_hashes"
@@ -34,7 +36,7 @@ FAILED_MID_COUNTS_KEY = "hotpepper_failed_mid_counts"
 MAX_PROCESSED_HASHES = 1000
 MAX_FAILED_TRACKED = 2000
 DEAD_LETTER_RETRY_LIMIT = 3
-HOTPEPPER_FIXED_COLOR_CODE = "#f2740d"
+HOTPEPPER_FIXED_COLOR_CODE = HOTPEPPER_COLOR_CODE
 HOTPEPPER_MENU_NAME = "ホットペッパー"
 
 

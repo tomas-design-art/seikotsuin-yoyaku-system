@@ -8,6 +8,7 @@ from app.models.patient import Patient
 from app.models.reservation import Reservation
 from app.schemas.practitioner import PractitionerCreate, PractitionerUpdate, PractitionerResponse
 from app.api.auth import require_admin
+from pydantic import BaseModel
 
 router = APIRouter(prefix="/api/practitioners", tags=["practitioners"])
 
@@ -27,6 +28,28 @@ async def create_practitioner(data: PractitionerCreate, db: AsyncSession = Depen
     await db.commit()
     await db.refresh(practitioner)
     return practitioner
+
+
+class PractitionerOrderItem(BaseModel):
+    id: int
+    display_order: int
+
+
+@router.put("/reorder", response_model=list[PractitionerResponse])
+async def reorder_practitioners(
+    items: list[PractitionerOrderItem], db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_admin)
+):
+    """並び順を保存する。タイムテーブルの列の順番と、指名なしのホットペッパー予約を
+    どの先生から入れるか（同じ役割の中での順番）に効く。
+    ※ /{practitioner_id} より前に置く（後ろだと "reorder" が id として解釈される）。
+    """
+    for item in items:
+        await db.execute(
+            sa_update(Practitioner).where(Practitioner.id == item.id).values(display_order=item.display_order)
+        )
+    await db.commit()
+    result = await db.execute(select(Practitioner).order_by(Practitioner.display_order, Practitioner.id))
+    return result.scalars().all()
 
 
 @router.put("/{practitioner_id}", response_model=PractitionerResponse)

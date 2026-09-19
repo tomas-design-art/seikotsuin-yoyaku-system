@@ -245,6 +245,26 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
   }, [weekVisiblePractitioners.length]);
 
   const goToday = () => setCurrentDate(getTodayJST());
+
+  // 「現時刻」：今日に戻り、いまの時刻の「時」の頭（15:11 なら 15:00）が一番上に来るようにスクロールする
+  const [scrollToNowRequest, setScrollToNowRequest] = useState(0);
+  const goNow = () => {
+    setCurrentDate(getTodayJST());
+    setNowMinutes(getNowJSTMinutes());
+    setScrollToNowRequest((n) => n + 1);
+  };
+  useEffect(() => {
+    if (scrollToNowRequest === 0) return;
+    const frame = requestAnimationFrame(() => {
+      if (!gridRef.current) return;
+      const hourStart = Math.floor(getNowJSTMinutes() / 60) * 60;
+      const target = Math.min(Math.max(hourStart, dayStart), dayEnd);
+      gridRef.current.scrollTop = ((target - dayStart) / SLOT_INTERVAL) * slotHeight;
+    });
+    return () => cancelAnimationFrame(frame);
+    // 押したときだけ動かす（拡大・縮小や日付の移動では動かさない）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scrollToNowRequest]);
   const goPrev = () => {
     const d = new Date(currentDate);
     d.setDate(d.getDate() - (viewMode === 'day' ? 1 : 7));
@@ -982,6 +1002,7 @@ export default function TimeTable({ onSlotClick, onDragSelect, onReservationClic
             })()}
           </div>
           <button onClick={goToday} className="ml-1 md:ml-2 px-2 md:px-3 py-1 text-xs md:text-sm bg-blue-500 text-white rounded hover:bg-blue-600">今日</button>
+          <button onClick={goNow} className="ml-1 px-2 md:px-3 py-1 text-xs md:text-sm bg-red-500 text-white rounded hover:bg-red-600 whitespace-nowrap" title="今日のいまの時刻（赤い線）まで移動">現時刻</button>
           <span className="ml-1 shrink-0"><HelpTip helpKey="timetable" /></span>
           {/* Zoom controls */}
           <div className="flex items-center gap-0.5 ml-2 border-l pl-2 border-gray-200">

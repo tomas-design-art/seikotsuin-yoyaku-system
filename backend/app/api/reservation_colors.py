@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update as sa_update
 
 from app.database import get_db
-from app.models.reservation_color import ReservationColor
+from app.models.reservation_color import ReservationColor, is_hotpepper_color_code
 from app.models.reservation import Reservation
 from app.schemas.reservation_color import (
     ReservationColorCreate,
@@ -14,6 +14,9 @@ from app.schemas.reservation_color import (
 from app.api.auth import require_admin
 
 router = APIRouter(prefix="/api/reservation-colors", tags=["reservation-colors"])
+
+_HOTPEPPER_LOCKED = "ホットペッパー予約の色は、ホットペッパーからの予約を見分ける目印なので変更・削除できません"
+_HOTPEPPER_RESERVED = "この色コードはホットペッパー予約専用です。別の色を選んでください"
 
 
 @router.get("/", response_model=list[ReservationColorResponse])
@@ -26,6 +29,8 @@ async def list_colors(db: AsyncSession = Depends(get_db)):
 
 @router.post("/", response_model=ReservationColorResponse, status_code=201)
 async def create_color(data: ReservationColorCreate, db: AsyncSession = Depends(get_db), _auth: dict = Depends(require_admin)):
+    if is_hotpepper_color_code(data.color_code):
+        raise HTTPException(status_code=400, detail=_HOTPEPPER_RESERVED)
     if data.is_default:
         # 他のデフォルトを解除
         await db.execute(
@@ -46,8 +51,12 @@ async def update_color(
     color = result.scalar_one_or_none()
     if not color:
         raise HTTPException(status_code=404, detail="色設定が見つかりません")
+    if is_hotpepper_color_code(color.color_code):
+        raise HTTPException(status_code=400, detail=_HOTPEPPER_LOCKED)
 
     update_data = data.model_dump(exclude_unset=True)
+    if is_hotpepper_color_code(update_data.get("color_code")):
+        raise HTTPException(status_code=400, detail=_HOTPEPPER_RESERVED)
 
     if update_data.get("is_default"):
         # 他のデフォルトを解除
@@ -71,6 +80,8 @@ async def delete_color(color_id: int, db: AsyncSession = Depends(get_db), _auth:
     if not color:
         raise HTTPException(status_code=404, detail="色設定が見つかりません")
 
+    if is_hotpepper_color_code(color.color_code):
+        raise HTTPException(status_code=400, detail=_HOTPEPPER_LOCKED)
     if color.is_default:
         raise HTTPException(status_code=400, detail="デフォルト色は削除できません")
 

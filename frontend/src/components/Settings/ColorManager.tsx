@@ -13,6 +13,11 @@ const FIXED_WARNING_COLORS = [
     { name: '仮予約', color_code: '#EAB308' },
 ];
 
+// ホットペッパーのメール取り込みが予約に付ける色（backend/app/models/reservation_color.py の HOTPEPPER_COLOR_CODE）。
+// 取り込みはこの色コードで色を探すので、画面からは変更・削除できないようにしている（予約システム側でも拒否）。
+const HOTPEPPER_COLOR_CODE = '#f2740d';
+const isHotpepperColor = (code: string) => code.trim().toLowerCase() === HOTPEPPER_COLOR_CODE;
+
 export default function ColorManager() {
     const [colors, setColors] = useState<ReservationColor[]>([]);
     const [editingId, setEditingId] = useState<number | null>(null);
@@ -168,6 +173,15 @@ export default function ColorManager() {
                                 <span className="w-6 h-6 rounded-full flex-shrink-0" style={{ backgroundColor: c.color_code }} />
                                 <span className="flex-1 font-medium text-sm">{c.name}</span>
                                 <span className="text-xs font-mono text-gray-500">{c.color_code}</span>
+                                {isHotpepperColor(c.color_code) ? (
+                                    <span
+                                        className="px-2 py-0.5 bg-orange-50 text-orange-700 border border-orange-200 text-xs rounded-full whitespace-nowrap"
+                                        title="ホットペッパーからの予約を見分ける目印なので、変更・削除できません"
+                                    >
+                                        🔒 ホットペッパー取り込み用（変更不可）
+                                    </span>
+                                ) : (
+                                <>
                                 {c.is_default ? (
                                     <span className="px-2 py-0.5 bg-blue-100 text-blue-700 text-xs rounded-full">デフォルト</span>
                                 ) : (
@@ -185,6 +199,8 @@ export default function ColorManager() {
                                     <button onClick={() => handleDelete(c.id)} className="p-1 text-red-400 hover:bg-red-50 rounded">
                                         <Trash2 size={14} />
                                     </button>
+                                )}
+                                </>
                                 )}
                             </>
                         )}
