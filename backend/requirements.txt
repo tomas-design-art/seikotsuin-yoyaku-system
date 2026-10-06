@@ -1,20 +1,71 @@
-fastapi>=0.100.0
-uvicorn[standard]>=0.23.0
-sqlalchemy[asyncio]>=2.0.0
-asyncpg>=0.28.0
-alembic>=1.12.0
-pydantic>=2.0.0
-pydantic-settings>=2.0.0
-python-dotenv>=1.0.0
-httpx>=0.25.0
-sse-starlette>=1.6.0
-apscheduler>=3.10.0
-python-jose[cryptography]>=3.3.0
-passlib[bcrypt]>=1.7.4
+# -*- coding: utf-8 -*-
+# ↑ 消さない。無いと Windows の pip がこのファイルを cp932 で読み、日本語のコメントで UnicodeDecodeError になる。
+#
+# 本番（Render）に入れるパッケージ。版はすべて == で固定する（2026-10-06）。
+#
+# なぜ固定するか: pip には npm の min-release-age（公開から7日未満の版を入れない）にあたる仕組みが無い。
+#   Render はデプロイのたびに `pip install -r requirements.txt` するので、固定しないと出たばかりの版が黙って入る。
+# 版の出どころ: 2026-10-06 に本番（yoyaku-backend）の Shell で `pip freeze` した版をそのまま使った。
+#   どれも PyPI の公開から7日以上たっていることを確かめた（一番新しい idna 3.20 で 18.8 日）。
+# 版を上げるときは:
+#   1. PyPI でその版の公開日を見て、7日以上たった版だけにする
+#   2. 直接使うものだけでなく、下の「その依存」も固定する（固定しないと、そこから新しい版が入る）
+#   3. 新しい venv に `pip install -r requirements-dev.txt` → `pip check` → テスト
+# テストだけで使うもの（pytest など）は requirements-dev.txt に置く。
+
+# ── アプリが直接使うもの ──
+fastapi==0.141.1
+uvicorn[standard]==0.53.0
+sqlalchemy[asyncio]==2.0.54
+asyncpg==0.31.0
+alembic==1.20.0
+pydantic==2.13.5
+pydantic-settings==2.15.0
+python-dotenv==1.2.3
+httpx==0.28.1
+sse-starlette==3.4.11
+apscheduler==3.11.3
+python-jose[cryptography]==3.5.0
+passlib[bcrypt]==1.7.4
+# bcrypt 5.0.0 だと passlib 1.7.4 のハッシュ作成が ValueError で落ちる（2026-10-06 手元で確認）
 bcrypt==4.0.1
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-aiosqlite>=0.19.0
-openpyxl>=3.1.0
-python-multipart>=0.0.6
-holidays>=0.40
+openpyxl==3.1.5
+python-multipart==0.0.32
+holidays==0.104
+
+# ── その依存（直接は使わない）──
+annotated-doc==0.0.5        # fastapi
+annotated-types==0.8.0      # pydantic
+anyio==4.15.1               # httpx, starlette, sse-starlette, watchfiles
+certifi==2026.7.22          # httpx, httpcore
+cffi==2.1.1                 # cryptography
+click==8.5.0                # uvicorn
+cryptography==50.0.1        # python-jose[cryptography]
+ecdsa==0.19.2               # python-jose
+et-xmlfile==2.0.0           # openpyxl
+greenlet==3.5.6             # sqlalchemy[asyncio]
+h11==0.16.0                 # uvicorn, httpcore
+httpcore==1.0.9             # httpx
+httptools==0.8.0            # uvicorn[standard]
+idna==3.20                  # anyio, httpx
+mako==1.4.1                 # alembic
+markupsafe==3.0.3           # mako
+pyasn1==0.6.4               # python-jose, rsa
+pycparser==3.0              # cffi
+pydantic-core==2.46.5       # pydantic
+python-dateutil==2.9.0.post0  # holidays
+pyyaml==6.0.3               # uvicorn[standard]
+rsa==4.9.1                  # python-jose
+six==1.17.0                 # ecdsa, python-dateutil
+starlette==1.6.0            # fastapi, sse-starlette
+typing-extensions==4.16.0   # pydantic, fastapi, sqlalchemy ほか
+typing-inspection==0.4.4    # pydantic, fastapi, pydantic-settings
+tzlocal==5.4.4              # apscheduler
+watchfiles==1.2.0           # uvicorn[standard]
+websockets==17.1            # uvicorn[standard]
+
+# OS によって入るもの（条件は uvicorn・tzlocal 自身が付けている条件と同じ）
+# uvloop: uvicorn[standard] の依存。本番（Linux）で使う。Windows には入らない
+uvloop==0.22.1 ; sys_platform != "win32" and sys_platform != "cygwin" and platform_python_implementation != "PyPy"
+# tzdata: tzlocal の依存。手元の Windows だけ（本番は OS の時刻データを使う）
+tzdata==2025.3 ; platform_system == "Windows"

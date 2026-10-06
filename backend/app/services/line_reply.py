@@ -4,11 +4,18 @@ import httpx
 from typing import Optional
 
 from app.config import settings
+from app.services import autopilot_log
 
 logger = logging.getLogger(__name__)
 
 
 async def _post_line_reply(reply_token: str, messages: list[dict]) -> bool:
+    ok = await _send_line_reply(reply_token, messages)
+    autopilot_log.note_send(via="reply", to=None, messages=messages, ok=ok)
+    return ok
+
+
+async def _send_line_reply(reply_token: str, messages: list[dict]) -> bool:
     if not settings.line_channel_access_token or settings.line_channel_access_token == "xxx":
         logger.warning("LINE access token not configured, skipping reply")
         return False
@@ -61,6 +68,17 @@ async def push_message(user_id: str, message: str) -> bool:
 
 async def push_text_with_quick_reply(user_id: str, message: str, items: list[dict]) -> bool:
     """LINE QuickReply付きプッシュメッセージ"""
+    ok = await _send_push_text_with_quick_reply(user_id, message, items)
+    autopilot_log.note_send(
+        via="push",
+        to=user_id,
+        messages=[{"type": "text", "text": message, "quickReply": {"items": items}}],
+        ok=ok,
+    )
+    return ok
+
+
+async def _send_push_text_with_quick_reply(user_id: str, message: str, items: list[dict]) -> bool:
     if not settings.line_channel_access_token or settings.line_channel_access_token == "xxx":
         logger.warning("LINE access token not configured, skipping push")
         return False
@@ -93,6 +111,12 @@ async def push_text_with_quick_reply(user_id: str, message: str, items: list[dic
 
 async def push_message_with_access_token(user_id: str, message: str, access_token: str | None) -> bool:
     """任意トークンでLINEプッシュメッセージ"""
+    ok = await _send_push_message_with_access_token(user_id, message, access_token)
+    autopilot_log.note_send(via="push", to=user_id, messages=[{"type": "text", "text": message}], ok=ok)
+    return ok
+
+
+async def _send_push_message_with_access_token(user_id: str, message: str, access_token: str | None) -> bool:
     if not access_token or access_token == "xxx":
         logger.warning("LINE access token not configured, skipping push")
         return False
@@ -135,6 +159,17 @@ async def reply_flex_message(reply_token: str, alt_text: str, contents: dict) ->
 
 async def push_flex_message(user_id: str, alt_text: str, contents: dict) -> bool:
     """LINE Messaging APIでFlexプッシュ"""
+    ok = await _send_push_flex_message(user_id, alt_text, contents)
+    autopilot_log.note_send(
+        via="push",
+        to=user_id,
+        messages=[{"type": "flex", "altText": alt_text, "contents": contents}],
+        ok=ok,
+    )
+    return ok
+
+
+async def _send_push_flex_message(user_id: str, alt_text: str, contents: dict) -> bool:
     if not settings.line_channel_access_token or settings.line_channel_access_token == "xxx":
         logger.warning("LINE access token not configured, skipping flex push")
         return False
