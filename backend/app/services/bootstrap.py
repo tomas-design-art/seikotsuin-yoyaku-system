@@ -17,6 +17,7 @@ def _import_all_models() -> None:
         "app.models.audit_log",
         "app.models.chat_session",
         "app.models.date_override",
+        "app.models.line_autopilot_log",
         "app.models.line_user_state",
         "app.models.menu",
         "app.models.notification_log",

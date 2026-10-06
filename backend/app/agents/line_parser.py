@@ -469,7 +469,7 @@ async def parse_line_message(
     fallback = _rule_based_parse(message, profile_name=profile_name, previous=previous, menu_names=menu_names)
     from app.config import settings
     if not settings.gemini_api_key:
-        return _normalize_result(fallback, profile_name, previous)
+        return _noted(message, "rule", _normalize_result(fallback, profile_name, previous))
     try:
         result = _normalize_result(
             await _ai_parse(
@@ -488,14 +488,30 @@ async def parse_line_message(
                 result[key] = rule_result[key]
         result["constraints"] = list(dict.fromkeys([*result["constraints"], *rule_result["constraints"]]))
         result["missing_fields"] = _compute_missing_fields(result)
-        return result
+        return _noted(message, "ai", result)
     except Exception as e:
         logger.error(f"AI parse failed: {e}")
-        return _normalize_result(fallback, profile_name, previous)
+        return _noted(message, "rule_after_ai_error", _normalize_result(fallback, profile_name, previous), error=str(e))
+
+
+def _noted(message: str, source: str, result: dict, error: str | None = None) -> dict:
+    """LINE自動予約の記録に、何を受け取りどう読んだかを残す（記録中でなければ何もしない）。"""
+    from app.services import autopilot_log
+
+    autopilot_log.note("parse", input=message, source=source, result=result, error=error)
+    return result
 
 
 async def classify_conversation_control(message: str, phase: str) -> dict:
     """自然文から会話の継続・やり直し・中止だけを判定する。"""
+    result = await _classify_conversation_control(message, phase)
+    from app.services import autopilot_log
+
+    autopilot_log.note("control", input=message, phase=phase, result=result)
+    return result
+
+
+async def _classify_conversation_control(message: str, phase: str) -> dict:
     safe_fallback_actions = {
         "本人確認をやり直す": "restart_identity",
         "予約を最初からやり直す": "restart_booking",

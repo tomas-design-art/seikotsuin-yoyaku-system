@@ -39,7 +39,7 @@ from app.services.line_composer import (
     has_opening_greeting,
     strip_opening_greeting,
 )
-from app.services import confirmation, offered_slots
+from app.services import autopilot_log, confirmation, offered_slots
 from app.services.reply_plan import ReplyPlan, plan_for
 from app.services.line_debounce import clear_debounce, is_duplicate_message, merge_debounced_message
 from app.services.line_inbox import (
@@ -1086,6 +1086,7 @@ async def _polished_from_plan(plan: ReplyPlan) -> str:
 
 async def _reply_plan(reply_token: str | None, form: str, plan: ReplyPlan) -> None:
     """骨格から文面を作って送る。整え方が骨格を壊していれば骨格をそのまま送る。"""
+    autopilot_log.note("plan", form=form, plan=plan)
     if not reply_token:
         return
     await reply_text_with_quick_reply(
@@ -1516,6 +1517,8 @@ async def _compose_autopilot_reply(
     context: dict,
     parsed: dict | None = None,
 ) -> str:
+    # どの場面として返信を作り、AIに何を事実として渡したか（LINE自動予約の記録）
+    autopilot_log.note("situation", name=situation, facts=context)
     db = _AUTOPILOT_DB_CONTEXT.get()
     user_id = _AUTOPILOT_USER_CONTEXT.get()
     enriched_context = dict(context)
@@ -2260,6 +2263,7 @@ async def _handoff_autopilot_to_human(
     notification: str,
 ) -> None:
     """手動退避は最後の手段。理由はLLMへ渡さず、引き継ぎだけ伝える。"""
+    autopilot_log.note("handoff", notification=notification)
     await set_user_mode(db, user_id, "manual")
     await create_notification(db, "line_manual_mode", notification)
     if reply_token:
@@ -5212,10 +5216,17 @@ async def _notify_webhook_failure(event: dict, error: Exception) -> None:
 async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
     event_context = _LINE_WEBHOOK_EVENT_ID.set(event.get("webhookEventId"))
     try:
-        if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
-            await _handle_text_message(event, db)
-        elif event.get("type") == "postback":
-            await _handle_postback(event, db)
+        # LINE自動予約の記録。autopilot の人と登録の途中の人の分だけ、1通ごとに1行残す
+        async with autopilot_log.recording(
+            event,
+            db,
+            setup_modes=_AUTOPILOT_SETUP_MODES,
+            setup_keyword=AUTOPILOT_SETUP_KEYWORD,
+        ):
+            if event.get("type") == "message" and event.get("message", {}).get("type") == "text":
+                await _handle_text_message(event, db)
+            elif event.get("type") == "postback":
+                await _handle_postback(event, db)
     finally:
         _LINE_WEBHOOK_EVENT_ID.reset(event_context)
 
