@@ -126,18 +126,37 @@ async def test_choosing_a_menu_by_name_does_not_ask_about_the_usual_menu():
     assert state["draft"]["menu_name"] == menus["extension"]
 
 
-# ─── D11：メニューを聞くボタンも3つまで ───
+# ─── D7・D11：ボタンは候補と、はい／いいえだけ。メニューは「⭐️いつもの」だけ（まことさん 2026-10-07） ───
 
 
 @pytest.mark.asyncio
-async def test_the_menu_question_shows_at_most_three_buttons():
+async def test_the_menu_question_offers_only_the_usual_button():
+    """メニューを全部ボタンで並べない（ホットペッパー等も出てしまう・スクロールが要る）。「⭐️いつもの」だけ。"""
     async with clinic() as (sessions, ids):
         uid, patient_id = await _patient(sessions)
-        await _menus_and_usual(sessions, ids, patient_id)
+        menus = await _menus_and_usual(sessions, ids, patient_id)
 
         sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
 
-    assert 1 <= len(_buttons(sent)) <= 3
+    buttons = _buttons(sent)
+    assert len(buttons) == 1
+    assert "いつもの" in buttons[0]["label"]
+    assert not any(menus["extension"] in (button.get("label") or "") for button in buttons)
+
+
+@pytest.mark.asyncio
+async def test_a_patient_without_a_usual_menu_gets_no_menu_buttons():
+    """「いつもの」が無い人には、メニューのボタンを出さない（文字で受ける）。返信そのものは届く。"""
+    async with clinic() as (sessions, ids):
+        uid, _patient_id = await _patient(sessions)
+        async with sessions() as db:
+            db.add(Menu(name="保険延長", duration_minutes=30, is_active=True, display_order=1))
+            await db.commit()
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+
+    assert sent, "返信が届いていない"
+    assert _buttons(sent) == []
 
 
 # ─── X6：自動で予約してよい施術時間の下限は20分 ───
@@ -148,3 +167,54 @@ async def test_the_minimum_duration_for_automatic_booking_is_20_minutes_by_defau
     async with clinic() as (sessions, _ids):
         async with sessions() as db:
             assert await clinic_context.get_autopilot_min_duration(db) == 20
+
+
+# ─── C7：メニューは予約の必須条件にしない（まことさん 2026-10-07） ───
+
+
+@pytest.mark.asyncio
+async def test_a_first_visit_patient_can_book_without_choosing_a_menu():
+    """いつものも前回の予約も無い人（初回）は、メニュー名を知らなくても予約できる。
+    初回は60分・院長（A4）なので、メニューも施術時間も聞かずに候補を出し、メニュー無しで確定する
+    （電話予約と同じく、メニューはスタッフが後から入れる＝2026-04-14 の決定）。"""
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        async with sessions() as db:
+            db.add(Menu(name="保険延長", duration_minutes=30, is_active=True, display_order=1))
+            await db.commit()
+
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": day.isoformat()})
+        state = await _state(sessions, uid)
+        assert state["mode"] == "adjusting", "メニューを聞き返して止まっている"
+        offer = state["draft"]["autopilot_offer"]
+        assert offer["candidates"][0]["practitioner_id"] == ids["tokita"]
+
+        from tests.test_line_change_cancel_real_db import tap
+        first = offer["candidates"][0]
+        await tap(sessions, uid, f"action=pick&offer={offer['offer_id']}&index=1")
+        await send(sessions, uid, "はい", YES)
+        async with sessions() as db:
+            from app.models.reservation import Reservation
+
+            booked = (await db.execute(select(Reservation).where(Reservation.patient_id == patient_id))).scalars().all()
+
+    assert len(booked) == 1
+    assert booked[0].menu_id is None
+    assert int((booked[0].end_time - booked[0].start_time).total_seconds() // 60) == 60
+    assert booked[0].practitioner_id == first["practitioner_id"]
+
+
+@pytest.mark.asyncio
+async def test_the_booking_menu_for_a_first_visit_patient_asks_for_a_date_not_a_menu():
+    """リッチメニューの「予約/変更」。いつもの が無い人には、メニュー名ではなく日時を聞く（ボタン無し）。"""
+    async with clinic() as (sessions, _ids):
+        uid, _patient_id = await _patient(sessions)
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+
+    text = _text(sent)
+    assert "メニュー" not in text
+    assert "日時" in text or "日" in text
+    assert _buttons(sent) == []
+

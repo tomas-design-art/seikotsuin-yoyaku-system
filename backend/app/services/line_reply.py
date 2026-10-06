@@ -50,7 +50,9 @@ async def reply_to_line(reply_token: str, message: str) -> bool:
 
 
 async def reply_text_with_quick_reply(reply_token: str, message: str, items: list[dict]) -> bool:
-    """LINE QuickReply付きテキスト返信"""
+    """LINE QuickReply付きテキスト返信。ボタンが無ければ普通の文として送る（空の一覧は LINE が受け付けない）。"""
+    if not items:
+        return await reply_to_line(reply_token, message)
     payload = {
         "type": "text",
         "text": message,
@@ -67,7 +69,9 @@ async def push_message(user_id: str, message: str) -> bool:
 
 
 async def push_text_with_quick_reply(user_id: str, message: str, items: list[dict]) -> bool:
-    """LINE QuickReply付きプッシュメッセージ"""
+    """LINE QuickReply付きプッシュメッセージ。ボタンが無ければ普通の文として送る。"""
+    if not items:
+        return await push_message(user_id, message)
     ok = await _send_push_text_with_quick_reply(user_id, message, items)
     autopilot_log.note_send(
         via="push",
