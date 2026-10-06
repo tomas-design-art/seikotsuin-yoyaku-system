@@ -1,0 +1,22 @@
+# -*- coding: utf-8 -*-
+# ↑ 消さない（理由は requirements.txt の先頭）。
+#
+# テストを回すときに入れるパッケージ（GitHub Actions・手元の venv・docker compose の backend）。
+# 本番（Render）は requirements.txt だけを入れるので、ここに書いたものは本番に入らない。
+# 版の決め方・上げ方は requirements.txt の先頭と同じ（すべて == で固定・公開から7日以上）。
+-r requirements.txt
+
+# ── テストが直接使うもの ──
+pytest==9.1.1
+pytest-asyncio==1.4.0
+aiosqlite==0.22.1           # 一部のテストがメモリ上の SQLite を使う
+
+# ── その依存（直接は使わない）──
+iniconfig==2.3.0            # pytest
+packaging==26.3             # pytest
+pluggy==1.6.0               # pytest
+pygments==2.21.0            # pytest
+
+# OS によって入るもの（条件は pytest 自身が付けている条件と同じ）
+# colorama: pytest の依存。手元の Windows だけ
+colorama==0.4.6 ; sys_platform == "win32"

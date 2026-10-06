@@ -187,3 +187,11 @@
 - 症状: `029_reservation_hotpepper_sync_round`（36文字）で migration を作った。`alembic_version.version_num` は VARCHAR(32) なので、本番の起動時 `alembic upgrade head` で書き込みに失敗するところだった（push 前に気づいた）。
 - 手順: revision は 32 文字以内にする（既存の最長は 32 文字の `009_add_middle_name_reading_mode`）。新しい migration は空の DB で `alembic upgrade head` を通してから push する。
 - 状態: L1（初回記録）
+
+## 2026-10-06: requirements の版を固定したときに踏んだもの
+
+- **日本語コメントで pip が落ちる**: pip 24.0（手元・本番と同じ版）は requirements を、先頭2行に文字コードの宣言が無いと OS の既定（日本語 Windows では cp932）で読む。UTF-8 の日本語コメントで `UnicodeDecodeError` になった（pip の `auto_decode` で再現）。手順: `requirements*.txt` の1行目の `# -*- coding: utf-8 -*-` を消さない。L1。
+- **uvloop が Windows に入らない**: 本番（Linux）の `pip freeze` をそのまま写すと、手元で `uvloop does not support Windows at the moment` で止まる。手順: 本番の freeze から写すときは、OS で入る・入らないが分かれるもの（uvloop・tzdata・colorama）に、その依存元（uvicorn・tzlocal・pytest）と同じ条件（marker）を付け、Windows の新しい venv でも入れて確かめる。L1。
+- **手元の backend/.venv が requirements と食い違っていた**: bcrypt が 5.0.0（固定は 4.0.1）で、passlib 1.7.4 のハッシュ作成が `ValueError: password cannot be longer than 72 bytes` で落ちる。手順: 手元の venv は `pip install -r requirements-dev.txt` で作り直す。状態: 未対応（手元の venv は触っていない）。
+- **使い捨ての PostgreSQL の 55432 番が別の作業で使用中だった**: 動いている `yoyaku-test-pg` は止めずに、別の名前・ポート（例: `yoyaku-pin-pg`・55433）で立てる。
+- 版の固定漏れ（`>=` などで書く）と依存の書き漏れは CI で止める（固定の検査・`pip install --no-deps` → `pip check`）。わざと壊して落ちることを確認済み。L3。

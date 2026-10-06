@@ -47,10 +47,16 @@ jobs:
         with:
           python-version: "3.11" # 本番（render.yaml）は 3.11.9
           cache: pip
-          cache-dependency-path: backend/requirements.txt
-      # Render のビルドと同じ入れ方。requirements.txt は版を固定していないので、
-      # 新しい版が出て壊れたらここで先に分かる
-      - run: pip install -r requirements.txt
+          cache-dependency-path: backend/requirements*.txt
+      # 版の固定漏れを止める。どの行も「名前==版」で書く（>= などで書くと、本番のデプロイで新しい版が黙って入る）
+      - name: requirements の版がすべて固定されているか
+        run: |
+          loose=$(grep -hvE '^[[:space:]]*(#|-r[[:space:]]|$)' requirements.txt requirements-dev.txt | sed 's/[;#].*//' | grep -v '==' || true)
+          if [ -n "$loose" ]; then echo "版が == で固定されていない行:"; echo "$loose"; exit 1; fi
+      # 書いた版だけを入れる（--no-deps）。依存の書き漏れがあると次の pip check で落ちる。
+      # 本番（Render）は requirements.txt を依存つきで入れるが、全部固定してあるので入る版は同じ
+      - run: pip install --no-deps -r requirements-dev.txt
+      - run: pip check
       # マイグレーションが空のDBで最後まで通るか（テスト用とは別のDBで）
       - run: alembic upgrade head
         env:

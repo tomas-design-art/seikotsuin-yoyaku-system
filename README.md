@@ -61,7 +61,7 @@ docker-compose exec backend python scripts/seed.py
 ## テスト実行
 ```bash
 cd backend
-pip install -r requirements.txt
+pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
 
