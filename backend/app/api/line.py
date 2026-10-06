@@ -2942,6 +2942,8 @@ def _date_shift_context(requested_date: date, candidates: list[dict]) -> dict:
     }
 
 
+_LATE_NOTICE = re.compile(r"遅刻|遅れ|遅く(?:な|着)")
+
 _RETRY_GUIDANCE = "理解できなかった場合、お手数ですが最初からやり直してください。"
 _PHONE_GUIDANCE = "お手数ですが、医院に直接お電話ください。"
 
@@ -2959,6 +2961,30 @@ def _chat_change_guidance_plan(reservation_count: int) -> ReplyPlan:
         facts.append("変更をご希望でしたら、どのご予約かと、ご希望の日時をお知らせください。")
     facts.append("それ以外のご相談は、" + _PHONE_GUIDANCE)
     return ReplyPlan(facts=facts, keep=["このチャット", "医院に直接お電話ください"])
+
+
+def _duration_question_plan() -> ReplyPlan:
+    return ReplyPlan(
+        ask="施術時間は何分をご希望ですか？メニューがお決まりでしたら、メニュー名でも承ります。",
+        ask_about="施術時間",
+        keep=["何分"],
+    )
+
+
+def _late_notice_plan(reservation_count: int) -> ReplyPlan:
+    """遅刻の連絡への返事（正解 I4・まことさん 2026-10-07）。
+
+    ちょっとした遅れはただの連絡（施術時間でスタッフが調整する）。後の予約が詰まっていれば
+    施術時間が短くなる場合があることと、大きく遅れるならお時間の変更をこのチャットで受けられることを伝える。
+    """
+    facts = [
+        "ご連絡ありがとうございます。",
+        "後のご予約の状況によっては、施術時間が短くなる場合がございます。",
+        "ご予約のお時間の変更でしたら、このチャットで承れます。",
+    ]
+    if reservation_count > 1:
+        facts.append("変更をご希望でしたら、どのご予約かと、ご希望の日時をお知らせください。")
+    return ReplyPlan(facts=facts, keep=["施術時間が短くなる", "このチャット"])
 
 
 def _phone_guidance_plan() -> ReplyPlan:
@@ -3431,14 +3457,25 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         await set_user_mode(db, user_id, "idle")
         if reply_token:
             quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
-            await reply_text_with_quick_reply(
-                reply_token,
-                await _compose_autopilot_reply(
-                    "ask_menu",
-                    {"patient_name": line_patient.name, "patient_message": text},
-                ),
-                quick_items,
-            )
+            if quick_items:
+                # いつもの がある人：メニューを聞き、「⭐️いつもの」のボタンを添える
+                await reply_text_with_quick_reply(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "ask_menu",
+                        {"patient_name": line_patient.name, "patient_message": text},
+                    ),
+                    quick_items,
+                )
+            else:
+                # いつもの が無い人（初回など）：メニュー名は知らないので聞かない。日時を聞く（正解 C7）
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "ask_datetime",
+                        {"patient_name": line_patient.name, "patient_message": text},
+                    ),
+                )
         return
 
     # 管理者が「自分で返信」を選択したユーザーは自動返信停止
@@ -3586,10 +3623,23 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 # 予約が1件ならその変更を受けられる状態にする。それ以外の相談は電話（まことさん 2026-10-07）。
                 await reset_user_conversation(db, user_id, reason="needs_human")
                 upcoming = await _find_upcoming_reservations(db, line_patient.id)
+                is_late_notice = bool(_LATE_NOTICE.search(text or ""))
                 if len(upcoming) == 1:
-                    await merge_user_draft(db, user_id, {"autopilot_change_reservation_id": upcoming[0].id})
+                    await merge_user_draft(
+                        db,
+                        user_id,
+                        {
+                            "autopilot_change_reservation_id": upcoming[0].id,
+                            "autopilot_change_opened_by": "late_notice" if is_late_notice else "consultation",
+                        },
+                    )
                     await set_user_mode(db, user_id, "autopilot_change_datetime")
-                plan = _chat_change_guidance_plan(len(upcoming)) if upcoming else _phone_guidance_plan()
+                if not upcoming:
+                    plan = _phone_guidance_plan()
+                elif is_late_notice:
+                    plan = _late_notice_plan(len(upcoming))
+                else:
+                    plan = _chat_change_guidance_plan(len(upcoming))
                 if reply_token:
                     await reply_to_line(reply_token, await _polished_from_plan(plan))
                 return
@@ -4310,6 +4360,22 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     await _compose_autopilot_reply("change_target_missing", {"patient_message": text}, parsed),
                 )
             return
+        # 遅刻の連絡への案内のあと、日時を言わない返事（「了解です」「急ぎます」）は、ただの連絡として
+        # 終える。日時を聞き返し続けない（まことさん 2026-10-07：ちょっとした遅れはただの事務連絡）。
+        if (
+            prev_draft.get("autopilot_change_opened_by") == "late_notice"
+            and not parsed.get("date")
+            and not parsed.get("time")
+            and not _has_change_intent(text)
+        ):
+            await reset_user_conversation(db, user_id, reason="late_notice_acknowledged")
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _polished_from_plan(ReplyPlan(facts=["承知いたしました。お気をつけてお越しください。"])),
+                )
+            return
+
         # 提示中の候補への返事（番号・時刻・ボタン）は、保存した候補にだけ照合する（正解 D8）。
         stored_offer = offered_slots.from_draft(prev_draft)
         if stored_offer:
@@ -5053,25 +5119,16 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             },
         )
 
-    if not merged.get("menu_name"):
+    # メニューは予約の必須条件にしない（正解 C7・まことさん 2026-10-07）。患者さんはメニュー名を知らない。
+    # 施術時間が分かっていれば（初回は60分・いつもの・前回・本人が言った）メニュー無しで進め、
+    # メニューはスタッフが後から入れる（電話予約と同じ・2026-04-14 の決定）。
+    # 以前はメニューが空だと聞き返して止まり、初回の人はメニューのボタンでしか先へ進めなかった。
+    if not merged.get("menu_name") and not (is_autopilot_patient and merged.get("duration_minutes")):
         if is_autopilot_patient:
-            await set_user_mode(db, user_id, "idle", user_state.get("request_id"))
+            # 施術時間も分からないときだけ、何分のご希望かを文字で聞く（ボタンにしない＝正解 D7）
+            await set_user_mode(db, user_id, "waiting_time_duration", user_state.get("request_id"))
             if reply_token:
-                quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
-                await reply_text_with_quick_reply(
-                    reply_token,
-                    await _compose_autopilot_reply(
-                        "ask_menu",
-                        {
-                            "patient_name": line_patient.name,
-                            "date": merged.get("date"),
-                            "time": merged.get("time"),
-                            "patient_message": text,
-                        },
-                        parsed_intent,
-                    ),
-                    quick_items,
-                )
+                await reply_to_line(reply_token, await _polished_from_plan(_duration_question_plan()))
             return
         preset = await _get_patient_default_preset(db, line_patient) if is_autopilot_patient else None
         if preset:

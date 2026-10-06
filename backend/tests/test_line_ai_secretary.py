@@ -1679,13 +1679,16 @@ async def test_autopilot_rich_menu_trigger_restarts_booking_instead_of_manual_mo
         "app.api.line.clear_user_draft", new=AsyncMock()
     ) as mock_clear, patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
         "app.api.line._build_menu_quick_reply_items", new=AsyncMock(return_value=[])
-    ), patch("app.api.line.reply_text_with_quick_reply", new=AsyncMock()) as mock_reply:
+    ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply, patch(
+        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご希望の日時を教えていただけますか？")
+    ) as mock_compose:
         await _handle_text_message(event, db)
 
     mock_clear.assert_awaited_once_with(db, "U-autopilot")
     assert mock_set_mode.await_args.args[2] == "idle"
     mock_reply.assert_awaited_once()
-    assert "メニュー" in mock_reply.await_args.args[1]
+    # 「いつもの」が無い人には、メニュー名ではなく日時を聞く（正解 C7・2026-10-07）
+    assert mock_compose.await_args.args[0] == "ask_datetime"
 
 
 @pytest.mark.asyncio
@@ -1717,11 +1720,15 @@ async def test_autopilot_natural_booking_message_restarts_from_manual_mode():
         "app.api.line._get_patient_default_preset",
         new=AsyncMock(return_value={"menu_name": "マッスルセラピー", "duration_minutes": 60, "practitioner_name": "時田"}),
     ), patch("app.api.line._build_menu_quick_reply_items", new=AsyncMock(return_value=[])), patch(
-        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
-    ) as mock_reply:
+        "app.api.line.reply_to_line", new=AsyncMock()
+    ) as mock_reply, patch(
+        "app.api.line._apply_daily_greeting", new=AsyncMock(side_effect=lambda reply: reply)
+    ):
         await _handle_text_message(event, db)
 
-    assert mock_reply.await_args.args[1]
+    # 手動対応から自動の会話に戻り、返信が届く。メニューも施術時間も分からないので、
+    # メニュー名ではなく施術時間を聞く（正解 C7・2026-10-07）
+    assert "施術時間" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio
