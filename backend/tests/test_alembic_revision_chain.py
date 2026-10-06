@@ -56,7 +56,7 @@ def test_alembic_revision_chain_has_expected_single_head():
         if down_revision:
             down_revisions.add(down_revision)
 
-    assert revisions - down_revisions == {"030_line_autopilot_logs"}
+    assert revisions - down_revisions == {"031_autopilot_min_duration_20"}
 
 
 def test_patient_line_id_has_non_unique_lookup_index():

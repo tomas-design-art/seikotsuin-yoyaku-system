@@ -142,6 +142,11 @@ def _offer_plan(context: dict) -> ReplyPlan | None:
     facts: list[str] = []
     keep: list[str] = []
 
+    # 言われた時刻の結果（「13:30〜は空いております」「15:00〜は空きがございません」）を先に置く
+    for key in ("requested_note", "unavailable_note"):
+        if context.get(key):
+            facts.append(str(context[key]))
+
     # 希望の担当を出せていないなら、候補と同じ重みでその事実を先に置く。
     preferred = context.get("preferred_practitioner")
     if isinstance(preferred, dict) and preferred.get("name") and not preferred.get("has_candidate"):
@@ -163,16 +168,22 @@ def _offer_plan(context: dict) -> ReplyPlan | None:
     options: list[str] = []
     for candidate in candidates:
         label = candidate.get("label")
+        start = str(candidate.get("start") or "")
         if not label:
-            label = " ".join(_slot_times(candidate))
+            label = f"{start}〜" if start else ""
         options.append(str(label))
-        keep.extend(_slot_times(candidate))
+        # 開始時刻だけを残させる。終了時刻は言わない（正解 D3）
+        if start:
+            keep.append(f"{start}〜")
 
+    # 候補が3つだけだと「ここしか空いていない」と受け取られるので、ほかの時間も
+    # 選べることを伝える（正解 D5・まことさん 2026-10-07）。空いているとは言わない（事実が無いので）。
+    keep.append("ほかのお時間")
     return ReplyPlan(
         facts=facts,
         options=options,
         note=context.get("first_visit_note"),
-        ask="ご希望の番号を教えていただけますか？",
+        ask="ご希望の番号を教えていただけますか？ほかのお時間をご希望でしたら、お時間をお知らせください。",
         ask_about="番号",
         keep=[term for term in keep if term],
     )

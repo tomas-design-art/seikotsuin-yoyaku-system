@@ -1232,6 +1232,8 @@ async def test_autopilot_cancel_confirmation_accepts_casual_affirmative():
     ), patch("app.api.line.create_notification", new=AsyncMock()) as mock_notification, patch(
         "app.api.line.transition_status", new=AsyncMock(return_value=cancelled_reservation)
     ) as mock_transition, patch("app.api.line.clear_user_draft", new=AsyncMock()), patch(
+        "app.api.line.reset_autopilot_failures", new=AsyncMock()
+    ), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ) as mock_set_mode, patch(
         "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="9/4 17時のご予約をキャンセルしました。")
@@ -1312,6 +1314,8 @@ async def test_cancel_confirmation_survives_recent_booking_no_reply_shortcut():
     ), patch(
         "app.api.line.transition_status", new=AsyncMock(return_value=cancelled_reservation)
     ) as mock_transition, patch("app.api.line.clear_user_draft", new=AsyncMock()), patch(
+        "app.api.line.reset_autopilot_failures", new=AsyncMock()
+    ), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ) as mock_set_mode, patch(
         "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご予約をキャンセルしました。")
@@ -1333,6 +1337,7 @@ async def test_autopilot_change_proposes_slot_before_rescheduling():
 
     reservation = SimpleNamespace(
         id=91,
+        practitioner_id=3,
         start_time=datetime(2026, 8, 13, 10, 0, tzinfo=JST),
         end_time=datetime(2026, 8, 13, 11, 0, tzinfo=JST),
     )
@@ -1480,15 +1485,6 @@ async def test_autopilot_change_without_datetime_asks_and_keeps_conversation_act
     assert "日時" in mock_reply.await_args.args[1]
 
 
-def test_change_candidate_selection_resolves_nearer_option_to_first_slot():
-    from app.api.line import _select_change_alternative
-
-    alternatives = [
-        {"date": "2026-08-26", "start": "10:00"},
-        {"date": "2026-09-02", "start": "10:00"},
-    ]
-    assert _select_change_alternative("近い方だよ", alternatives) == 1
-    assert _select_change_alternative("2番でお願いします", alternatives) == 2
 
 
 @pytest.mark.asyncio
@@ -1508,6 +1504,8 @@ async def test_autopilot_change_date_only_offers_and_persists_real_slots():
             "date": "2026-08-26",
             "start": "10:00",
             "end": "11:00",
+            "practitioner_id": 3,
+            "practitioner_name": "時田",
             "label": "2026-08-26 10:00〜11:00（担当:時田）",
         }
     )
@@ -1518,9 +1516,11 @@ async def test_autopilot_change_date_only_offers_and_persists_real_slots():
     }
     parsed = {"intent": "change", "date": "2026-08-26", "time": None, "constraints": []}
     db = AsyncMock()
-    db.get = AsyncMock(return_value=reservation)
+    db.get = AsyncMock(side_effect=lambda model, _id: reservation if model.__name__ == "Reservation" else SimpleNamespace(id=3, name="時田"))
 
     with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ), patch("app.api.line.reply_text_with_quick_reply", new=AsyncMock()), patch(
         "app.api.line.get_user_state",
         new=AsyncMock(return_value={
             "mode": "autopilot_change_datetime",
@@ -1539,7 +1539,10 @@ async def test_autopilot_change_date_only_offers_and_persists_real_slots():
         await _handle_text_message(event, db)
 
     mock_candidates.assert_awaited_once()
-    assert mock_merge.await_args.args[2]["autopilot_change_offered_slots"][0]["start"] == "10:00"
+    # 変更の候補も新しい予約と同じ置き場（autopilot_offer）へ。番号はボタンで選ばせる（正解 D8）
+    offer = mock_merge.await_args.args[2]["autopilot_offer"]
+    assert offer["candidates"][0]["start"] == "10:00"
+    assert mock_merge.await_args.args[2]["autopilot_change_reservation_id"] == 91
     assert mock_compose.await_args.args[0] == "offer_alternatives"
 
 
@@ -2565,7 +2568,10 @@ async def test_autopilot_reservation_status_question_uses_db_facts_before_handof
 
 
 @pytest.mark.asyncio
-async def test_autopilot_urgent_availability_question_hands_off_to_human():
+async def test_autopilot_urgent_availability_question_asks_to_call_the_clinic():
+    """ぎっくり腰で今日すぐ診てほしい、のような人が受けるべき内容は、手動対応に切り替えて
+    「担当者からご連絡します」と待たせず、「医院に直接お電話ください」と案内する（正解 I3・2026-10-07）。
+    院長のLINEへの通知は記録として残す。"""
     from app.api.line import _handle_text_message
 
     patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
@@ -2594,14 +2600,17 @@ async def test_autopilot_urgent_availability_question_hands_off_to_human():
     ), patch("app.api.line.create_notification", new=AsyncMock()) as mock_notify, patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ) as mock_set_mode, patch(
-        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="担当者からご連絡します。")
-    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        "app.api.line.reset_user_conversation", new=AsyncMock()
+    ) as mock_reset, patch(
+        "app.api.line._apply_daily_greeting", new=AsyncMock(side_effect=lambda reply: reply)
+    ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
         await _handle_text_message(event, AsyncMock())
 
     mock_notify.assert_awaited_once()
-    assert mock_set_mode.await_args.args[1:] == ("U-autopilot", "manual")
-    assert mock_compose.await_args.args[0] == "handoff_to_human"
+    assert all(call.args[2] != "manual" for call in mock_set_mode.await_args_list)
+    assert mock_reset.await_args.kwargs["reason"] == "needs_human"
     mock_reply.assert_awaited_once()
+    assert "医院に直接お電話ください" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio
@@ -4739,6 +4748,8 @@ def test_every_confirmation_situation_has_a_button_form():
         "autopilot_confirm_usual",
         "autopilot_cancel_confirm",
         "autopilot_change_confirm",
+        # 「1日」を「◯/1(◯)のことでしょうか？」と確かめる場面（正解 E2・2026-10-07）
+        "autopilot_date_confirm",
     }
     # 確認の場面はコードが質問を握る側にも入っていること
     assert "confirm_slot" in _CODE_OWNED_QUESTION_SITUATIONS

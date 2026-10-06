@@ -163,9 +163,14 @@ def extract_full_name(message: str, profile_name: str | None = None) -> str | No
 
 
 def _extract_menu(message: str, menu_names: list[str] | None = None) -> str | None:
-    for menu_name in menu_names or []:
-        if menu_name and menu_name in message:
+    # 院のメニュー名を長い順に照合する。短い順だと「保険延長」が「保険」を含む別の名前に負ける。
+    for menu_name in sorted((name for name in (menu_names or []) if name), key=len, reverse=True):
+        if menu_name in message:
             return menu_name
+    if menu_names:
+        # 院のメニュー一覧が分かっているときは、一覧に無い名前（固定の表の「初診」「骨盤矯正」など）を返さない。
+        # 「保険延長」を「保険」＝保険診療と読んだのはこの表（2026-09-28 実機で保険延長が消えた件）。
+        return None
     menu_map = {
         "保険診療": ["保険診療", "保険", "保険の治療"],
         "初診": ["初診", "はじめて", "初めて", "初めての受診"],

@@ -61,7 +61,7 @@ def _initial_settings() -> list[tuple[str, str]]:
         # autopilot が自動予約してよい最低施術時間（分）。
         # menus.duration_minutes は可変メニューでは10分刻みの単位であり最低時間ではないため、
         # ここを下回る施術時間では自動確定させない安全弁。
-        ("autopilot_min_duration_minutes", "30"),
+        ("autopilot_min_duration_minutes", "20"),
         # 料金はLLMに生成させず、この固定文＋URLだけを返す（誤案内防止・院長判断）
         ("clinic_price_page_url", "https://coco-seikotsuin2407.jp/menu"),
         (
