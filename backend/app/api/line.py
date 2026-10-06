@@ -395,9 +395,12 @@ def _format_usual_shortcut_text(menu_name: str, duration_minutes: int, practitio
     return f"⭐️いつもの（{menu_name} {duration_minutes}分）"
 
 
-def _build_duration_quick_reply_items(min_minutes: int, max_minutes: int, max_items: int = 13) -> list[dict]:
+def _build_duration_quick_reply_items(min_minutes: int, max_minutes: int, max_items: int = 3) -> list[dict]:
+    """施術時間のボタン。3つまで（正解 D11）。短い・中くらい・長いを出し、それ以外は文字で受ける。"""
+    middle = int(round((min_minutes + max_minutes) / 2 / 10.0)) * 10
+    choices = list(dict.fromkeys(value for value in (min_minutes, middle, max_minutes) if min_minutes <= value <= max_minutes))
     items: list[dict] = []
-    for d in range(min_minutes, max_minutes + 1, 10):
+    for d in choices:
         if len(items) >= max_items:
             break
         label = f"{d}分"
@@ -638,6 +641,16 @@ def _has_assumed_booking_defaults(draft: dict) -> bool:
 
 
 async def _build_menu_quick_reply_items(
+    db: AsyncSession,
+    line_user_id: str | None = None,
+    max_items: int = 6,
+    patient: Patient | None = None,
+) -> list[dict]:
+    """メニューを聞くときのボタン。3つまで（正解 D11・D7：メニューを全部ボタンで並べない）。"""
+    return (await _build_menu_quick_reply_items_all(db, line_user_id, max_items, patient))[:_MAX_CHOICE_BUTTONS]
+
+
+async def _build_menu_quick_reply_items_all(
     db: AsyncSession,
     line_user_id: str | None = None,
     max_items: int = 6,
@@ -2487,6 +2500,7 @@ async def _merge_autopilot_slots(
         update["date"] = previous["date"]
     menu_hint = parsed.get("menu_name") or parsed.get("menu_hint")
     wants_usual = menu_hint == "usual" or bool(re.search(r"いつもの|前回と同じ|この前と同じ", text)) or text.startswith("⭐️いつもの")
+    named_menu = None if wants_usual else await _menu_named_in_text(db, text)
     if wants_usual:
         # 「いつもの」は空いている箱を埋めるだけ。患者が述べた値は上書きしない。
         # 以前は preset で必ず上書きしていたため、「マッスルセラピーを60分お願いします」の
@@ -2498,6 +2512,8 @@ async def _merge_autopilot_slots(
                 if update.get(key) in (None, "") and previous.get(key) in (None, ""):
                     update[key] = value
 
+        # 本人が「いつもの」を選んだ。改めて「いつものでよろしいですか」とは聞かない（正解 C2）
+        update["usual_confirmed"] = True
         preset = await _get_patient_default_preset(db, patient)
         if preset:
             _fill_gaps(
@@ -2519,24 +2535,20 @@ async def _merge_autopilot_slots(
                         "duration_minutes": latest["duration_minutes"],
                     }
                 )
-    elif menu_hint:
-        selected_menu = await _resolve_menu(db, str(menu_hint))
+    elif named_menu or menu_hint:
+        # 本人がメニューを言った（ボタンの文字を含む）。院のメニュー名が本文にあればそれを使い、
+        # 無ければAIの読み取り（menu_hint）を使う。いつもの（登録情報）で上書きしない（正解 C3）。
+        # 以前は本文のメニュー名を見ておらず、AIが読めないとメニューが空のまま残り、
+        # 登録上のいつもの（マッスルセラピー）で埋まった（2026-09-28 実機・保険延長が消えた件）。
+        selected_menu = named_menu or await _resolve_menu(db, str(menu_hint))
         if selected_menu:
             update.update(
                 {
                     "menu_id": selected_menu.id,
                     "menu_name": selected_menu.name,
                     "duration_minutes": update.get("duration_minutes") or selected_menu.duration_minutes,
-                }
-            )
-    elif previous.get("menu_name") is None and (text.startswith("⭐️") or previous.get("mode") == "waiting_menu"):
-        selected_menu = await _resolve_menu(db, text)
-        if selected_menu:
-            update.update(
-                {
-                    "menu_id": selected_menu.id,
-                    "menu_name": selected_menu.name,
-                    "duration_minutes": update.get("duration_minutes") or selected_menu.duration_minutes,
+                    "menu_explicit": True,
+                    "assumed_menu": False,
                 }
             )
 
@@ -2564,6 +2576,25 @@ async def _merge_autopilot_slots(
                 update[key] = value
 
     return await merge_user_draft(db, user_id, update)
+
+
+async def _menu_named_in_text(db: AsyncSession, text: str) -> Menu | None:
+    """本文に院のメニュー名（有効なもの）が入っていれば、そのメニュー。長い名前を優先する。
+
+    名前の一覧は、この1通のために組み立てた院の確定情報（_AUTOPILOT_CLINIC_CONTEXT）から取る。
+    """
+    normalized = unicodedata.normalize("NFKC", text or "")
+    if not normalized.strip():
+        return None
+    names = [
+        str(menu.get("name"))
+        for menu in ((_AUTOPILOT_CLINIC_CONTEXT.get() or {}).get("menus") or [])
+        if isinstance(menu, dict) and menu.get("name")
+    ]
+    named = [name for name in names if unicodedata.normalize("NFKC", name) in normalized]
+    if not named:
+        return None
+    return await _resolve_menu(db, max(named, key=len))
 
 
 async def _reply_setup_start(reply_token: str | None, prefix: str | None = None) -> None:
@@ -3515,6 +3546,13 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             text,
             profile_name=display_name,
             previous=prev_draft,
+            # 院のメニュー名の一覧（院の確定情報に入っているもの）。AIにも、AIが失敗したときの
+            # 予備の読み取りにも渡す。渡していなかったため「保険延長」が読めなかった（2026-09-28）
+            menu_names=[
+                str(menu.get("name"))
+                for menu in ((clinic_facts or {}).get("menus") or [])
+                if isinstance(menu, dict) and menu.get("name")
+            ],
             clinic_context=clinic_facts,
             recent_history=None,
             conversation_state=(user_state.get("context_data") or {}).get("recent_completed_booking"),
@@ -4511,6 +4549,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 "menu_id": preset["menu_id"],
                 "menu_name": preset["menu_name"],
                 "duration_minutes": preset["duration_minutes"],
+                # 本人が「いつもの」でよいと答えた。登録情報からの推定ではなくなった（正解 C2）
+                "usual_confirmed": True,
+                "assumed_menu": False,
+                "assumed_practitioner": False,
+                "assumed_duration": False,
             }
             if preset.get("practitioner_id"):
                 usual_draft["practitioner_id"] = preset["practitioner_id"]
@@ -5131,6 +5174,35 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         parsed_intent,
                     )
                 await reply_text_with_quick_reply(reply_token, prompt, quick_items)
+            return
+
+    # リピーターには最初に「いつものメニューでよろしいでしょうか」と確認する（正解 C2・まことさん 2026-09-16）。
+    # 以前は登録上のいつもの（メニュー・担当）を黙って埋めて進んでいた。本人がメニューを言った・
+    # 「いつもの」を押した・一度はいと答えた後は聞かない。言われた日時は draft に残っている。
+    if (
+        is_autopilot_patient
+        and merged.get("assumed_menu")
+        and not merged.get("usual_confirmed")
+        and not merged.get("menu_explicit")
+    ):
+        usual = await _get_patient_default_preset(db, line_patient)
+        if usual and usual.get("menu_name") == merged.get("menu_name"):
+            await set_user_mode(db, user_id, "autopilot_confirm_usual", user_state.get("request_id"))
+            if reply_token:
+                await _reply_confirmation(
+                    reply_token,
+                    "usual",
+                    await _compose_autopilot_reply(
+                        "usual_confirm",
+                        {
+                            "menu": usual["menu_name"],
+                            "duration": usual["duration_minutes"],
+                            "practitioner": usual.get("practitioner_name"),
+                            "patient_message": text,
+                        },
+                        parsed_intent,
+                    ),
+                )
             return
 
     # 日付が確定したら、時刻が揃うのを待たずに休診日を見る。
@@ -6140,6 +6212,7 @@ async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
     # 行の鍵を待って止まり、以後のLINEが一切処理されなくなる（2026-10-07 テストで発見）。
     db_context = _AUTOPILOT_DB_CONTEXT.set(db)
     user_context = _AUTOPILOT_USER_CONTEXT.set((event.get("source") or {}).get("userId"))
+    clinic_context_token = _AUTOPILOT_CLINIC_CONTEXT.set({})
     try:
         # LINE自動予約の記録。autopilot の人と登録の途中の人の分だけ、1通ごとに1行残す
         async with autopilot_log.recording(
@@ -6153,6 +6226,7 @@ async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
             elif event.get("type") == "postback":
                 await _handle_postback(event, db)
     finally:
+        _AUTOPILOT_CLINIC_CONTEXT.reset(clinic_context_token)
         _AUTOPILOT_USER_CONTEXT.reset(user_context)
         _AUTOPILOT_DB_CONTEXT.reset(db_context)
         _LINE_WEBHOOK_EVENT_ID.reset(event_context)

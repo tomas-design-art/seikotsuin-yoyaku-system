@@ -34,7 +34,8 @@ _WEEKDAY_JP = ["月", "火", "水", "木", "金", "土", "日"]
 # autopilot が予約してよい最低施術時間の既定値（分）。
 # menus.duration_minutes は可変メニューでは「10分刻みの単位」として使われており、
 # 最低施術時間とは限らない。設定が無い場合の安全弁としてこの値を下限にする。
-DEFAULT_AUTOPILOT_MIN_DURATION = 30
+# 自動で予約してよい施術時間の下限（正解 X6・まことさん 2026-10-07 に30分→20分）
+DEFAULT_AUTOPILOT_MIN_DURATION = 20
 AUTOPILOT_MIN_DURATION_SETTING_KEY = "autopilot_min_duration_minutes"
 
 # 料金は LLM に生成させない（誤案内が金銭トラブルに直結するため院長判断）。
