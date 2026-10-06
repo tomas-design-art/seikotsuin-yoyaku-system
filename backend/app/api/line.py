@@ -240,9 +240,25 @@ _AUTOPILOT_BOOKING_MODES = {
     "adjusting",
     "autopilot_cancel_select",
     "autopilot_cancel_confirm",
+    "autopilot_change_select",
     "autopilot_change_datetime",
     "autopilot_change_confirm",
 }
+# 変更の途中の場面。ここでキャンセルと言われたら、動かそうとしている予約のキャンセルとして受ける。
+_CHANGE_MODES = {"autopilot_change_select", "autopilot_change_datetime", "autopilot_change_confirm"}
+# 新しい予約の手続きの途中の場面。
+_NEW_BOOKING_MODES = {
+    "waiting_menu",
+    "waiting_datetime",
+    "waiting_time_duration",
+    "autopilot_confirm_usual",
+    "autopilot_booking_confirm",
+    "autopilot_slot_confirm",
+    "adjusting",
+}
+_CANCEL_MODES = {"autopilot_cancel_select", "autopilot_cancel_confirm"}
+# 押して選ぶボタンは3つまで（正解 D11・まことさん 2026-10-07）。
+_MAX_CHOICE_BUTTONS = 3
 _CONVERSATION_TIMEOUT = timedelta(hours=1)
 # 「はい/いいえ」の意味をコードが解釈する場面。ここでは質問文をLLMに決めさせない。
 _CODE_OWNED_QUESTION_SITUATIONS = {
@@ -1309,6 +1325,29 @@ def _build_cancel_selection_items(reservations: list[Reservation]) -> list[dict]
     return items
 
 
+def _build_change_selection_items(reservations: list[Reservation]) -> list[dict]:
+    items = []
+    for reservation in reservations[:_MAX_CHOICE_BUTTONS]:
+        start = reservation.start_time.astimezone(JST)
+        label = start.strftime("%m/%d %H:%M")
+        items.append(
+            {
+                "type": "action",
+                "action": {
+                    "type": "postback",
+                    "label": label[:20],
+                    "data": f"action=change_select&reservation_id={reservation.id}",
+                    "displayText": f"{label}のご予約を変更",
+                },
+            }
+        )
+    return items
+
+
+def _compose_change_selection_text(reservations: list[Reservation]) -> str:
+    return _compose_cancel_selection_text(reservations).replace("キャンセルするご予約", "変更するご予約", 1)
+
+
 def _compose_cancel_selection_text(reservations: list[Reservation]) -> str:
     lines = ["キャンセルするご予約を選んでください。"]
     for index, reservation in enumerate(reservations, 1):
@@ -1373,6 +1412,124 @@ async def _find_owned_cancellable_reservation(
     if reservation.start_time.astimezone(JST) < now_jst():
         return None
     return reservation
+
+
+async def _start_cancel_flow(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    patient: Patient,
+    text: str,
+    parsed_intent: dict | None,
+    reservations: list[Reservation] | None = None,
+) -> None:
+    """キャンセルの手続きを始める。対象が1件なら確認、2件以上なら本人に選ばせる。
+
+    どの予約かはLLMに推測させず、患者本人に選択で確定させる。
+    選択待ちであることを状態として持つ。持たないと、ボタンではなく文字で
+    答えられたとき（実機では「両方」）新規メッセージとして処理され、
+    予約の候補提示に化ける（2026-09-04）。
+    """
+    upcoming = reservations if reservations is not None else await _find_upcoming_reservations(db, patient.id)
+    if not upcoming:
+        await _handoff_autopilot_to_human(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            patient=patient,
+            text=text,
+            parsed_intent=parsed_intent,
+            notification=f"LINEキャンセル要確認: {patient.id}",
+        )
+        return
+    if len(upcoming) > 1:
+        await merge_user_draft(
+            db,
+            user_id,
+            {"autopilot_cancel_candidate_ids": [reservation.id for reservation in upcoming]},
+        )
+        await set_user_mode(db, user_id, "autopilot_cancel_select")
+        if reply_token or _DEFERRED_REPLY_USER.get():
+            await reply_text_with_quick_reply(
+                reply_token,
+                _compose_cancel_selection_text(upcoming),
+                _build_cancel_selection_items(upcoming[:_MAX_CHOICE_BUTTONS]),
+            )
+        return
+    reservation = upcoming[0]
+    await merge_user_draft(db, user_id, {"autopilot_cancel_reservation_id": reservation.id})
+    await set_user_mode(db, user_id, "autopilot_cancel_confirm")
+    await _reply_plan(reply_token, "cancel", _cancel_confirmation_plan(reservation))
+
+
+def _booking_stopped_plan() -> ReplyPlan:
+    return ReplyPlan(facts=["ご予約のお手続きを取りやめました。"])
+
+
+async def _route_cancel_request(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    patient: Patient,
+    text: str,
+    parsed_intent: dict | None,
+    mode: str | None,
+    draft: dict,
+) -> bool:
+    """キャンセルの依頼を、いまの場面の処理より先に受ける（正解 G1・G2）。
+
+    以前のキャンセルの受け口は「どの場面の処理にも当たらなかったとき」だけ通っていた。
+    変更の日時待ち・確認待ち・候補の提示中は、その場面の処理が先に受けてしまい、
+    2026-09-28 実機で「キャンセルだけよろしく」に予約の聞き直しを返し、
+    「13時からの予約キャンセル」で予約を別の担当へ動かした。
+
+    - 変更の途中 → 動かそうとしていた予約のキャンセル確認へ
+    - 新しい予約の途中 → 既存の予約を指していればそのキャンセル確認へ。指していなければ、
+      いまの予約の手続きをやめる（既存の予約には触らない）
+    - それ以外の場面 → 従来の受け口（False を返す）
+    """
+    if mode in _CANCEL_MODES or not _asks_to_cancel(text, parsed_intent):
+        return False
+
+    if mode in _CHANGE_MODES:
+        target_id = draft.get("autopilot_change_reservation_id")
+        target = (
+            await _find_owned_cancellable_reservation(db, patient.id, int(target_id)) if target_id else None
+        )
+        await clear_user_draft(db, user_id)
+        await _start_cancel_flow(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            patient=patient,
+            text=text,
+            parsed_intent=parsed_intent,
+            reservations=[target] if target else None,
+        )
+        return True
+
+    if mode in _NEW_BOOKING_MODES:
+        upcoming = await _find_upcoming_reservations(db, patient.id)
+        named = _reservations_named(text, parsed_intent, upcoming)
+        await reset_user_conversation(db, user_id, reason="booking_cancelled_by_patient")
+        if named:
+            await _start_cancel_flow(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                reservations=named,
+            )
+            return True
+        if reply_token:
+            await reply_to_line(reply_token, await _polished_from_plan(_booking_stopped_plan()))
+        return True
+
+    return False
 
 
 def _requires_manual_autopilot_handling(text: str) -> bool:
@@ -1466,23 +1623,46 @@ def _select_offered_alternative(text: str, alternatives: list[dict]) -> int | No
     return 1 if len(alternatives) == 1 and _is_affirmative(text) else None
 
 
-def _select_change_alternative(text: str, alternatives: list[dict]) -> int | None:
-    """変更候補への選択を解決する。相対表現は候補が複数でも最も早い枠だけに結び付ける。"""
-    choice = _select_offered_alternative(text, alternatives)
-    if choice is not None:
-        return choice
-    normalized = _normalize_confirmation_text(text)
-    if alternatives and any(phrase in normalized for phrase in ("近い方", "早い方", "先の方")):
-        return 1
-    return None
-
-
 def _has_cancellation_intent(text: str) -> bool:
     return bool(re.search(r"キャンセル|取り消|取消|やめたい|cancel|annul|cancelar|취소", text or "", re.IGNORECASE))
 
 
 def _has_change_intent(text: str) -> bool:
     return bool(re.search(r"変更|変え|ずら|リスケ|reschedule|change|move|改期|更改|변경", text or "", re.IGNORECASE))
+
+
+_CANCEL_WORDS = re.compile(r"キャンセル|取り消|取消|cancel|cancelar|취소", re.IGNORECASE)
+
+
+def _asks_to_cancel(text: str, parsed: dict | None) -> bool:
+    """キャンセルの依頼か（正解 G1・G2）。
+
+    日時が入っていても、AIが change と読んでも、「キャンセル」の語があれば依頼として受ける。
+    2026-09-28 実機: 変更の途中の「10月3日13時からの予約キャンセルしといて」が
+    変更先の日時として読まれ、予約が時田から上田へ動いた。
+    受けた後は必ず「キャンセルしてよろしいですか」を挟むので、取り違えても予約は消えない。
+    """
+    if (parsed or {}).get("intent") == "cancel":
+        return True
+    return bool(_CANCEL_WORDS.search(text or ""))
+
+
+def _reservations_named(text: str, parsed: dict | None, reservations: list) -> list:
+    """本文（と読み取った日時）が指している予約。指していなければ空。"""
+    parsed_date = _parse_iso_date((parsed or {}).get("date"))
+    parsed_time = str((parsed or {}).get("time") or "")[:5]
+    named = []
+    for reservation in reservations:
+        start = reservation.start_time.astimezone(JST)
+        if parsed_date or parsed_time:
+            if parsed_date and start.date() != parsed_date:
+                continue
+            if parsed_time and start.strftime("%H:%M") != parsed_time:
+                continue
+            named.append(reservation)
+        elif _matches_reservation_datetime(text, reservation):
+            named.append(reservation)
+    return named
 
 
 def _format_usual_confirmation(preset: dict) -> str:
@@ -1663,8 +1843,14 @@ async def _complete_autopilot_reschedule(
     reply_token: str | None,
     patient_message: str = "",
     selected_candidate: dict | None = None,
+    preferred_practitioner_id: int | None = None,
 ) -> bool:
-    """DBで確認した変更候補を提示し、患者の明示確認を待つ。"""
+    """DBで確認した変更候補を提示し、患者の明示確認を待つ。
+
+    言われた日時が今の担当（名指しがあればその人）で空いていれば、その枠で確認へ進む。
+    空いていなければ、黙って別の担当にせず、近い枠を候補として選んでもらう（正解 F2）。
+    空きは、動かそうとしている予約そのものを除いて調べる（正解 F1）。
+    """
     try:
         if selected_candidate:
             target_date = date.fromisoformat(str(selected_candidate["date"]))
@@ -1675,11 +1861,28 @@ async def _complete_autopilot_reschedule(
             end_dt = datetime.combine(target_date, end_time, tzinfo=JST)
         else:
             target_date = date.fromisoformat(desired_date)
-            target_time = time.fromisoformat(desired_time)
+            target_time = time.fromisoformat(str(desired_time)[:5])
             duration = int((reservation.end_time - reservation.start_time).total_seconds() // 60)
+            keep_practitioner_id = preferred_practitioner_id or reservation.practitioner_id
             practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(
-                db, target_date, target_time, duration
+                db,
+                target_date,
+                target_time,
+                duration,
+                practitioner_id=keep_practitioner_id,
+                exclude_reservation_id=reservation.id,
             )
+            if not practitioner:
+                return await _offer_change_alternatives(
+                    db,
+                    reservation=reservation,
+                    target_date=target_date,
+                    desired_time=target_time,
+                    user_id=user_id,
+                    reply_token=reply_token,
+                    patient_message=patient_message,
+                    preferred_practitioner_id=keep_practitioner_id,
+                )
         if not practitioner:
             raise HTTPException(status_code=409, detail="変更先に空き枠がありません")
     except (HTTPException, ValueError):
@@ -1703,6 +1906,9 @@ async def _complete_autopilot_reschedule(
             "autopilot_change_end_time_iso": end_dt.isoformat(),
             "autopilot_change_practitioner_id": practitioner.id,
             "autopilot_change_practitioner_name": practitioner.name,
+            # 候補から選んだのではない。前に選んだ候補の記録が残っていると、動かす直前の
+            # 突き合わせで食い違い扱いになるので消す（merge_user_draft は None を無視するので False）
+            "autopilot_change_picked": False,
         },
     )
     await set_user_mode(db, user_id, "autopilot_change_confirm")
@@ -1717,6 +1923,242 @@ async def _complete_autopilot_reschedule(
         ),
     )
     return True
+
+
+def _reservation_minutes(reservation: Reservation) -> int:
+    return int((reservation.end_time - reservation.start_time).total_seconds() // 60)
+
+
+async def _offer_change_candidates(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    reservation: Reservation,
+    candidates: list[dict],
+    patient_message: str,
+    unavailable_note: str | None = None,
+    requested_date: date | None = None,
+) -> None:
+    """変更先の候補を、新しい予約と同じ形で出す（正解 D8）。
+
+    候補は表示順のまま1か所（autopilot_offer）へ保存し、ボタン（押した番号）で選ばせる。
+    以前は変更用の別の置き場（autopilot_change_offered_slots）に入れ、番号は本文中の
+    1桁を拾っていたため、提示と選択が食い違いうる作りのままだった（9/8 に「次に直す筆頭」）。
+    """
+    offer = offered_slots.new_offer(candidates, _reservation_minutes(reservation))
+    await merge_user_draft(
+        db,
+        user_id,
+        {**offer.to_draft(), "autopilot_change_reservation_id": reservation.id, "autopilot_change_picked": False},
+    )
+    await set_user_mode(db, user_id, "autopilot_change_datetime")
+    current_name = None
+    if reservation.practitioner_id:
+        current = await db.get(Practitioner, reservation.practitioner_id)
+        current_name = current.name if current else None
+    context: dict = {
+        "alternatives": offer.candidates,
+        "purpose": "予約変更",
+        "patient_message": patient_message,
+    }
+    if unavailable_note:
+        context["unavailable_note"] = unavailable_note
+    if requested_date:
+        context["requested_date"] = _format_date_with_weekday_jp(requested_date)
+    if current_name:
+        context.update(
+            _preferred_practitioner_context(
+                {"practitioner_id": reservation.practitioner_id, "practitioner_name": current_name},
+                offer.candidates,
+            )
+        )
+    await _reply_offer(reply_token, offer, await _compose_autopilot_reply("offer_alternatives", context))
+
+
+async def _offer_change_alternatives(
+    db: AsyncSession,
+    *,
+    reservation: Reservation,
+    target_date: date,
+    desired_time: time,
+    user_id: str,
+    reply_token: str | None,
+    patient_message: str,
+    preferred_practitioner_id: int | None,
+) -> bool:
+    """言われた時刻がその担当で空いていないとき、前後1時間くらいの空きを候補にする（正解 D10・F2）。
+
+    近くに無ければ、その日の空きを出す。それも無ければ空いていないことを伝える。
+    """
+    duration = _reservation_minutes(reservation)
+    desired = desired_time.hour * 60 + desired_time.minute
+    scored = await build_same_day_candidates(
+        db,
+        target_date,
+        desired_time,
+        duration,
+        preferred_practitioner_id=preferred_practitioner_id,
+        window_start_min=max(desired - 60, 0),
+        window_end_min=desired + 60 + duration,
+        max_results=_MAX_CHOICE_BUTTONS,
+        preferred_first=True,
+        exclude_reservation_id=reservation.id,
+    )
+    if not scored:
+        scored = await build_same_day_candidates(
+            db,
+            target_date,
+            desired_time,
+            duration,
+            preferred_practitioner_id=preferred_practitioner_id,
+            max_results=_MAX_CHOICE_BUTTONS,
+            preferred_first=True,
+            exclude_reservation_id=reservation.id,
+        )
+    candidates = [candidate.to_dict() for candidate in scored]
+    if not candidates:
+        await set_user_mode(db, user_id, "autopilot_change_datetime")
+        if reply_token:
+            await reply_to_line(
+                reply_token,
+                await _compose_autopilot_reply("slot_taken", {"patient_message": patient_message}),
+            )
+        return False
+    stamp = f"{_format_date_with_weekday_jp(target_date)} {desired_time.strftime('%H:%M')}"
+    await _offer_change_candidates(
+        db,
+        user_id=user_id,
+        reply_token=reply_token,
+        reservation=reservation,
+        candidates=candidates,
+        patient_message=patient_message,
+        unavailable_note=f"{stamp}〜は空きがございません。",
+    )
+    return True
+
+
+async def _offer_change_day(
+    db: AsyncSession,
+    *,
+    reservation: Reservation,
+    target_date: date,
+    user_id: str,
+    reply_token: str | None,
+    patient_message: str,
+    preferred_practitioner_id: int | None = None,
+) -> bool:
+    """日だけ言われた変更。その日の空きを、今の担当の枠を先頭にして候補にする（正解 D2・F2）。"""
+    duration = _reservation_minutes(reservation)
+    scored = await build_same_day_candidates(
+        db,
+        target_date,
+        time(9, 0),
+        duration,
+        preferred_practitioner_id=preferred_practitioner_id or reservation.practitioner_id,
+        max_results=_MAX_CHOICE_BUTTONS,
+        preferred_first=True,
+        exclude_reservation_id=reservation.id,
+    )
+    candidates = [candidate.to_dict() for candidate in scored]
+    if not candidates:
+        return False
+    await _offer_change_candidates(
+        db,
+        user_id=user_id,
+        reply_token=reply_token,
+        reservation=reservation,
+        candidates=candidates,
+        patient_message=patient_message,
+        requested_date=target_date,
+    )
+    return True
+
+
+async def _confirm_change_pick(
+    db: AsyncSession,
+    user_id: str,
+    reply_token: str | None,
+    *,
+    reservation: Reservation,
+    offer: offered_slots.Offer,
+    index: int,
+) -> bool:
+    """選ばれた変更先を確認へ回す。どの提示の何番目かも残し、動かす直前に突き合わせる。"""
+    picked = offered_slots.picked_record(offer, index)
+    if picked is None:
+        return False
+    start_dt = datetime.combine(date.fromisoformat(str(picked["date"])), time.fromisoformat(str(picked["start"])), tzinfo=JST)
+    end_dt = datetime.combine(date.fromisoformat(str(picked["date"])), time.fromisoformat(str(picked["end"])), tzinfo=JST)
+    await merge_user_draft(
+        db,
+        user_id,
+        {
+            "autopilot_change_reservation_id": reservation.id,
+            "autopilot_change_start_time_iso": start_dt.isoformat(),
+            "autopilot_change_end_time_iso": end_dt.isoformat(),
+            "autopilot_change_practitioner_id": picked.get("practitioner_id"),
+            "autopilot_change_practitioner_name": picked.get("practitioner_name"),
+            "autopilot_change_picked": picked,
+        },
+    )
+    await set_user_mode(db, user_id, "autopilot_change_confirm")
+    await _reply_plan(
+        reply_token,
+        "change",
+        _slot_confirmation_plan(
+            start_dt=start_dt,
+            end_dt=end_dt,
+            practitioner_name=picked.get("practitioner_name"),
+            purpose="変更後のご予約",
+        ),
+    )
+    return True
+
+
+async def _begin_change_for(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    patient: Patient,
+    reservation: Reservation,
+    text: str,
+) -> None:
+    """変更する予約が決まった。変更先の日時を聞く。"""
+    await clear_user_draft(db, user_id)
+    await merge_user_draft(db, user_id, {"autopilot_change_reservation_id": reservation.id})
+    await set_user_mode(db, user_id, "autopilot_change_datetime")
+    if reply_token:
+        await reply_to_line(
+            reply_token,
+            await _compose_autopilot_reply(
+                "ask_datetime",
+                {"patient_name": patient.name, "patient_message": text, "purpose": "予約変更"},
+            ),
+        )
+
+
+async def _start_change_selection(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    reservations: list[Reservation],
+) -> None:
+    """どの予約の変更か決まらないとき、本人の予約一覧を出して選ばせる（正解 X1）。ボタンは3つまで。"""
+    await merge_user_draft(
+        db,
+        user_id,
+        {"autopilot_change_candidate_ids": [reservation.id for reservation in reservations]},
+    )
+    await set_user_mode(db, user_id, "autopilot_change_select")
+    if reply_token or _DEFERRED_REPLY_USER.get():
+        await reply_text_with_quick_reply(
+            reply_token,
+            _compose_change_selection_text(reservations),
+            _build_change_selection_items(reservations),
+        )
 
 
 _EXPLICIT_DATE_PATTERN = re.compile(
@@ -2171,6 +2613,8 @@ async def _search_negotiated_candidates(
     earliest_offered: int | None,
     latest_offered: int | None,
     same_day_only: bool = False,
+    exclude_reservation_id: int | None = None,
+    preferred_first: bool = False,
 ) -> list[dict]:
     """条件変更を反映した候補を、同日優先・見つからなければ後続日で探す。"""
 
@@ -2197,6 +2641,8 @@ async def _search_negotiated_candidates(
             exclude_weekdays=filters.exclude_weekdays,
             max_results=3,
             search_days=search_days,
+            exclude_reservation_id=exclude_reservation_id,
+            preferred_first=preferred_first,
         )
         matched = [candidate.to_dict() for candidate in scored if _matches_direction(candidate)]
         if matched:
@@ -2532,6 +2978,8 @@ async def _renegotiate_autopilot_change(
         earliest_offered=earliest_offered,
         latest_offered=latest_offered,
         same_day_only=filters.earlier or filters.later,
+        exclude_reservation_id=reservation.id,
+        preferred_first=True,
     )
     if not candidates:
         await set_user_mode(db, user_id, "autopilot_change_datetime")
@@ -2550,29 +2998,14 @@ async def _renegotiate_autopilot_change(
             )
         return True
 
-    best = candidates[0]
-    start_dt = datetime.combine(date.fromisoformat(best["date"]), time.fromisoformat(best["start"]), tzinfo=JST)
-    end_dt = datetime.combine(date.fromisoformat(best["date"]), time.fromisoformat(best["end"]), tzinfo=JST)
-    await merge_user_draft(
+    # 先頭の1件を黙って選ばず、候補として本人に選んでもらう（別の担当へ勝手に変えない＝正解 F2）。
+    await _offer_change_candidates(
         db,
-        user_id,
-        {
-            "autopilot_change_start_time_iso": start_dt.isoformat(),
-            "autopilot_change_end_time_iso": end_dt.isoformat(),
-            "autopilot_change_practitioner_id": best["practitioner_id"],
-            "autopilot_change_practitioner_name": best["practitioner_name"],
-        },
-    )
-    await set_user_mode(db, user_id, "autopilot_change_confirm")
-    await _reply_plan(
-        reply_token,
-        "change",
-        _slot_confirmation_plan(
-            start_dt=start_dt,
-            end_dt=end_dt,
-            practitioner_name=best["practitioner_name"],
-            purpose="変更後のご予約",
-        ),
+        user_id=user_id,
+        reply_token=reply_token,
+        reservation=reservation,
+        candidates=candidates,
+        patient_message=text,
     )
     return True
 
@@ -2643,7 +3076,13 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         line_patient = await _find_line_patient(db, user_id)
         is_autopilot_patient = bool(line_patient and line_patient.line_autopilot_enabled)
 
-    if is_autopilot_patient and (user_state or {}).get("mode") in _AUTOPILOT_BOOKING_MODES:
+    # キャンセルの依頼は「会話をやめる」の判定に回さない。変更の途中の「キャンセルだけよろしく」が
+    # 会話の中止として扱われると、予約は消えずに会話だけ終わる（正解 G1）。
+    if (
+        is_autopilot_patient
+        and (user_state or {}).get("mode") in _AUTOPILOT_BOOKING_MODES
+        and not _CANCEL_WORDS.search(text or "")
+    ):
         control = await classify_conversation_control(text, "booking")
         action = control.get("action")
         if action in {"restart_booking", "abandon_booking"} and control.get("confidence") != "low":
@@ -2793,6 +3232,19 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             and not parsed_intent.get("has_reservation_intent")
         ):
             await clear_recent_completed_booking(db, user_id)
+            return
+
+        # キャンセルの依頼は、いまの場面の処理より先に受ける（正解 G1・G2）。
+        if await _route_cancel_request(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            patient=line_patient,
+            text=text,
+            parsed_intent=parsed_intent,
+            mode=current_mode,
+            draft=prev_draft,
+        ):
             return
 
         # 候補提示中の番号返信は「明示的な選択」。
@@ -3425,6 +3877,39 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         )
         return
 
+    if is_autopilot_patient and current_mode == "autopilot_change_select":
+        candidate_ids = set(prev_draft.get("autopilot_change_candidate_ids") or [])
+        reservations = [
+            reservation
+            for reservation in await _find_upcoming_reservations(db, line_patient.id)
+            if reservation.id in candidate_ids
+        ]
+        chosen = _select_cancel_targets(text, reservations)
+        if len(chosen) == 1:
+            await _begin_change_for(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                reservation=chosen[0],
+                text=text,
+            )
+            return
+        if reservations:
+            await _start_change_selection(db, user_id=user_id, reply_token=reply_token, reservations=reservations)
+            return
+        await clear_user_draft(db, user_id)
+        await _handoff_autopilot_to_human(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            patient=line_patient,
+            text=text,
+            parsed_intent=parsed_intent,
+            notification=f"LINE変更要確認: {line_patient.id}",
+        )
+        return
+
     if is_autopilot_patient and current_mode == "autopilot_change_datetime":
         reservation_id = prev_draft.get("autopilot_change_reservation_id")
         reservation = await db.get(Reservation, int(reservation_id)) if reservation_id else None
@@ -3438,79 +3923,38 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     await _compose_autopilot_reply("change_target_missing", {"patient_message": text}, parsed),
                 )
             return
-        # ★ここは #2572 の対策が入っていない旧方式。次に直す筆頭。
-        #   offer_id もボタンも予約直前の検算も無く、番号照合は
-        #   _select_change_alternative → _extract_alternative_choice ＝
-        #   「本文中の孤立した1桁を拾う」で、事故の原因ロジックそのもの。
-        #   しかも **既存の予約を動かす** 経路なので、放置期間が長いほど痛い。
-        #   新規予約側と同じく offered_slots へ寄せること。
-        change_offer = prev_draft.get("autopilot_change_offered_slots") or []
-        selected_choice = _select_change_alternative(text, change_offer)
-        if selected_choice is not None:
-            selected = change_offer[selected_choice - 1]
-            await _complete_autopilot_reschedule(
+        # 提示中の候補への返事（番号・時刻・ボタン）は、保存した候補にだけ照合する（正解 D8）。
+        stored_offer = offered_slots.from_draft(prev_draft)
+        if stored_offer:
+            picked_index = offered_slots.selected_index(text)
+            if picked_index is None:
+                picked_index = offered_slots.selected_index_by_time(text, stored_offer)
+            if picked_index is not None and await _confirm_change_pick(
+                db, user_id, reply_token, reservation=reservation, offer=stored_offer, index=picked_index
+            ):
+                return
+        requested_practitioner = None
+        if parsed.get("practitioner") or re.search(r"先生|担当", text or ""):
+            requested_practitioner = await _extract_requested_practitioner(db, text, parsed)
+        preferred_id = requested_practitioner.id if requested_practitioner else None
+        if parsed.get("date") and not parsed.get("time"):
+            target_date = _parse_iso_date(parsed["date"])
+            if target_date and await _offer_change_day(
                 db,
                 reservation=reservation,
-                desired_date=str(selected["date"]),
-                desired_time=str(selected["start"]),
+                target_date=target_date,
                 user_id=user_id,
                 reply_token=reply_token,
                 patient_message=text,
-                selected_candidate=selected,
-            )
-            return
-        if parsed.get("date") and not parsed.get("time"):
-            target_date = _parse_iso_date(parsed["date"])
-            duration = int((reservation.end_time - reservation.start_time).total_seconds() // 60)
-            candidates = await build_same_day_candidates(
-                db,
-                target_date,
-                time(9, 0),
-                duration,
-                preferred_practitioner_id=reservation.practitioner_id,
-                max_results=3,
-            )
-            # 変更元と同じ所要時間を満たす枠だけを出す。
-            # 短い隙間を候補に混ぜると、患者が番号で選んだ枠を元の時間で再検索し直す
-            # 事故を誘発する。短縮希望が明示された場合だけ別経路で扱う。
-            alternatives = []
-            for candidate in candidates:
-                candidate_data = candidate.to_dict()
-                try:
-                    candidate_duration = int(
-                        (
-                            datetime.combine(target_date, time.fromisoformat(candidate_data["end"]))
-                            - datetime.combine(target_date, time.fromisoformat(candidate_data["start"]))
-                        ).total_seconds()
-                        // 60
-                    )
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if candidate_duration == duration:
-                    alternatives.append(candidate_data)
-            if alternatives:
-                await merge_user_draft(
-                    db,
-                    user_id,
-                    {"autopilot_change_offered_slots": _to_offered_slots(alternatives)},
-                )
-                if reply_token:
-                    await reply_to_line(
-                        reply_token,
-                        await _compose_autopilot_reply(
-                            "offer_alternatives",
-                            {
-                                "alternatives": alternatives,
-                                "vague": True,
-                                "date_only": True,
-                                "requested_date": _format_date_with_weekday_jp(target_date),
-                                "patient_message": text,
-                                "purpose": "予約変更",
-                            },
-                            parsed,
-                        ),
-                    )
+                preferred_practitioner_id=preferred_id,
+            ):
                 return
+        if parsed.get("time") and not parsed.get("date"):
+            # 日付を言っていない返事では、話している日（提示中の候補の日、なければ今の予約の日）を動かさない（正解 E4）
+            discussed = (stored_offer.candidates[0].get("date") if stored_offer else None) or (
+                reservation.start_time.astimezone(JST).date().isoformat()
+            )
+            parsed = {**parsed, "date": discussed}
         if not parsed.get("date") or not parsed.get("time"):
             if reply_token:
                 await reply_to_line(
@@ -3530,6 +3974,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             user_id=user_id,
             reply_token=reply_token,
             patient_message=text,
+            preferred_practitioner_id=preferred_id,
         )
         return
 
@@ -3581,6 +4026,30 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 message="恐れ入ります、こちらの日時へご変更してよろしいでしょうか。",
             )
             return
+        # 候補から選ばれた変更なら、動かす直前に、提示そのものと突き合わせる（正解 D8）
+        picked = prev_draft.get("autopilot_change_picked")
+        if isinstance(picked, dict):
+            current_offer = offered_slots.from_draft(prev_draft)
+            mismatch = offered_slots.verify_pick(current_offer, picked)
+            if not mismatch and not offered_slots.matches_slot(
+                current_offer.at(int(picked["index"])),
+                practitioner_id=int(practitioner_id),
+                start_iso=change_start.isoformat() if change_start else "",
+                end_iso=change_end.isoformat() if change_end else "",
+            ):
+                mismatch = "これから動かす枠が提示と違う"
+            if mismatch:
+                logger.error("LINE autopilot change mismatch (%s): picked=%s", mismatch, picked)
+                await _handoff_autopilot_to_human(
+                    db,
+                    user_id=user_id,
+                    reply_token=reply_token,
+                    patient=line_patient,
+                    text=text,
+                    parsed_intent=parsed_intent,
+                    notification=f"LINE予約変更の枠が選択と一致せず中止（{mismatch}）: {line_patient.id}",
+                )
+                return
         try:
             start_dt = datetime.fromisoformat(start_time_iso)
             end_dt = datetime.fromisoformat(end_time_iso)
@@ -3765,40 +4234,14 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         return
 
     if is_autopilot_patient and ((parsed_intent or {}).get("intent") == "cancel" or _has_cancellation_intent(text)):
-        upcoming = await _find_upcoming_reservations(db, line_patient.id)
-        if not upcoming:
-            await _handoff_autopilot_to_human(
-                db,
-                user_id=user_id,
-                reply_token=reply_token,
-                patient=line_patient,
-                text=text,
-                parsed_intent=parsed_intent,
-                notification=f"LINEキャンセル要確認: {line_patient.id}",
-            )
-            return
-        if len(upcoming) > 1:
-            # どの予約かはLLMに推測させず、患者本人に選択で確定させる。
-            # 選択待ちであることを状態として持つ。持たないと、ボタンではなく文字で
-            # 答えられたとき（実機では「両方」）新規メッセージとして処理され、
-            # 予約の候補提示に化ける（2026-09-04）。
-            await merge_user_draft(
-                db,
-                user_id,
-                {"autopilot_cancel_candidate_ids": [reservation.id for reservation in upcoming]},
-            )
-            await set_user_mode(db, user_id, "autopilot_cancel_select")
-            if reply_token or _DEFERRED_REPLY_USER.get():
-                await reply_text_with_quick_reply(
-                    reply_token,
-                    _compose_cancel_selection_text(upcoming),
-                    _build_cancel_selection_items(upcoming),
-                )
-            return
-        reservation = upcoming[0]
-        await merge_user_draft(db, user_id, {"autopilot_cancel_reservation_id": reservation.id})
-        await set_user_mode(db, user_id, "autopilot_cancel_confirm")
-        await _reply_plan(reply_token, "cancel", _cancel_confirmation_plan(reservation))
+        await _start_cancel_flow(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            patient=line_patient,
+            text=text,
+            parsed_intent=parsed_intent,
+        )
         return
 
     if is_autopilot_patient and ((parsed_intent or {}).get("intent") == "change" or _has_change_intent(text)):
@@ -3808,6 +4251,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             (user_state.get("context_data") or {}).get("recent_completed_booking"),
         )
         if not reservation:
+            upcoming = await _find_upcoming_reservations(db, line_patient.id)
+            if len(upcoming) > 1:
+                # どの予約の変更か決まらない。勝手に選ばず、本人に選ばせる（正解 X1）
+                await _start_change_selection(db, user_id=user_id, reply_token=reply_token, reservations=upcoming)
+                return
             await _handoff_autopilot_to_human(
                 db,
                 user_id=user_id,
@@ -3820,6 +4268,17 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
         parsed_change = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
         desired_date, desired_time = parsed_change.get("date"), parsed_change.get("time")
+        if desired_date and not desired_time:
+            target_date = _parse_iso_date(desired_date)
+            if target_date and await _offer_change_day(
+                db,
+                reservation=reservation,
+                target_date=target_date,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient_message=text,
+            ):
+                return
         if not desired_date or not desired_time:
             await merge_user_draft(db, user_id, {"autopilot_change_reservation_id": reservation.id})
             await set_user_mode(db, user_id, "autopilot_change_datetime")
@@ -4774,6 +5233,17 @@ async def _handle_pick_postback(
             await reply_to_line(reply_token, "恐れ入ります、もう一度お選びいただけますか。")
         return
 
+    # 変更の候補（変更の日時待ちで出したもの）なら、変更の確認へ
+    change_reservation_id = draft.get("autopilot_change_reservation_id")
+    if state.get("mode") == "autopilot_change_datetime" and change_reservation_id:
+        reservation = await _find_owned_cancellable_reservation(db, patient.id, int(change_reservation_id))
+        if reservation is None:
+            if reply_token:
+                await reply_to_line(reply_token, "対象のご予約が見つかりませんでした。お手数ですがもう一度お知らせください。")
+            return
+        await _confirm_change_pick(db, actor_user_id, reply_token, reservation=reservation, offer=offer, index=index)
+        return
+
     await _confirm_picked_slot(
         db,
         actor_user_id,
@@ -4857,6 +5327,36 @@ async def _handle_cancel_selection(
     await _reply_plan(reply_token, "cancel", _cancel_confirmation_plan(reservation))
 
 
+async def _handle_change_selection(
+    db: AsyncSession,
+    query: dict,
+    reply_token: str | None,
+    actor_user_id: str | None,
+) -> None:
+    """一覧のボタンで選ばれた予約の変更を始める。持ち主を必ず照合する。"""
+    if not actor_user_id:
+        return
+    try:
+        reservation_id = int((query.get("reservation_id") or [""])[0])
+    except (TypeError, ValueError):
+        return
+    patient = await _find_line_patient(db, actor_user_id)
+    if not patient or not patient.line_autopilot_enabled:
+        return
+    reservation = await _find_owned_cancellable_reservation(db, patient.id, reservation_id)
+    if not reservation:
+        await reply_to_line(reply_token, "対象のご予約が見つかりませんでした。お手数ですがもう一度お知らせください。")
+        return
+    await _begin_change_for(
+        db,
+        user_id=actor_user_id,
+        reply_token=reply_token,
+        patient=patient,
+        reservation=reservation,
+        text="",
+    )
+
+
 async def _notify_shadow_admin(text: str, reply_token: str | None, actor_user_id: str | None) -> None:
     """同じ本文を push と reply の両方で送ると、操作した管理者に2通届く。"""
     await push_message(settings.line_admin_user_id, text)
@@ -4886,6 +5386,10 @@ async def _handle_postback(event: dict, db: AsyncSession):
 
     if action == "cancel_select":
         await _handle_cancel_selection(db, q, reply_token, actor_user_id)
+        return
+
+    if action == "change_select":
+        await _handle_change_selection(db, q, reply_token, actor_user_id)
         return
 
     req = await get_request(db, rid, line_user_id=line_user_id)
@@ -5215,6 +5719,12 @@ async def _notify_webhook_failure(event: dict, error: Exception) -> None:
 
 async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
     event_context = _LINE_WEBHOOK_EVENT_ID.set(event.get("webhookEventId"))
+    # 返信を作る処理（挨拶の判定など）が読むセッションと相手は、1通ごとに入れ直して最後に戻す。
+    # 戻さないと、受信キューのように1つのタスクで続けて処理するとき、前の1通の閉じたセッションが
+    # 次の1通（ボタンなど）に残る。そのセッションで会話状態を書くと、いまのセッションが握っている
+    # 行の鍵を待って止まり、以後のLINEが一切処理されなくなる（2026-10-07 テストで発見）。
+    db_context = _AUTOPILOT_DB_CONTEXT.set(db)
+    user_context = _AUTOPILOT_USER_CONTEXT.set((event.get("source") or {}).get("userId"))
     try:
         # LINE自動予約の記録。autopilot の人と登録の途中の人の分だけ、1通ごとに1行残す
         async with autopilot_log.recording(
@@ -5228,6 +5738,8 @@ async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
             elif event.get("type") == "postback":
                 await _handle_postback(event, db)
     finally:
+        _AUTOPILOT_USER_CONTEXT.reset(user_context)
+        _AUTOPILOT_DB_CONTEXT.reset(db_context)
         _LINE_WEBHOOK_EVENT_ID.reset(event_context)
 
 

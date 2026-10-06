@@ -47,10 +47,10 @@ from app.utils.normalize import kanji_digits_to_ascii, normalize_input_text
 #        **autopilot_slot_confirm 等、モード集合に無い状態から再検索へ逃がす唯一の道**
 #    **ここから予約を作ってはいけない。**
 #
-# 3. autopilot_change_offered_slots（app/api/line.py・変更フロー専用）
-#    = **未移行の旧方式。** offer_id もボタンも matches_slot も無く、番号照合は
-#    _extract_alternative_choice（本文中の孤立1桁）＝ #2572 の原因ロジックそのもの。
-#    既存の予約を動かす経路なので、放置期間が長いほど痛い。次に直す筆頭。
+# 3. autopilot_change_offered_slots（変更フロー専用だった旧方式）
+#    = **2026-10-07 に廃止。** 変更の候補も 1 の autopilot_offer に入れ、ボタンで選ばせ、
+#    動かす直前に突き合わせる（line.py の _offer_change_candidates / _confirm_change_pick）。
+#    変更中の候補か新しい予約の候補かは、会話の場面（autopilot_change_datetime か adjusting か）で分ける。
 #
 # 2 を全廃してよくなる条件（次にやる人へ）:
 #   - 候補0件のとき旧キーを [] で上書きしないこと（2026-09-08 に修正済み）
@@ -96,11 +96,18 @@ class Offer:
         }
 
 
+# 一度に出す候補（＝押して選ぶボタン）は3つまで（正解 D11・まことさん 2026-10-07）。
+# 文面の番号とボタンが必ず同じ数になるよう、提示そのものをここで3つに切る。
+MAX_CANDIDATES = 3
+
+
 def new_offer(candidates: list[dict], duration_minutes: int | None = None) -> Offer:
     """提示のたびに新しい offer_id を振る。古いボタンを見分けるため。"""
     return Offer(
         offer_id=uuid.uuid4().hex[:12],
-        candidates=[dict(candidate) for candidate in (candidates or []) if isinstance(candidate, dict)],
+        candidates=[dict(candidate) for candidate in (candidates or []) if isinstance(candidate, dict)][
+            :MAX_CANDIDATES
+        ],
         duration_minutes=duration_minutes,
     )
 

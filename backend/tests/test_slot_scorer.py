@@ -39,13 +39,13 @@ async def test_find_best_practitioner_falls_back_when_top_candidate_conflicts(mo
     async def fake_get_business_hours_for_date(_db, _target_date):
         return _BusinessHours()
 
-    async def fake_load_day_infos(_db, _target_date, _practitioners):
+    async def fake_load_day_infos(_db, _target_date, _practitioners, exclude_reservation_id=None):
         return [
             slot_scorer._DayInfo(practitioner_conflicted, True, [], [], 600, 1260),
             slot_scorer._DayInfo(practitioner_available, True, [], [], 600, 1260),
         ]
 
-    async def fake_check_conflict(_db, practitioner_id, start_dt, end_dt):
+    async def fake_check_conflict(_db, practitioner_id, start_dt, end_dt, exclude_reservation_id=None):
         assert start_dt == datetime(2026, 4, 20, 10, 0, tzinfo=JST)
         assert end_dt == datetime(2026, 4, 20, 11, 0, tzinfo=JST)
         return [object()] if practitioner_id == 1 else []
@@ -99,13 +99,13 @@ async def test_find_best_practitioner_prefers_director(monkeypatch):
     async def fake_get_business_hours_for_date(_db, _target_date):
         return _BusinessHours()
 
-    async def fake_load_day_infos(_db, _target_date, _practitioners):
+    async def fake_load_day_infos(_db, _target_date, _practitioners, exclude_reservation_id=None):
         return [
             slot_scorer._DayInfo(practitioner_staff, True, [], [], 600, 1260),
             slot_scorer._DayInfo(practitioner_director, True, [], [], 600, 1260),
         ]
 
-    async def fake_check_conflict(_db, practitioner_id, start_dt, end_dt):
+    async def fake_check_conflict(_db, practitioner_id, start_dt, end_dt, exclude_reservation_id=None):
         return []
 
     monkeypatch.setattr(slot_scorer, "get_business_hours_for_date", fake_get_business_hours_for_date)
@@ -158,7 +158,7 @@ def _make_candidate_db(day_infos):
     async def fake_bh(_db, _d):
         return _BusinessHours()
 
-    async def fake_load(_db, _d, _pracs):
+    async def fake_load(_db, _d, _pracs, exclude_reservation_id=None):
         return day_infos
 
     return _DB(), fake_bh, fake_load

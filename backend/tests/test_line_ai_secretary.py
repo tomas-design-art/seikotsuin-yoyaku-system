@@ -1333,6 +1333,7 @@ async def test_autopilot_change_proposes_slot_before_rescheduling():
 
     reservation = SimpleNamespace(
         id=91,
+        practitioner_id=3,
         start_time=datetime(2026, 8, 13, 10, 0, tzinfo=JST),
         end_time=datetime(2026, 8, 13, 11, 0, tzinfo=JST),
     )
@@ -1480,15 +1481,6 @@ async def test_autopilot_change_without_datetime_asks_and_keeps_conversation_act
     assert "日時" in mock_reply.await_args.args[1]
 
 
-def test_change_candidate_selection_resolves_nearer_option_to_first_slot():
-    from app.api.line import _select_change_alternative
-
-    alternatives = [
-        {"date": "2026-08-26", "start": "10:00"},
-        {"date": "2026-09-02", "start": "10:00"},
-    ]
-    assert _select_change_alternative("近い方だよ", alternatives) == 1
-    assert _select_change_alternative("2番でお願いします", alternatives) == 2
 
 
 @pytest.mark.asyncio
@@ -1508,6 +1500,8 @@ async def test_autopilot_change_date_only_offers_and_persists_real_slots():
             "date": "2026-08-26",
             "start": "10:00",
             "end": "11:00",
+            "practitioner_id": 3,
+            "practitioner_name": "時田",
             "label": "2026-08-26 10:00〜11:00（担当:時田）",
         }
     )
@@ -1518,9 +1512,11 @@ async def test_autopilot_change_date_only_offers_and_persists_real_slots():
     }
     parsed = {"intent": "change", "date": "2026-08-26", "time": None, "constraints": []}
     db = AsyncMock()
-    db.get = AsyncMock(return_value=reservation)
+    db.get = AsyncMock(side_effect=lambda model, _id: reservation if model.__name__ == "Reservation" else SimpleNamespace(id=3, name="時田"))
 
     with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
+        "app.api.line.set_user_mode", new=AsyncMock()
+    ), patch("app.api.line.reply_text_with_quick_reply", new=AsyncMock()), patch(
         "app.api.line.get_user_state",
         new=AsyncMock(return_value={
             "mode": "autopilot_change_datetime",
@@ -1539,7 +1535,10 @@ async def test_autopilot_change_date_only_offers_and_persists_real_slots():
         await _handle_text_message(event, db)
 
     mock_candidates.assert_awaited_once()
-    assert mock_merge.await_args.args[2]["autopilot_change_offered_slots"][0]["start"] == "10:00"
+    # 変更の候補も新しい予約と同じ置き場（autopilot_offer）へ。番号はボタンで選ばせる（正解 D8）
+    offer = mock_merge.await_args.args[2]["autopilot_offer"]
+    assert offer["candidates"][0]["start"] == "10:00"
+    assert mock_merge.await_args.args[2]["autopilot_change_reservation_id"] == 91
     assert mock_compose.await_args.args[0] == "offer_alternatives"
 
 

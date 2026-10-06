@@ -192,6 +192,23 @@
 
 - **日本語コメントで pip が落ちる**: pip 24.0（手元・本番と同じ版）は requirements を、先頭2行に文字コードの宣言が無いと OS の既定（日本語 Windows では cp932）で読む。UTF-8 の日本語コメントで `UnicodeDecodeError` になった（pip の `auto_decode` で再現）。手順: `requirements*.txt` の1行目の `# -*- coding: utf-8 -*-` を消さない。L1。
 - **uvloop が Windows に入らない**: 本番（Linux）の `pip freeze` をそのまま写すと、手元で `uvloop does not support Windows at the moment` で止まる。手順: 本番の freeze から写すときは、OS で入る・入らないが分かれるもの（uvloop・tzdata・colorama）に、その依存元（uvicorn・tzlocal・pytest）と同じ条件（marker）を付け、Windows の新しい venv でも入れて確かめる。L1。
-- **手元の backend/.venv が requirements と食い違っていた**: bcrypt が 5.0.0（固定は 4.0.1）で、passlib 1.7.4 のハッシュ作成が `ValueError: password cannot be longer than 72 bytes` で落ちる。手順: 手元の venv は `pip install -r requirements-dev.txt` で作り直す。状態: 未対応（手元の venv は触っていない）。
+- **手元の backend/.venv が requirements と食い違っていた**: bcrypt が 5.0.0（固定は 4.0.1）で、passlib 1.7.4 のハッシュ作成が `ValueError: password cannot be longer than 72 bytes` で落ちる。手順: 手元の venv は `pip install -r requirements-dev.txt` で作り直す。状態: 対応済み（2026-10-06 に手元の venv を requirements-dev.txt で入れ直し、bcrypt 4.0.1・pip check 問題なし・テスト全件通過）。
 - **使い捨ての PostgreSQL の 55432 番が別の作業で使用中だった**: 動いている `yoyaku-test-pg` は止めずに、別の名前・ポート（例: `yoyaku-pin-pg`・55433）で立てる。
 - 版の固定漏れ（`>=` などで書く）と依存の書き漏れは CI で止める（固定の検査・`pip install --no-deps` → `pip check`）。わざと壊して落ちることを確認済み。L3。
+
+## 2026-10-07: ボタンを押したときに、前の1通の閉じたセッションで会話状態を書いて止まった（デッドロック）
+
+- 症状: 本物の PostgreSQL で「メッセージ → ボタン」を同じタスクで続けて流すと、ボタンの処理が永久に止まった（テストが5分でも終わらない）。
+- 原因: 返信を作る処理（`_compose_autopilot_reply`・挨拶の判定 `_apply_daily_greeting`）は、セッションと相手を contextvar（`_AUTOPILOT_DB_CONTEXT` / `_AUTOPILOT_USER_CONTEXT`）から読む。これは `_handle_text_message` が入れるだけで、**戻していなかった**。ボタン（postback）の処理はこれを入れないので、前の1通の閉じたセッションが残る。そのセッションで `get_user_state` が会話状態（最終活動時刻）を書くと、いまのセッションが握っている同じ行の鍵を待ち、いまのセッションはその待ちが終わるまで commit できない＝互いに待って止まる。
+- 本番への影響: Webhook の旧経路は1リクエスト＝1タスクなので起きにくいが、**受信キュー（`process_pending_line_events`）は1つのタスクで続けて処理する**ので、同じ患者の「メッセージ → ボタン」が同じ回に入ると、ワーカーが止まり以後のLINEが処理されなくなる。
+- 見落とした理由: 既存のテストは1通ごとに偽のDBで流していて、2通を同じタスクで続けて流すテストが無かった。
+- 手順: `_dispatch_line_event` で1通ごとに contextvar を入れ直し、最後に戻す。contextvar で何かを渡すときは、入れる場所と戻す場所を同じ関数に置く。
+- 状態: L3（tests/test_line_change_cancel_real_db.py のボタンを押す2件。修正前は止まることを確認）。
+
+## 2026-10-07: テストの日付が祝日（スポーツの日）で、院が休診扱いになり候補が出なかった
+
+- 症状: 「今日から5日後」で作ったテストが、空いているはずの枠を「空きなし」と判定した。
+- 原因: 2026-10-12 がスポーツの日。祝日は営業時間の判定で休診になる（平日祝の行が無い限り）。
+- 手順: 本物の DB で日付を使うテストは、祝日を避けた日を使う（tests/test_line_change_cancel_real_db.py の `_day()` は `holidays.Japan()` で祝日を飛ばす）。
+- 状態: L1（初回）。
+

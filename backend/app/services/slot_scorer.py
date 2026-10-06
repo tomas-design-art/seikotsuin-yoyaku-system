@@ -117,8 +117,14 @@ async def _load_day_infos(
     db: AsyncSession,
     target_date: date,
     practitioners: list[Practitioner],
+    exclude_reservation_id: int | None = None,
 ) -> list[_DayInfo]:
-    """1日分の全施術者情報を一括ロード"""
+    """1日分の全施術者情報を一括ロード
+
+    exclude_reservation_id: 予約の変更で、動かそうとしている予約そのもの。
+    これを数えると「13:00〜14:00 を 13:30 へずらす」が自分とぶつかって
+    埋まっている扱いになる（2026-09-28 実機）。
+    """
     start_of_day = datetime.combine(target_date, time(0, 0), tzinfo=JST)
     end_of_day = datetime.combine(target_date, time(23, 59, 59), tzinfo=JST)
     infos: list[_DayInfo] = []
@@ -139,15 +145,16 @@ async def _load_day_infos(
             work_start_min = wsh * 60 + wsm
             work_end_min = weh * 60 + wem
 
+        conditions = [
+            Reservation.practitioner_id == p.id,
+            Reservation.status.in_(ACTIVE_STATUSES),
+            Reservation.start_time >= start_of_day,
+            Reservation.start_time <= end_of_day,
+        ]
+        if exclude_reservation_id is not None:
+            conditions.append(Reservation.id != exclude_reservation_id)
         res = await db.execute(
-            select(Reservation).where(
-                and_(
-                    Reservation.practitioner_id == p.id,
-                    Reservation.status.in_(ACTIVE_STATUSES),
-                    Reservation.start_time >= start_of_day,
-                    Reservation.start_time <= end_of_day,
-                )
-            ).order_by(Reservation.start_time)
+            select(Reservation).where(and_(*conditions)).order_by(Reservation.start_time)
         )
         reservations = []
         for r in res.scalars().all():
@@ -392,6 +399,7 @@ async def find_best_practitioner(
     duration_minutes: int,
     prefer_director: bool = False,
     practitioner_id: int | None = None,
+    exclude_reservation_id: int | None = None,
 ) -> tuple[Practitioner | None, datetime, datetime, int, int]:
     """
     指定スロットで最適な施術者を選択。
@@ -421,7 +429,7 @@ async def find_best_practitioner(
     if slot_start < bh_start or slot_end > bh_end:
         return None, start_dt, end_dt, 0, 0
 
-    day_infos = await _load_day_infos(db, target_date, practitioners)
+    day_infos = await _load_day_infos(db, target_date, practitioners, exclude_reservation_id=exclude_reservation_id)
     max_load = max((di.load for di in day_infos if di.is_working), default=0)
 
     ranked_candidates: list[tuple[float, Practitioner, int, int]] = []
@@ -441,7 +449,9 @@ async def find_best_practitioner(
 
     # ── DB直接問合せによる最終安全チェック ──
     for _, candidate_prac, gap_before, gap_after in ranked_candidates:
-        conflicts = await check_conflict(db, candidate_prac.id, start_dt, end_dt)
+        conflicts = await check_conflict(
+            db, candidate_prac.id, start_dt, end_dt, exclude_reservation_id=exclude_reservation_id
+        )
         if conflicts:
             logger.warning(
                 "slot_scorer safety net caught conflict! prac=%s slot=%s-%s conflicts=%d",
@@ -489,6 +499,7 @@ async def build_same_day_candidates(
     window_end_min: int | None = None,
     max_results: int = 3,
     preferred_first: bool = False,
+    exclude_reservation_id: int | None = None,
 ) -> list[ScoredSlot]:
     """その日の空きを、時間帯を散らして提示順に返す。
 
@@ -532,7 +543,7 @@ async def build_same_day_candidates(
 
     desired_min = min(max(desired_time.hour * 60 + desired_time.minute, ws), we)
 
-    day_infos = await _load_day_infos(db, target_date, practitioners)
+    day_infos = await _load_day_infos(db, target_date, practitioners, exclude_reservation_id=exclude_reservation_id)
     working = [info for info in day_infos if info.is_working]
     if not working:
         return []
@@ -629,6 +640,7 @@ async def build_candidates_over_days(
     max_results: int = 3,
     search_days: int = 1,
     preferred_first: bool = False,
+    exclude_reservation_id: int | None = None,
 ) -> list[ScoredSlot]:
     """希望条件（時間帯・除外日）を守ったまま、当日から順に候補を集める。"""
     exclude_dates = exclude_dates or set()
@@ -649,6 +661,7 @@ async def build_candidates_over_days(
             window_end_min=window_end_min,
             max_results=max_results - len(results),
             preferred_first=preferred_first,
+            exclude_reservation_id=exclude_reservation_id,
         )
         results.extend(day_results)
         if len(results) >= max_results:
