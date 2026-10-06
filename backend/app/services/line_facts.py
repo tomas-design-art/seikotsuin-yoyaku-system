@@ -221,6 +221,7 @@ async def collect_question_facts(
     previous_category: str | None = None,
     patient_id: int | None = None,
     conversation_date: date | None = None,
+    usual_practitioner_id: int | None = None,
 ) -> dict | None:
     """質問に対してシステムが根拠を持つ事実を返す。答えられなければ None。
 
@@ -305,7 +306,9 @@ async def collect_question_facts(
             target_date,
             time(9, 0),
             duration,
-            preferred_practitioner_id=practitioner.id if practitioner else None,
+            # 名指しが無ければ、いつもの担当の枠を先に探す。探さないと他の担当の朝の枠で
+            # 3件が埋まり、AIが「いつもの担当（時田）は埋まっている」と書く（2026-09-28 実機・正解 D9）
+            preferred_practitioner_id=practitioner.id if practitioner else usual_practitioner_id,
             max_results=3,
             preferred_first=True,
         )

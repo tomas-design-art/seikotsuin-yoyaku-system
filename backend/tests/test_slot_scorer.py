@@ -388,7 +388,8 @@ def test_the_candidate_label_reads_as_a_japanese_date_not_an_iso_string():
         date(2026, 9, 9), time(10, 0), time(11, 0), 2, "上田", 0.0,
     )
 
-    assert slot.label == "9/9(水) 10:00〜11:00（担当: 上田）"
+    # 終了時刻は言わない（正解 D3・まことさん 2026-08-27「13:30〜、16:15〜…などが空いております」）
+    assert slot.label == "9/9(水) 10:00〜（担当: 上田）"
     assert "2026-" not in slot.label
     # to_dict の date は ISO のまま（曜日の検算や日付の突き合わせが使う）
     assert slot.to_dict()["date"] == "2026-09-09"

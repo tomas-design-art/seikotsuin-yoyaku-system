@@ -63,6 +63,7 @@ from app.services.line_facts import (
 )
 from app.services.line_negotiation import SlotFilters, build_slot_filters
 from app.services.slot_scorer import (
+    ScoredSlot,
     build_candidates_over_days,
     build_same_day_candidates,
     build_day_availability_summary,
@@ -245,6 +246,7 @@ _AUTOPILOT_BOOKING_MODES = {
     "autopilot_change_select",
     "autopilot_change_datetime",
     "autopilot_change_confirm",
+    "autopilot_date_confirm",
 }
 # 変更の途中の場面。ここでキャンセルと言われたら、動かそうとしている予約のキャンセルとして受ける。
 _CHANGE_MODES = {"autopilot_change_select", "autopilot_change_datetime", "autopilot_change_confirm"}
@@ -257,6 +259,7 @@ _NEW_BOOKING_MODES = {
     "autopilot_booking_confirm",
     "autopilot_slot_confirm",
     "adjusting",
+    "autopilot_date_confirm",
 }
 _CANCEL_MODES = {"autopilot_cancel_select", "autopilot_cancel_confirm"}
 # 押して選ぶボタンは3つまで（正解 D11・まことさん 2026-10-07）。
@@ -952,6 +955,7 @@ _CONFIRM_FORM_MODES = {
     "usual": "autopilot_confirm_usual",
     "cancel": "autopilot_cancel_confirm",
     "change": "autopilot_change_confirm",
+    "date": "autopilot_date_confirm",
 }
 
 
@@ -2164,6 +2168,278 @@ async def _start_change_selection(
         )
 
 
+async def _booking_draft_with_defaults(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    patient: Patient,
+    draft: dict,
+    request_id: str | None,
+) -> dict:
+    """メニュー・施術時間・担当の箱が空いていれば、登録情報（いつもの・前回）で埋める（正解 C1）。"""
+    if draft.get("menu_name") and draft.get("duration_minutes") and draft.get("practitioner_id"):
+        return draft
+    defaults = await _resolve_booking_defaults(db, user_id=user_id, patient=patient)
+    missing = {key: value for key, value in defaults.items() if draft.get(key) in (None, "") and value not in (None, "")}
+    if not missing:
+        return draft
+    return await merge_user_draft(db, user_id, missing, request_id)
+
+
+async def _booking_duration(db: AsyncSession, draft: dict) -> int:
+    menu = await _resolve_menu(db, draft.get("menu_name"))
+    return int(draft.get("duration_minutes") or (menu.duration_minutes if menu else 60))
+
+
+async def _send_booking_offer(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    request_id: str | None,
+    draft: dict,
+    target_date: date,
+    duration: int,
+    candidates: list[dict],
+    text: str,
+    parsed_intent: dict | None,
+    extra: dict | None = None,
+) -> None:
+    """新しい予約の候補を保存してボタンつきで出す（候補の置き場は autopilot_offer だけ）。"""
+    await merge_user_draft(
+        db,
+        user_id,
+        {
+            "date": target_date.isoformat(),
+            "autopilot_offered_slots": _to_offered_slots(candidates),
+            "autopilot_offer_duration": duration,
+        },
+        request_id,
+    )
+    offer = await _offer_candidates(db, user_id, candidates, duration, request_id)
+    await _reply_offer(
+        reply_token,
+        offer,
+        await _compose_autopilot_reply(
+            "offer_alternatives",
+            {
+                "alternatives": offer.candidates,
+                "vague": True,
+                "menu": draft.get("menu_name"),
+                "duration_minutes": duration,
+                "patient_message": text,
+                **_preferred_practitioner_context(draft, offer.candidates),
+                **(extra or {}),
+            },
+            parsed_intent,
+        ),
+    )
+
+
+async def _offer_booking_day(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    request_id: str | None,
+    patient: Patient,
+    draft: dict,
+    target_date: date,
+    text: str,
+    parsed_intent: dict | None,
+) -> None:
+    """その日の空きを、いつもの担当の枠を先頭にして候補で出す（正解 D2・D9）。
+
+    「やっぱり木曜日は空いてる？」に、AIの自由な文で答えさせない。コードが調べた候補を
+    出す。以前は他の担当の朝の枠で候補が埋まり、AIが空いていた院長を「埋まっている」と
+    書いた（2026-09-28 実機）。
+    """
+    if await _reply_if_closed_day(
+        db,
+        user_id=user_id,
+        reply_token=reply_token,
+        target_date=target_date,
+        text=text,
+        parsed_intent=parsed_intent,
+        request_id=request_id,
+    ):
+        return
+    draft = await _booking_draft_with_defaults(
+        db, user_id=user_id, patient=patient, draft=draft, request_id=request_id
+    )
+    duration = await _booking_duration(db, draft)
+    scored = await build_same_day_candidates(
+        db,
+        target_date,
+        time(9, 0),
+        duration,
+        preferred_practitioner_id=draft.get("practitioner_id"),
+        max_results=_MAX_CHOICE_BUTTONS,
+        preferred_first=True,
+    )
+    candidates = [candidate.to_dict() for candidate in scored]
+    if not candidates:
+        await merge_user_draft(db, user_id, {"date": target_date.isoformat()}, request_id)
+        await set_user_mode(db, user_id, "waiting_datetime", request_id)
+        if reply_token:
+            await reply_to_line(
+                reply_token,
+                await _compose_autopilot_reply(
+                    "no_candidates",
+                    {
+                        "date": _format_date_with_weekday_jp(target_date),
+                        "next_open_dates": await next_open_dates(db, target_date),
+                        "patient_message": text,
+                    },
+                    parsed_intent,
+                ),
+            )
+        return
+    await _send_booking_offer(
+        db,
+        user_id=user_id,
+        reply_token=reply_token,
+        request_id=request_id,
+        draft=draft,
+        target_date=target_date,
+        duration=duration,
+        candidates=candidates,
+        text=text,
+        parsed_intent=parsed_intent,
+        extra={"date_only": True},
+    )
+
+
+async def _offer_booking_near_time(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    request_id: str | None,
+    patient: Patient,
+    draft: dict,
+    target_date: date,
+    desired_time: time,
+    text: str,
+    parsed_intent: dict | None,
+) -> None:
+    """言われた時刻ちょうどを確かめる（正解 D4・D10）。
+
+    空いていれば、その時刻を先頭に、前後1時間くらいの空きを添えて候補で出す（ボタン3つまで）。
+    いつもの担当が空いていなければ、その事実を伝え、近い枠と、その時刻に空いている別の担当を出す。
+    以前は保存した候補に無い時刻だと、条件の変更として扱わず同じ候補を出し直した（2026-09-28 実機）。
+    """
+    if await _reply_if_closed_day(
+        db,
+        user_id=user_id,
+        reply_token=reply_token,
+        target_date=target_date,
+        text=text,
+        parsed_intent=parsed_intent,
+        request_id=request_id,
+    ):
+        return
+    draft = await _booking_draft_with_defaults(
+        db, user_id=user_id, patient=patient, draft=draft, request_id=request_id
+    )
+    duration = await _booking_duration(db, draft)
+    preferred_id = draft.get("practitioner_id")
+    desired = desired_time.hour * 60 + desired_time.minute
+    stamp = desired_time.strftime("%H:%M")
+
+    def _slot(practitioner: Practitioner) -> dict:
+        end = datetime.combine(target_date, desired_time) + timedelta(minutes=duration)
+        return ScoredSlot(target_date, desired_time, end.time(), practitioner.id, practitioner.name, 0.0).to_dict()
+
+    exact_practitioner, *_ = await find_best_practitioner(
+        db, target_date, desired_time, duration, practitioner_id=preferred_id
+    )
+    candidates: list[dict] = [_slot(exact_practitioner)] if exact_practitioner else []
+    nearby = await build_same_day_candidates(
+        db,
+        target_date,
+        desired_time,
+        duration,
+        preferred_practitioner_id=preferred_id,
+        window_start_min=max(desired - 60, 0),
+        window_end_min=desired + 60 + duration,
+        max_results=_MAX_CHOICE_BUTTONS,
+        preferred_first=True,
+    )
+    for candidate in (scored.to_dict() for scored in nearby):
+        if any(
+            candidate["start"] == taken["start"] and candidate["practitioner_id"] == taken["practitioner_id"]
+            for taken in candidates
+        ):
+            continue
+        candidates.append(candidate)
+    if not exact_practitioner and preferred_id:
+        # いつもの担当は空いていない。その時刻に空いている別の担当がいれば、名前つきで候補に入れる
+        other, *_ = await find_best_practitioner(db, target_date, desired_time, duration)
+        if other and not any(c["start"] == stamp and c["practitioner_id"] == other.id for c in candidates):
+            candidates.append(_slot(other))
+    candidates = candidates[:_MAX_CHOICE_BUTTONS]
+    if not candidates:
+        await _offer_booking_day(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            request_id=request_id,
+            patient=patient,
+            draft=draft,
+            target_date=target_date,
+            text=text,
+            parsed_intent=parsed_intent,
+        )
+        return
+    if exact_practitioner:
+        extra = {"requested_note": f"{stamp}〜は空いております。"}
+    else:
+        name = str(draft.get("practitioner_name") or "").split()[0] if draft.get("practitioner_name") else ""
+        extra = {"unavailable_note": f"{stamp}〜は{name + 'の' if name else ''}空きがございません。"}
+    await _send_booking_offer(
+        db,
+        user_id=user_id,
+        reply_token=reply_token,
+        request_id=request_id,
+        draft=draft,
+        target_date=target_date,
+        duration=duration,
+        candidates=candidates,
+        text=text,
+        parsed_intent=parsed_intent,
+        extra=extra,
+    )
+
+
+# 「1日空いてない？」の「1日」。ついたち（日付）か、いちにち（終日）か、言葉だけでは決まらない（正解 E2）。
+# 「10月1日」「1日中」「1日おき」などは除く。
+_BARE_FIRST_DAY = re.compile(r"(?<![0-9/月])1日(?!中|間|おき|以上|分|後|前|目|ずつ|ごと)")
+
+
+def _mentions_bare_first_day(text: str) -> bool:
+    normalized = unicodedata.normalize("NFKC", text or "").replace("一日", "1日")
+    return bool(_BARE_FIRST_DAY.search(normalized))
+
+
+def _next_first_day(today: date) -> date:
+    if today.day == 1:
+        return today
+    return date(today.year + (1 if today.month == 12 else 0), 1 if today.month == 12 else today.month + 1, 1)
+
+
+def _date_confirmation_plan(day: date) -> ReplyPlan:
+    label = _format_date_with_weekday_jp(day)
+    return ReplyPlan(ask=f"{label}のことでしょうか？", ask_about="こと", yes_no=True, keep=[label])
+
+
+def _parse_hhmm(value: object) -> time | None:
+    try:
+        return time.fromisoformat(str(value)[:5])
+    except (TypeError, ValueError):
+        return None
+
+
 _EXPLICIT_DATE_PATTERN = re.compile(
     r"\d{4}-\d{1,2}-\d{1,2}"
     r"|\d{1,2}\s*[月/]\s*\d{1,2}"
@@ -3272,6 +3548,30 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         ):
             return
 
+        # 「1日空いてない？」の「1日」（正解 E2・E3）。話している日が1日（ついたち）なら、その日のこと。
+        # そうでなければ「◯/1(◯)のことでしょうか？」と聞き返す。AIの読み取りには任せない。
+        if (current_mode in _NEW_BOOKING_MODES or current_mode in {None, "idle"}) and current_mode != "autopilot_date_confirm" and _mentions_bare_first_day(text):
+            today = now_jst().date()
+            discussed = _parse_iso_date(prev_draft.get("date"))
+            if discussed and discussed.day == 1 and discussed >= today:
+                await _offer_booking_day(
+                    db,
+                    user_id=user_id,
+                    reply_token=reply_token,
+                    request_id=user_state.get("request_id"),
+                    patient=line_patient,
+                    draft=prev_draft,
+                    target_date=discussed,
+                    text=text,
+                    parsed_intent=parsed_intent,
+                )
+                return
+            pending = _next_first_day(today)
+            await merge_user_draft(db, user_id, {"autopilot_pending_date": pending.isoformat()}, user_state.get("request_id"))
+            await set_user_mode(db, user_id, "autopilot_date_confirm", user_state.get("request_id"))
+            await _reply_plan(reply_token, "date", _date_confirmation_plan(pending))
+            return
+
         # 候補提示中の番号返信は「明示的な選択」。
         # 確信度や needs_human の判定より先に扱う（提示直後に聞き返すのは受付として誤り）。
         explicit_choice = False
@@ -3663,6 +3963,47 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
         return
 
+    if is_autopilot_patient and current_mode == "autopilot_date_confirm":
+        pending = _parse_iso_date(prev_draft.get("autopilot_pending_date"))
+        answer = confirmation.read_answer(text, parsed_intent)
+        if pending and answer == confirmation.YES:
+            await _offer_booking_day(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                request_id=user_state.get("request_id"),
+                patient=line_patient,
+                draft=prev_draft,
+                target_date=pending,
+                text=text,
+                parsed_intent=parsed_intent,
+            )
+            return
+        if answer == confirmation.NO or not pending:
+            await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))
+            if reply_token:
+                await reply_to_line(
+                    reply_token,
+                    await _compose_autopilot_reply(
+                        "ask_datetime",
+                        {"patient_name": line_patient.name, "patient_message": text},
+                        parsed_intent,
+                    ),
+                )
+            return
+        await _reask_confirmation(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            patient=line_patient,
+            text=text,
+            parsed_intent=parsed_intent,
+            request_id=user_state.get("request_id"),
+            form="date",
+            plan=_date_confirmation_plan(pending),
+        )
+        return
+
     if is_autopilot_patient and current_mode == "adjusting":
         # 番号は「保存した候補」にだけ照合する。本文が番号だけのときに限る。
         # 以前は本文から最初の孤立した1桁を拾い、別の場所に保存された古い候補を
@@ -3695,6 +4036,41 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 index=picked_index,
                 menu_name=prev_draft.get("menu_name"),
                 request_id=user_state.get("request_id"),
+            )
+            return
+
+        # 保存した候補に無い時刻・日を言われたら、その時刻・その日を調べ直す（正解 D4・D10・D9・E4）。
+        # 以前は条件の変更として扱わず、同じ候補をそのまま出し直した（2026-09-28 実機）。
+        offered_date = _parse_iso_date(stored_offer.candidates[0].get("date")) if stored_offer else None
+        explicit_date = (
+            _parse_iso_date((parsed_intent or {}).get("date")) if _mentions_explicit_date(text) else None
+        )
+        requested_time = _parse_hhmm((parsed_intent or {}).get("time"))
+        if requested_time and not _has_cancellation_intent(text):
+            await _offer_booking_near_time(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                request_id=user_state.get("request_id"),
+                patient=line_patient,
+                draft=merged or prev_draft,
+                target_date=explicit_date or offered_date or _parse_iso_date(prev_draft.get("date")) or now_jst().date(),
+                desired_time=requested_time,
+                text=text,
+                parsed_intent=parsed_intent,
+            )
+            return
+        if explicit_date and explicit_date != offered_date and not _has_cancellation_intent(text):
+            await _offer_booking_day(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                request_id=user_state.get("request_id"),
+                patient=line_patient,
+                draft=merged or prev_draft,
+                target_date=explicit_date,
+                text=text,
+                parsed_intent=parsed_intent,
             )
             return
 
@@ -4207,7 +4583,25 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             # いま会話で扱っている日。これを渡さないと、明後日の話の最中に
             # 尋ねられた勤務時間へ、当日の勤務時間を答えてしまう。
             conversation_date=_parse_iso_date(prev_draft.get("date")),
+            usual_practitioner_id=prev_draft.get("practitioner_id"),
         )
+        # 予約の途中で空きを聞かれたら、AIの自由な文で答えず、その日の候補を出す（正解 D9）
+        in_booking = current_mode in _NEW_BOOKING_MODES or bool(
+            prev_draft.get("menu_name") or prev_draft.get("autopilot_offer")
+        )
+        if facts and facts.get("category") == "availability" and facts.get("date") and in_booking:
+            await _offer_booking_day(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                request_id=user_state.get("request_id"),
+                patient=line_patient,
+                draft=prev_draft,
+                target_date=date.fromisoformat(facts["date"]),
+                text=text,
+                parsed_intent=parsed_intent,
+            )
+            return
         if facts and facts.get("category"):
             try:
                 await merge_user_draft(

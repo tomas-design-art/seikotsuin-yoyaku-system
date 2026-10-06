@@ -75,9 +75,10 @@ class ScoredSlot:
         確定・キャンセルの文面は「後から見返す記録」なので `2026/09/09` のまま
         にしてある。ここは「選ぶための一時情報」なので、役割が違うものを揃えない。
         """
+        # 終了時刻は言わない（正解 D3・まことさん 2026-08-27「13:30〜、16:15〜…などが空いております」）
         self.label = (
             f"{format_date_jp(self.date)} "
-            f"{self.start_time.strftime('%H:%M')}〜{self.end_time.strftime('%H:%M')}"
+            f"{self.start_time.strftime('%H:%M')}〜"
             f"（担当: {self.practitioner_name}）"
         )
 
