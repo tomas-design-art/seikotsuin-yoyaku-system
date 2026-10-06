@@ -135,8 +135,14 @@ class TestEndToEndScenarios(unittest.TestCase):
         status = asyncio.run(determine_status(mock_db, data))
         assert status == "CONFIRMED"
 
-    def test_phone_reservation_no_menu_pending(self):
-        """電話予約でメニュー未選択→PENDING"""
+    @patch("app.services.reservation_service.check_patient_conflict", new_callable=AsyncMock, return_value=[])
+    @patch("app.services.reservation_service.check_conflict", new_callable=AsyncMock, return_value=[])
+    def test_phone_reservation_without_menu_is_confirmed_when_nothing_conflicts(self, mock_check, mock_patient_check):
+        """電話予約でメニュー未選択でも、競合がなければ CONFIRMED。
+
+        2026-04-14（4fe0926）に「メニュー未選択は仮予約条件にしない（手入力ではメニューを
+        後から入れる運用）」へ変わった。このテストだけ以前の PENDING を期待したまま残っていた。
+        """
         from app.services.reservation_service import determine_status
         from app.schemas.reservation import ReservationCreate
 
@@ -149,7 +155,7 @@ class TestEndToEndScenarios(unittest.TestCase):
             channel="PHONE",
         )
         status = asyncio.run(determine_status(mock_db, data))
-        assert status == "PENDING"
+        assert status == "CONFIRMED"
 
     @patch("app.services.reservation_service.check_conflict", new_callable=AsyncMock)
     def test_phone_reservation_with_conflict_pending(self, mock_check):

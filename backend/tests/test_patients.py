@@ -230,17 +230,32 @@ class TestPatientMatchFindOrCreate(unittest.TestCase):
         from sqlalchemy.orm import sessionmaker
 
         from app.database import Base
-        import app.models.patient  # noqa: F401
-        import app.models.practitioner  # noqa: F401
-        import app.models.menu  # noqa: F401
-        import app.models.reservation_color  # noqa: F401
+        from app.models.menu import Menu
+        from app.models.patient import Patient
+        from app.models.practitioner import Practitioner
+        from app.models.reservation import Reservation
+        from app.models.reservation_color import ReservationColor
+        from app.models.reservation_series import ReservationSeries
 
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         Session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
         async def setup():
             async with engine.begin() as conn:
-                await conn.run_sync(Base.metadata.create_all)
+                # 作る表を明示する。Base.metadata には先に走ったテストが読み込んだモデル
+                # （SQLite では作れない JSONB の表など）も載るので、全部作ろうとすると
+                # 単体では通るのに全体で回すと落ちる（2026-10-06 修正）。
+                await conn.run_sync(
+                    Base.metadata.create_all,
+                    tables=[
+                        Patient.__table__,
+                        Practitioner.__table__,
+                        Menu.__table__,
+                        ReservationColor.__table__,
+                        ReservationSeries.__table__,
+                        Reservation.__table__,
+                    ],
+                )
             return Session
 
         loop = asyncio.new_event_loop()

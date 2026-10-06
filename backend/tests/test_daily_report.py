@@ -7,12 +7,12 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api.reservations import get_daily_report
 from app.database import Base
-from app.models.menu import Menu
+from app.models.menu import Menu, MenuPriceTier
 from app.models.patient import Patient
 from app.models.practitioner import Practitioner
 from app.models.reservation import Reservation
-import app.models.reservation_color  # noqa: F401
-import app.models.reservation_series  # noqa: F401
+from app.models.reservation_color import ReservationColor
+from app.models.reservation_series import ReservationSeries
 
 
 JST = ZoneInfo("Asia/Tokyo")
@@ -25,7 +25,21 @@ def test_daily_report_returns_confirmed_reservations_until_cutoff():
 
     async def _run():
         async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+        # 作る表を明示する。Base.metadata には先に走ったテストが読み込んだモデル
+        # （SQLite では作れない JSONB の表など）も載るので、全部作ろうとすると
+        # 単体では通るのに全体で回すと落ちる（2026-10-06 修正）。
+            await conn.run_sync(
+                Base.metadata.create_all,
+                tables=[
+                    Patient.__table__,
+                    Practitioner.__table__,
+                    Menu.__table__,
+                    MenuPriceTier.__table__,
+                    ReservationColor.__table__,
+                    ReservationSeries.__table__,
+                    Reservation.__table__,
+                ],
+            )
 
         async with Session() as db:
             practitioner = Practitioner(name="上田", role="施術者", daily_report_code="上")
