@@ -1232,6 +1232,8 @@ async def test_autopilot_cancel_confirmation_accepts_casual_affirmative():
     ), patch("app.api.line.create_notification", new=AsyncMock()) as mock_notification, patch(
         "app.api.line.transition_status", new=AsyncMock(return_value=cancelled_reservation)
     ) as mock_transition, patch("app.api.line.clear_user_draft", new=AsyncMock()), patch(
+        "app.api.line.reset_autopilot_failures", new=AsyncMock()
+    ), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ) as mock_set_mode, patch(
         "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="9/4 17時のご予約をキャンセルしました。")
@@ -1312,6 +1314,8 @@ async def test_cancel_confirmation_survives_recent_booking_no_reply_shortcut():
     ), patch(
         "app.api.line.transition_status", new=AsyncMock(return_value=cancelled_reservation)
     ) as mock_transition, patch("app.api.line.clear_user_draft", new=AsyncMock()), patch(
+        "app.api.line.reset_autopilot_failures", new=AsyncMock()
+    ), patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ) as mock_set_mode, patch(
         "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご予約をキャンセルしました。")
@@ -2564,7 +2568,10 @@ async def test_autopilot_reservation_status_question_uses_db_facts_before_handof
 
 
 @pytest.mark.asyncio
-async def test_autopilot_urgent_availability_question_hands_off_to_human():
+async def test_autopilot_urgent_availability_question_asks_to_call_the_clinic():
+    """ぎっくり腰で今日すぐ診てほしい、のような人が受けるべき内容は、手動対応に切り替えて
+    「担当者からご連絡します」と待たせず、「医院に直接お電話ください」と案内する（正解 I3・2026-10-07）。
+    院長のLINEへの通知は記録として残す。"""
     from app.api.line import _handle_text_message
 
     patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
@@ -2593,14 +2600,17 @@ async def test_autopilot_urgent_availability_question_hands_off_to_human():
     ), patch("app.api.line.create_notification", new=AsyncMock()) as mock_notify, patch(
         "app.api.line.set_user_mode", new=AsyncMock()
     ) as mock_set_mode, patch(
-        "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="担当者からご連絡します。")
-    ) as mock_compose, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+        "app.api.line.reset_user_conversation", new=AsyncMock()
+    ) as mock_reset, patch(
+        "app.api.line._apply_daily_greeting", new=AsyncMock(side_effect=lambda reply: reply)
+    ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
         await _handle_text_message(event, AsyncMock())
 
     mock_notify.assert_awaited_once()
-    assert mock_set_mode.await_args.args[1:] == ("U-autopilot", "manual")
-    assert mock_compose.await_args.args[0] == "handoff_to_human"
+    assert all(call.args[2] != "manual" for call in mock_set_mode.await_args_list)
+    assert mock_reset.await_args.kwargs["reason"] == "needs_human"
     mock_reply.assert_awaited_once()
+    assert "医院に直接お電話ください" in mock_reply.await_args.args[1]
 
 
 @pytest.mark.asyncio

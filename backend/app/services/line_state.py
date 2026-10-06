@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import uuid
+from datetime import datetime, timedelta
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -235,10 +236,14 @@ async def remember_completed_booking(
     line_user_id: str,
     booking: dict,
 ) -> None:
-    """直近に確定した予約の事実を、次の自然な会話理解のためだけに残す。"""
+    """直近に確定した予約の事実を、次の自然な会話理解のためだけに残す。
+
+    手続きが済んだので、うまくいかなかった回数も数え直す（I1・I2）。
+    """
     state = await _get_or_create_state(db, line_user_id)
     context = _normalize_context(state.context_data)
     context["recent_completed_booking"] = dict(booking)
+    context.pop(FAILURE_KEY, None)
     state.context_data = context
     await db.flush()
 
@@ -255,6 +260,41 @@ async def clear_recent_completed_booking(db: AsyncSession, line_user_id: str) ->
 # 会話履歴や draft とは別に持つ。予約確定・キャンセル確定で履歴を消しても、
 # その日のうちに二度目の挨拶をしないため（2026-09-15 まことさん決定）。
 GREETED_ON_KEY = "last_greeted_on"
+
+
+# 自動予約がうまくいかなかった回数（正解 I1・I2・まことさん 2026-10-07）。
+# 1回目は「最初からやり直してください」、2回目は「医院に直接お電話ください」と案内する。
+# 会話を最初からにしても数えた回数は残す必要があるので、draft とは別に持つ。
+# 手続きが済んだら・電話を案内したら・しばらくたったら数え直す。
+FAILURE_KEY = "autopilot_failures"
+
+
+async def bump_autopilot_failures(db: AsyncSession, line_user_id: str, *, window: timedelta) -> int:
+    """失敗を1回数えて、今回が何回目かを返す。前の失敗から window より空いていれば1回目に戻す。"""
+    state = await _get_or_create_state(db, line_user_id)
+    context = _normalize_context(state.context_data)
+    record = context.get(FAILURE_KEY) if isinstance(context.get(FAILURE_KEY), dict) else {}
+    now = now_jst()
+    try:
+        last = datetime.fromisoformat(str(record.get("at")))
+    except (TypeError, ValueError):
+        last = None
+    count = int(record.get("count") or 0) if last and now - last <= window else 0
+    count += 1
+    context[FAILURE_KEY] = {"count": count, "at": now.isoformat()}
+    state.context_data = context
+    await db.flush()
+    return count
+
+
+async def reset_autopilot_failures(db: AsyncSession, line_user_id: str) -> None:
+    state = await _get_or_create_state(db, line_user_id)
+    context = _normalize_context(state.context_data)
+    if FAILURE_KEY not in context:
+        return
+    context.pop(FAILURE_KEY, None)
+    state.context_data = context
+    await db.flush()
 
 
 async def mark_greeted_on(db: AsyncSession, line_user_id: str, day_iso: str) -> None:

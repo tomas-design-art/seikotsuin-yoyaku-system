@@ -79,6 +79,7 @@ from app.services.line_reply import (
 )
 from app.services.line_state import (
     GREETED_ON_KEY,
+    bump_autopilot_failures,
     clear_user_draft,
     clear_recent_completed_booking,
     create_pending_request,
@@ -88,6 +89,7 @@ from app.services.line_state import (
     mark_greeted_on,
     merge_user_draft,
     remember_completed_booking,
+    reset_autopilot_failures,
     reset_user_conversation,
     set_user_mode,
     update_request,
@@ -1199,7 +1201,8 @@ async def _reply_confirmation(reply_token: str | None, form: str, message: str) 
 
 # 確認の返事が読めなかった回数。閾値は既存の autopilot_cancel_select_failures に合わせる。
 _CONFIRM_UNCLEAR_KEY = "autopilot_confirm_unclear"
-_CONFIRM_UNCLEAR_LIMIT = 3
+# 確認への分からない返事は、1回目は聞き直し、続いたら（2回目）失敗として扱う（正解 X4・2026-10-07）
+_CONFIRM_UNCLEAR_LIMIT = 2
 
 
 async def _reply_if_closed_day(
@@ -2698,6 +2701,18 @@ def _date_shift_context(requested_date: date, candidates: list[dict]) -> dict:
     }
 
 
+_RETRY_GUIDANCE = "理解できなかった場合、お手数ですが最初からやり直してください。"
+_PHONE_GUIDANCE = "お手数ですが、医院に直接お電話ください。"
+
+
+def _retry_guidance_plan() -> ReplyPlan:
+    return ReplyPlan(facts=[_RETRY_GUIDANCE], keep=["最初からやり直してください"])
+
+
+def _phone_guidance_plan() -> ReplyPlan:
+    return ReplyPlan(facts=["大変申し訳ございません。", _PHONE_GUIDANCE], keep=["医院に直接お電話ください"])
+
+
 async def _handoff_autopilot_to_human(
     db: AsyncSession,
     *,
@@ -2708,19 +2723,29 @@ async def _handoff_autopilot_to_human(
     parsed_intent: dict | None,
     notification: str,
 ) -> None:
-    """手動退避は最後の手段。理由はLLMへ渡さず、引き継ぎだけ伝える。"""
-    autopilot_log.note("handoff", notification=notification)
-    await set_user_mode(db, user_id, "manual")
-    await create_notification(db, "line_manual_mode", notification)
+    """自動予約がうまくいかなかったとき（正解 I1〜I3・まことさん 2026-10-07）。
+
+    - 1回目：「理解できなかった場合、お手数ですが最初からやり直してください」と案内し、会話を最初からにする
+    - 2回目：丁寧に謝って「医院に直接お電話ください」と案内する（数え直す）
+    - 以前のように「手動対応」に切り替えて「担当者が確認します」とは返さない。院長のLINEへの
+      引き継ぎはメッセージだと気づかれないことがあり、患者さんが宙に浮くため。
+      通知は記録として残すが、それに頼らない。
+    名前は呼び出し側（約10か所）を変えないため残している。
+    """
+    count = await bump_autopilot_failures(db, user_id, window=_CONVERSATION_TIMEOUT)
+    phone = count >= 2
+    autopilot_log.note("handoff", notification=notification, failure_count=count, guidance="phone" if phone else "retry")
+    await create_notification(
+        db,
+        "line_manual_mode",
+        f"{notification}（患者へ{'電話をお願いする案内' if phone else 'やり直しの案内'}を送信）",
+    )
+    await reset_user_conversation(db, user_id, reason="autopilot_failure")
+    if phone:
+        await reset_autopilot_failures(db, user_id)
     if reply_token:
-        await reply_to_line(
-            reply_token,
-            await _compose_autopilot_reply(
-                "handoff_to_human",
-                {"patient_message": text},
-                parsed_intent,
-            ),
-        )
+        plan = _phone_guidance_plan() if phone else _retry_guidance_plan()
+        await reply_to_line(reply_token, await _polished_from_plan(plan))
 
 
 async def _reoffer_autopilot_candidates(
@@ -3267,21 +3292,16 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 or _requires_human_priority(parsed_intent, text)
             )
         ):
-            await create_notification(db, "line_manual_mode", f"LINE手動対応: {line_patient.id}")
+            await create_notification(db, "line_manual_mode", f"LINE手動対応: {line_patient.id}（患者へ電話をお願いする案内を送信）")
             if (
                 _requires_human_priority(parsed_intent, text)
                 or not parsed_intent.get("has_reservation_intent")
             ):
-                await set_user_mode(db, user_id, "manual")
+                # 遅刻の連絡や相談など、人が受けるべき内容。院長のLINEへの通知を待たせて
+                # 宙に浮かせず、電話を案内する（正解 I3）。失敗ではないので回数には数えない。
+                await reset_user_conversation(db, user_id, reason="needs_human")
                 if reply_token:
-                    await reply_to_line(
-                        reply_token,
-                        await _compose_autopilot_reply(
-                            "handoff_to_human",
-                            {"reason": "担当者による確認が必要", "patient_message": text},
-                            parsed_intent,
-                        ),
-                    )
+                    await reply_to_line(reply_token, await _polished_from_plan(_phone_guidance_plan()))
                 return
         # 候補を出した後も条件は動く（「やっぱり30分で」「時田先生で」）。
         # ここを idle 系のモードに限っていたため、候補提示中に何を言われても
@@ -3838,6 +3858,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     )
                 return
             await set_user_mode(db, user_id, "idle")
+            await reset_autopilot_failures(db, user_id)
             if reply_token:
                 await reply_to_line(
                     reply_token,
