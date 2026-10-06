@@ -395,28 +395,6 @@ def _format_usual_shortcut_text(menu_name: str, duration_minutes: int, practitio
     return f"⭐️いつもの（{menu_name} {duration_minutes}分）"
 
 
-def _build_duration_quick_reply_items(min_minutes: int, max_minutes: int, max_items: int = 3) -> list[dict]:
-    """施術時間のボタン。3つまで（正解 D11）。短い・中くらい・長いを出し、それ以外は文字で受ける。"""
-    middle = int(round((min_minutes + max_minutes) / 2 / 10.0)) * 10
-    choices = list(dict.fromkeys(value for value in (min_minutes, middle, max_minutes) if min_minutes <= value <= max_minutes))
-    items: list[dict] = []
-    for d in choices:
-        if len(items) >= max_items:
-            break
-        label = f"{d}分"
-        items.append(
-            {
-                "type": "action",
-                "action": {
-                    "type": "message",
-                    "label": label,
-                    "text": label,
-                },
-            }
-        )
-    return items
-
-
 def _build_yes_no_new_quick_reply_items() -> list[dict]:
     return [
         {
@@ -643,75 +621,31 @@ def _has_assumed_booking_defaults(draft: dict) -> bool:
 async def _build_menu_quick_reply_items(
     db: AsyncSession,
     line_user_id: str | None = None,
-    max_items: int = 6,
     patient: Patient | None = None,
 ) -> list[dict]:
-    """メニューを聞くときのボタン。3つまで（正解 D11・D7：メニューを全部ボタンで並べない）。"""
-    return (await _build_menu_quick_reply_items_all(db, line_user_id, max_items, patient))[:_MAX_CHOICE_BUTTONS]
+    """メニューを聞くときのボタン。**「⭐️いつもの」だけ**（正解 D7・まことさん 2026-10-07）。
 
-
-async def _build_menu_quick_reply_items_all(
-    db: AsyncSession,
-    line_user_id: str | None = None,
-    max_items: int = 6,
-    patient: Patient | None = None,
-) -> list[dict]:
-    defaults = ["初診", "保険診療", "骨盤矯正", "全身調整"]
-    menu_names: list[str] = []
-    items: list[dict] = []
-
-    # 患者デフォルト設定（担当者あり）を優先、なければ直近予約履歴を使う
+    メニューを全部ボタンで並べると、ホットペッパーのような患者さんに見せないものまで出て、
+    数が多いとボタンを横に送る必要がある。ボタンは候補と、はい／いいえのところだけにする。
+    「いつもの」が無い人にはボタンを出さない（メニューは文字で受ける）。
+    以前は「⭐️いつもの」に加えてメニューを並び順に最大6つ出していた（2026-04 から）。
+    """
     preset = await _get_patient_default_preset(db, patient)
     if preset:
         quick_text = _format_usual_shortcut_text(
             preset["menu_name"], preset["duration_minutes"], preset["practitioner_name"]
         )
-        items.append(
-            {
-                "type": "action",
-                "action": {
-                    "type": "message",
-                    "label": "⭐️いつもの",
-                    "text": quick_text,
-                },
-            }
-        )
-    elif line_user_id:
-        latest = await _get_latest_reservation_for_line_user(db, line_user_id)
-        if latest:
-            quick_text = _format_usual_shortcut_text(latest["menu_name"], latest["duration_minutes"])
-            items.append(
-                {
-                    "type": "action",
-                    "action": {
-                        "type": "message",
-                        "label": "⭐️いつもの",
-                        "text": quick_text,
-                    },
-                }
-            )
-
-    menus = (await db.execute(select(Menu).where(Menu.is_active == True).order_by(Menu.display_order))).scalars().all()
-    for m in menus:
-        if m.name and m.name not in menu_names:
-            menu_names.append(m.name)
-        if len(menu_names) >= max_items:
-            break
-    if not menu_names:
-        menu_names = defaults
-
-    for name in menu_names[:max_items]:
-        items.append(
-            {
-                "type": "action",
-                "action": {
-                    "type": "message",
-                    "label": name[:20],
-                    "text": name,
-                },
-            }
-        )
-    return items
+    else:
+        latest = await _get_latest_reservation_for_line_user(db, line_user_id) if line_user_id else None
+        if not latest:
+            return []
+        quick_text = _format_usual_shortcut_text(latest["menu_name"], latest["duration_minutes"])
+    return [
+        {
+            "type": "action",
+            "action": {"type": "message", "label": "⭐️いつもの", "text": quick_text},
+        }
+    ]
 
 
 async def _resolve_menu(db: AsyncSession, menu_name: str | None) -> Menu | None:
@@ -3016,6 +2950,17 @@ def _retry_guidance_plan() -> ReplyPlan:
     return ReplyPlan(facts=[_RETRY_GUIDANCE], keep=["最初からやり直してください"])
 
 
+def _chat_change_guidance_plan(reservation_count: int) -> ReplyPlan:
+    """予約のある人への、遅刻・相談の案内。時間の変更はチャットでできることを先に伝える。"""
+    facts = ["ご予約のお時間の変更でしたら、このチャットで承れます。"]
+    if reservation_count == 1:
+        facts.append("変更をご希望でしたら、ご希望の日時をお知らせください。")
+    else:
+        facts.append("変更をご希望でしたら、どのご予約かと、ご希望の日時をお知らせください。")
+    facts.append("それ以外のご相談は、" + _PHONE_GUIDANCE)
+    return ReplyPlan(facts=facts, keep=["このチャット", "医院に直接お電話ください"])
+
+
 def _phone_guidance_plan() -> ReplyPlan:
     return ReplyPlan(facts=["大変申し訳ございません。", _PHONE_GUIDANCE], keep=["医院に直接お電話ください"])
 
@@ -3636,10 +3581,17 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 or not parsed_intent.get("has_reservation_intent")
             ):
                 # 遅刻の連絡や相談など、人が受けるべき内容。院長のLINEへの通知を待たせて
-                # 宙に浮かせず、電話を案内する（正解 I3）。失敗ではないので回数には数えない。
+                # 宙に浮かせない（正解 I3）。失敗ではないので回数には数えない。
+                # 予約がある人には、まず「お時間の変更はこのチャットで承れます」と案内し、
+                # 予約が1件ならその変更を受けられる状態にする。それ以外の相談は電話（まことさん 2026-10-07）。
                 await reset_user_conversation(db, user_id, reason="needs_human")
+                upcoming = await _find_upcoming_reservations(db, line_patient.id)
+                if len(upcoming) == 1:
+                    await merge_user_draft(db, user_id, {"autopilot_change_reservation_id": upcoming[0].id})
+                    await set_user_mode(db, user_id, "autopilot_change_datetime")
+                plan = _chat_change_guidance_plan(len(upcoming)) if upcoming else _phone_guidance_plan()
                 if reply_token:
-                    await reply_to_line(reply_token, await _polished_from_plan(_phone_guidance_plan()))
+                    await reply_to_line(reply_token, await _polished_from_plan(plan))
                 return
         # 候補を出した後も条件は動く（「やっぱり30分で」「時田先生で」）。
         # ここを idle 系のモードに限っていたため、候補提示中に何を言われても
@@ -4997,11 +4949,10 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             min_minutes, max_minutes = _menu_duration_bounds(selected_menu)
             await set_user_mode(db, user_id, "waiting_time_duration", user_state.get("request_id"))
             if reply_token:
-                quick_items = _build_duration_quick_reply_items(min_minutes, max_minutes)
-                await reply_text_with_quick_reply(
+                # 施術時間はボタンにしない（正解 D7・まことさん 2026-10-07）。文字で受ける
+                await reply_to_line(
                     reply_token,
                     f"{selected_menu.name}ですね。施術時間は{min_minutes}〜{max_minutes}分で、10分刻みで選べます。",
-                    quick_items,
                 )
             return
 
@@ -5023,11 +4974,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         min_minutes, max_minutes = _menu_duration_bounds(menu)
         if duration is None or not _is_valid_duration_for_menu(menu, duration):
             if reply_token:
-                quick_items = _build_duration_quick_reply_items(min_minutes, max_minutes)
-                await reply_text_with_quick_reply(
+                await reply_to_line(
                     reply_token,
                     f"時間は{min_minutes}〜{max_minutes}分の10分刻みでお願いします。",
-                    quick_items,
                 )
             return
 
@@ -5159,7 +5108,6 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             min_minutes, max_minutes = _menu_duration_bounds(menu)
             await set_user_mode(db, user_id, "waiting_time_duration", user_state.get("request_id"))
             if reply_token:
-                quick_items = _build_duration_quick_reply_items(min_minutes, max_minutes)
                 prompt = f"{menu.name}は時間を選べます。{min_minutes}〜{max_minutes}分で教えてください。"
                 if is_autopilot_patient:
                     prompt = await _compose_autopilot_reply(
@@ -5173,7 +5121,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         },
                         parsed_intent,
                     )
-                await reply_text_with_quick_reply(reply_token, prompt, quick_items)
+                await reply_to_line(reply_token, prompt)
             return
 
     # リピーターには最初に「いつものメニューでよろしいでしょうか」と確認する（正解 C2・まことさん 2026-09-16）。
@@ -5354,11 +5302,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             min_minutes, max_minutes = _menu_duration_bounds(menu)
             await set_user_mode(db, user_id, "waiting_time_duration", user_state.get("request_id"))
             if reply_token:
-                quick_items = _build_duration_quick_reply_items(min_minutes, max_minutes)
-                await reply_text_with_quick_reply(
+                await reply_to_line(
                     reply_token,
                     f"施術時間を確認させてください。{min_minutes}〜{max_minutes}分でお願いします。",
-                    quick_items,
                 )
             return
         else:

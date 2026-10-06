@@ -2602,6 +2602,9 @@ async def test_autopilot_urgent_availability_question_asks_to_call_the_clinic():
     ) as mock_set_mode, patch(
         "app.api.line.reset_user_conversation", new=AsyncMock()
     ) as mock_reset, patch(
+        # 予約の無い人。予約がある人には先に「時間の変更はチャットで」と案内する（別のテストで固定）
+        "app.api.line._find_upcoming_reservations", new=AsyncMock(return_value=[])
+    ), patch(
         "app.api.line._apply_daily_greeting", new=AsyncMock(side_effect=lambda reply: reply)
     ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
         await _handle_text_message(event, AsyncMock())

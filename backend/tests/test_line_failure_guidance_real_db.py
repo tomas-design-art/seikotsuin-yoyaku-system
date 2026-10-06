@@ -15,6 +15,7 @@ import pytest
 
 from tests.test_line_change_cancel_real_db import (
     YES,
+    _buttons,
     _book,
     _day,
     _patient,
@@ -119,3 +120,25 @@ async def test_a_message_that_needs_a_person_is_told_to_call_instead_of_waiting_
 
     assert PHONE in _texts(sent)
     assert state["mode"] != "manual"
+
+
+@pytest.mark.asyncio
+async def test_a_late_notice_with_a_reservation_first_says_the_time_can_be_changed_in_the_chat():
+    """予約のある人の「遅刻しそうです」には、まず「お時間の変更はこのチャットで承れます」と案内し、
+    その予約の変更を受けられる状態にする。それ以外の相談は電話（まことさん 2026-10-07）。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        own = await _book(sessions, patient_id, ids["tokita"], _day(), "13:00")
+
+        sent = await send(
+            sessions, uid, "すみません、10分ほど遅刻しそうです",
+            {"intent": "other", "needs_human": True, "has_reservation_intent": False},
+        )
+        state = await _state(sessions, uid)
+
+    assert "このチャット" in _texts(sent)
+    assert PHONE in _texts(sent)
+    assert state["mode"] == "autopilot_change_datetime"
+    assert state["draft"]["autopilot_change_reservation_id"] == own
+    assert _buttons(sent) == []
+
