@@ -3081,7 +3081,10 @@ async def _merge_autopilot_slots(
                         "duration_minutes": latest["duration_minutes"],
                     }
                 )
-    elif named_menu or menu_hint:
+    elif named_menu or (menu_hint and not previous.get("menu_kind")):
+        # ボタンで保険診療／自費診療／相談したい を選んだあとは、本文に院のメニュー名がそのまま
+        # 書かれたときだけメニューを変える。AIの読み取りだけでは変えない（AIは登録の いつもの を
+        # 文脈から入れてくることがある。10/8 1:13 の実機：「今日の夕方以降で」で 相談したい が消えた）。
         # 本人がメニューを言った（ボタンの文字を含む）。院のメニュー名が本文にあればそれを使い、
         # 無ければAIの読み取り（menu_hint）を使う。いつもの（登録情報）で上書きしない（正解 C3）。
         # 以前は本文のメニュー名を見ておらず、AIが読めないとメニューが空のまま残り、
