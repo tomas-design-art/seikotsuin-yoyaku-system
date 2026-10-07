@@ -144,3 +144,20 @@ def test_a_sentence_that_starts_with_itsumo_is_not_mistaken_for_a_greeting(messa
 ])
 def test_common_variants_of_the_greeting_are_still_dropped(message, expected):
     assert strip_opening_greeting(message) == expected
+
+
+@pytest.mark.parametrize("message,expected", [
+    # 10/7 23:21 の実機の返信の頭（返信のたびに付いていた）
+    ("お疲れ様です。施術時間は何分をご希望でしょうか？", "施術時間は何分をご希望でしょうか？"),
+    ("お疲れ様です。いつも当院をご利用いただきありがとうございます。\n\nご希望のメニューを教えてください。",
+     "ご希望のメニューを教えてください。"),
+    ("この度はご予約のご検討をいただき、誠にありがとうございます。\n恐れ入りますが、ご希望日を教えていただけますでしょうか。",
+     "恐れ入りますが、ご希望日を教えていただけますでしょうか。"),
+    ("お疲れさまです！ご予約を確定しました。", "ご予約を確定しました。"),
+])
+def test_otsukaresama_and_konotabi_openings_count_as_the_greeting(message, expected):
+    """挨拶はその日1回（正解 B4）。「お疲れ様です」「この度は…ありがとうございます」も挨拶として数える。"""
+    from app.services.line_composer import has_opening_greeting
+
+    assert has_opening_greeting(message) is True
+    assert strip_opening_greeting(message) == expected

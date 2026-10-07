@@ -2366,6 +2366,45 @@ async def _offer_practitioner_choice(
         )
 
 
+# 「30分遅らせたい」「1時間早めたい」：施術時間ではなく、開始をずらす量（正解 F9・I4）
+_SHIFT_REQUEST = re.compile(
+    r"(?:(\d{1,3})\s*時間\s*(半)?|(\d{1,3})\s*分)\s*(?:ほど|くらい|ぐらい|程度)?\s*(?:だけ)?\s*"
+    r"(遅らせ|遅く(?!な|着)|後ろ|繰り下げ|早め|早く|前倒し|繰り上げ)"
+)
+_SHIFT_EARLIER = ("早め", "早く", "前倒し", "繰り上げ")
+
+
+def _shift_request_minutes(text: str) -> int | None:
+    """開始をずらす量（分）。後ろへは正、前へは負。ずらす話でなければ None。AIには任せない（正解 F9）。"""
+    match = _SHIFT_REQUEST.search(unicodedata.normalize("NFKC", text or ""))
+    if not match:
+        return None
+    hours, half, minutes, direction = match.groups()
+    total = int(hours) * 60 + (30 if half else 0) if hours else int(minutes)
+    if total <= 0:
+        return None
+    return -total if direction.startswith(_SHIFT_EARLIER) else total
+
+
+def _requested_change_minutes(
+    text: str,
+    parsed: dict | None,
+    reservation: Reservation,
+    *,
+    asked: str | None = None,
+) -> int | None:
+    """変更で本人が望んだ施術時間。
+
+    - 「30分遅らせたい」の30分は、ずらす量であって施術時間ではない（正解 F9）
+    - 「施術時間を半分に」は今の施術時間の半分（正解 F10・10/7 23:21 の実機の言い方）
+    """
+    if _shift_request_minutes(text):
+        return None
+    if "半分" in (text or "") and (re.search(r"施術|時間", text or "") or asked == "duration"):
+        return max(_reservation_minutes(reservation) // 2, 1)
+    return _stated_change_minutes(text, parsed)
+
+
 def _stated_change_minutes(text: str, parsed: dict | None) -> int | None:
     """変更の文で本人が言った施術時間。
 
@@ -4282,6 +4321,17 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             recent_history=None,
             conversation_state=(user_state.get("context_data") or {}).get("recent_completed_booking"),
         )
+        if button_menu_kind:
+            # メニューのボタン（保険診療／自費診療／相談したい）は、新しい予約のメニューへの答え。
+            # AIが「相談したい」を質問・人に回す内容と読んでも、その読み方で行き先を変えない（正解 H3）。
+            # 10/7 23:19 の実機：引き継ぎになり、存在しない予約の作り話や「お電話ください」を返した
+            parsed_intent = {
+                **parsed_intent,
+                "intent": "new",
+                "has_reservation_intent": True,
+                "needs_human": False,
+                "reply_action": "reply",
+            }
 
         # 予約確定直後の感謝・締めの挨拶は、Geminiが返信不要と判断できる。
         # 新しい予約操作を含まない場合だけ受け入れ、次の会話へ確定文脈を持ち越さない。
@@ -5142,8 +5192,22 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         if parsed.get("practitioner") or re.search(r"先生|担当", text or ""):
             requested_practitioner = await _extract_requested_practitioner(db, text, parsed)
         preferred_id = requested_practitioner.id if requested_practitioner else None
-        # 本人が言った施術時間（正解 F6）。言っていなければ今の予約の長さのまま
-        stated_minutes = _stated_change_minutes(text, parsed)
+        # 「30分遅らせたい」「1時間早めたい」は開始をずらす。施術時間・担当はそのまま（正解 F9）
+        shift = _shift_request_minutes(text)
+        if shift:
+            shifted = reservation.start_time.astimezone(JST) + timedelta(minutes=shift)
+            await _complete_autopilot_reschedule(
+                db,
+                reservation=reservation,
+                desired_date=shifted.date().isoformat(),
+                desired_time=shifted.strftime("%H:%M"),
+                user_id=user_id,
+                reply_token=reply_token,
+                patient_message=text,
+            )
+            return
+        # 本人が言った施術時間（正解 F6・F10）。言っていなければ今の予約の長さのまま
+        stated_minutes = _requested_change_minutes(text, parsed, reservation, asked=prev_draft.get(_CHANGE_ASKED_KEY))
         change_minutes, menu_change = (
             await _resolve_change_minutes(db, reservation, stated_minutes) if stated_minutes else (None, None)
         )
@@ -5649,8 +5713,22 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             {"autopilot_change_reservation_id": reservation.id},
             drop=(_CHANGE_ASKED_KEY, *_CHANGE_PENDING_KEYS),
         )
-        # 本人が言った施術時間（正解 F6）。「30分にしてほしい」は日時を聞き返さずに、開始はそのままで変える
-        stated_minutes = _stated_change_minutes(text, parsed_change)
+        # 「30分遅らせたい」「1時間早めたい」は開始をずらす。施術時間・担当はそのまま（正解 F9）
+        shift = _shift_request_minutes(text)
+        if shift:
+            shifted = reservation.start_time.astimezone(JST) + timedelta(minutes=shift)
+            await _complete_autopilot_reschedule(
+                db,
+                reservation=reservation,
+                desired_date=shifted.date().isoformat(),
+                desired_time=shifted.strftime("%H:%M"),
+                user_id=user_id,
+                reply_token=reply_token,
+                patient_message=text,
+            )
+            return
+        # 本人が言った施術時間（正解 F6・F10）。「30分にしてほしい」は日時を聞き返さずに、開始はそのままで変える
+        stated_minutes = _requested_change_minutes(text, parsed_change, reservation)
         change_minutes, menu_change = (
             await _resolve_change_minutes(db, reservation, stated_minutes) if stated_minutes else (None, None)
         )

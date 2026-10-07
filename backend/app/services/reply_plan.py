@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 
 # 「はい/いいえ」で答えさせる形。骨格が求めていなければ現れてはいけない。
@@ -47,6 +48,13 @@ _GROUNDED_CLAIMS = (
     (_OUTCOME_CLAIM, "完了"),
     (_OTHER_DAY_CLAIM, "別日の案内"),
 )
+
+_DIGITS = re.compile(r"\d+")
+
+
+def _numbers(text: str) -> set[str]:
+    """文に出てくる数字（全角も同じに見る・先頭の0は落とす。13:00 → 13 と 0）。"""
+    return {digits.lstrip("0") or "0" for digits in _DIGITS.findall(unicodedata.normalize("NFKC", text or ""))}
 
 
 @dataclass
@@ -107,6 +115,13 @@ class ReplyPlan:
         for pattern, label in _GROUNDED_CLAIMS:
             if pattern.search(polished) and not pattern.search(skeleton):
                 return f"骨格に無い{label}を伝えている"
+
+        # 骨格に無い数字（日付・時刻・分数）を足していないか。言い換え（10/8 → 10月8日）は数字が同じなので通る。
+        # 「最初からやり直してください」の1文に、存在しない予約（2024年5月20日・10:00・60分）を
+        # 書き足して送った（2026-10-07 夜の実機）。
+        extra = _numbers(polished) - _numbers(skeleton)
+        if extra:
+            return f"骨格に無い数字を書いている: {', '.join(sorted(extra)[:3])}"
 
         asks_yes_no = bool(_YES_NO_REQUEST.search(polished))
         if asks_yes_no and not self.yes_no:

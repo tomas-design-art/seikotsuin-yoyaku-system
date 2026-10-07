@@ -29,6 +29,7 @@ from tests.test_line_change_cancel_real_db import (
     _at,
     _buttons,
     _day,
+    _dispatch,
     _patient,
     _state,
     clinic,
@@ -596,6 +597,42 @@ async def test_the_insurance_button_with_an_insurance_previous_visit_uses_that_m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("label", ["相談したい", "保険診療", "自費診療"])
+async def test_a_menu_button_is_a_booking_answer_even_if_the_ai_reads_it_as_a_question(label):
+    """10/7 23:19〜 の実機：［相談したい］を押すと、AIが「相談したい」を質問・人に回す内容と読み、
+    予約の処理に入らずに引き継ぎになった（1回目は存在しない予約の作り話、2回目は「お電話ください」）。
+    ボタンの答えはAIの読み方で行き先を変えない（正解 H3）。"""
+    from uuid import uuid4
+
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["tokita"], _day(-14), "10:00", 60, None, None)
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+        button = next(item for item in _buttons(sent) if item.get("label") == label)
+        event = {
+            "type": "postback",
+            "webhookEventId": f"ev-{uuid4().hex}",
+            "replyToken": "reply-token",
+            "source": {"userId": uid},
+            "postback": {"data": button["data"]},
+        }
+        # 実機と同じ読み取り（10/7 23:19:26 の記録）
+        sent = await _dispatch(
+            sessions,
+            event,
+            {"intent": "question", "has_reservation_intent": False, "needs_human": True, "confidence": "high"},
+        )
+        state = await _state(sessions, uid)
+
+    text = _text(sent)
+    assert "お電話" not in text and "最初からやり直" not in text, f"引き継ぎになった: {text}"
+    assert state["draft"].get("menu_kind") == {"相談したい": "consult", "保険診療": "insurance", "自費診療": "self"}[label]
+    assert state["mode"] in {"idle", "waiting_datetime", "waiting_time_duration"}
+
+
+@pytest.mark.asyncio
 async def test_the_consult_button_books_without_a_menu_in_the_consult_color():
     async with clinic() as (sessions, ids):
         day = _day()
@@ -656,3 +693,66 @@ async def test_a_new_booking_below_20_minutes_is_searched_as_20_with_an_acknowle
     assert "かしこまりました" in _text(sent)
     assert state["draft"]["duration_minutes"] == 20
     assert state["draft"]["autopilot_offer"]["duration_minutes"] == 20
+
+
+# ─── F9：「30分遅らせたい」は開始をずらす（施術時間は変えない）・F10：「半分に」は今の施術時間の半分 ───
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, parse, start, end",
+    [
+        ("30分遅らせたいです", {"intent": "change"}, "17:00", "18:00"),
+        # AIが「30分」を施術時間と読んでも、ずらす量として扱う（施術時間を30分にしない）
+        ("30分遅らせたいです", {"intent": "change", "duration_minutes": 30}, "17:00", "18:00"),
+        ("1時間早めてもらえますか", {"intent": "change"}, "15:30", "16:30"),
+        ("30分後ろにずらしたいです", {"intent": "change"}, "17:00", "18:00"),
+    ],
+)
+async def test_shifting_by_minutes_moves_the_start_and_keeps_the_length(text, parse, start, end):
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["tokita"], day, "16:30", 60, menus["muscle"], menus["self_pay_color"])
+
+        await send(sessions, uid, text, parse)
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "autopilot_change_confirm", f"確認へ進んでいない（{state['mode']}）"
+    assert state["draft"]["autopilot_change_start_time_iso"].startswith(f"{day.isoformat()}T{start}")
+    assert state["draft"]["autopilot_change_end_time_iso"].startswith(f"{day.isoformat()}T{end}")
+
+
+@pytest.mark.asyncio
+async def test_halving_the_duration_keeps_the_start():
+    """10/7 23:21 の実機の言い方。変更の処理で分数にならず、ボタンを1回挟んでいた。"""
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["tokita"], day, "16:30", 60, menus["muscle"], menus["self_pay_color"])
+
+        await send(sessions, uid, "施術時間を半分にしてくだい", {"intent": "change", "constraints": ["duration_flexible"]})
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "autopilot_change_confirm"
+    assert state["draft"]["autopilot_change_start_time_iso"].startswith(f"{day.isoformat()}T16:30")
+    assert state["draft"]["autopilot_change_end_time_iso"].startswith(f"{day.isoformat()}T17:00")
+
+
+@pytest.mark.asyncio
+async def test_halving_after_the_duration_button_keeps_the_start():
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["tokita"], day, "16:30", 60, menus["muscle"], menus["self_pay_color"])
+
+        sent = await send(sessions, uid, "予約変更して", {"intent": "change"})
+        await press(sessions, uid, sent, "施術時間を変更したい")
+        await send(sessions, uid, "半分で", {"intent": "new"})
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "autopilot_change_confirm"
+    assert state["draft"]["autopilot_change_end_time_iso"].startswith(f"{day.isoformat()}T17:00")

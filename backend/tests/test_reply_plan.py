@@ -221,3 +221,43 @@ def test_situations_that_are_not_migrated_have_no_skeleton():
     assert plan_for("answer_question", {}) is None
     assert plan_for("small_talk", {}) is None
     assert plan_for("offer_alternatives", {"alternatives": []}) is None
+
+
+# ─── 骨格に無い数字（日付・時刻・分数）を足さない（2026-10-07 夜の実機） ───
+# 引き継ぎの骨格は「理解できなかった場合、お手数ですが最初からやり直してください。」の1文だけだったのに、
+# 整えたAIが「ご予約内容の確認です。日付：2024年5月20日／時刻：10:00／担当者：佐藤／
+# メニュー：全身調整コース／施術時間：60分」という存在しない予約を書き足し、そのまま送られた。
+
+
+def test_a_polished_reply_that_adds_dates_or_times_not_in_the_skeleton_is_rejected():
+    plan = ReplyPlan(facts=["理解できなかった場合、お手数ですが最初からやり直してください。"], keep=["最初からやり直して"])
+    polished = (
+        "お疲れ様です。いつも当院をご利用いただきありがとうございます。\n\n"
+        "ご予約内容の確認です。以下の内容でお間違いございませんか。\n\n"
+        "日付：2024年5月20日\n時刻：10:00\n担当者：佐藤\nメニュー：全身調整コース\n施術時間：60分\n\n"
+        "理解できなかった場合、お手数ですが最初からやり直してください。"
+    )
+
+    assert plan.rejects(polished)
+
+
+@pytest.mark.parametrize(
+    "polished",
+    [
+        "10/8(木) 13:00〜14:00（担当: 時田）ですね。\nこちらでご予約をお取りしてよろしいでしょうか？\nはい / いいえ",
+        # 書き方を変えても、骨格にある数字だけなら通す（10/8 → 10月8日、13:00 → 13時）
+        "10月8日（木）13時〜14時（担当: 時田）でお取りしてよろしいでしょうか？\nはい / いいえ",
+        # 全角の数字も同じ数字として見る
+        "１０/８(木) １３:００〜１４:００（担当: 時田）でお取りしてよろしいですか？\nはい / いいえ",
+    ],
+)
+def test_a_polished_reply_with_only_the_skeleton_numbers_is_accepted(polished):
+    plan = ReplyPlan(
+        facts=["10/8(木) 13:00〜14:00（担当: 時田）"],
+        ask="こちらでご予約をお取りしてよろしいですか？",
+        ask_about="よろしい",
+        yes_no=True,
+        keep=["時田"],
+    )
+
+    assert plan.rejects(polished) is None
