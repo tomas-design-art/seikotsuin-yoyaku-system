@@ -2419,14 +2419,19 @@ async def _merge_autopilot_slots(
     previous: dict,
     parsed: dict,
 ) -> dict:
+    stated_duration = parsed.get("duration_minutes") or _extract_duration_minutes(text)
     update = {
         "customer_name": patient.name,
         "date": parsed.get("date"),
         "time": parsed.get("time"),
-        "duration_minutes": parsed.get("duration_minutes") or _extract_duration_minutes(text),
+        "duration_minutes": stated_duration,
+        # 本人が言った分数。登録情報から補った分数と区別して残す（正解 C7・C8）
+        "stated_duration_minutes": stated_duration,
         "constraints": parsed.get("constraints"),
         "parse_confidence": parsed.get("confidence"),
     }
+    # 時間を選べるメニューを名前で言われ、施術時間がまだ分からない（このときは何分かを聞く）
+    duration_unknown = False
     # 患者が日付を口にしていないなら、話していた日を動かさない。
     # 解析側が時刻だけの返事に今日の日付を補うことがあり、そのまま採ると
     # 8/31の話をしていたのに今日で確定してしまう（実機で発生）。
@@ -2476,11 +2481,22 @@ async def _merge_autopilot_slots(
         # 登録上のいつもの（マッスルセラピー）で埋まった（2026-09-28 実機・保険延長が消えた件）。
         selected_menu = named_menu or await _resolve_menu(db, str(menu_hint))
         if selected_menu:
+            duration = update.get("duration_minutes")
+            if not duration and selected_menu.is_duration_variable:
+                # 時間を選べるメニューの登録値は刻み・最小値で、施術時間ではない（本番のマッスルセラピーは10分）。
+                # 以前はそれを施術時間に入れ、10分刻みの候補を出して確定直前の検算で落ちていた（2026-10-07）。
+                # 本人が前に言った分数 → 同じメニューの「いつもの」・前回の分数。無ければ聞く（正解 C8）
+                duration = previous.get("stated_duration_minutes") or await _usual_minutes_for_menu(
+                    db, user_id=user_id, patient=patient, menu=selected_menu
+                )
+                duration_unknown = not duration
+            elif not duration:
+                duration = selected_menu.duration_minutes
             update.update(
                 {
                     "menu_id": selected_menu.id,
                     "menu_name": selected_menu.name,
-                    "duration_minutes": update.get("duration_minutes") or selected_menu.duration_minutes,
+                    "duration_minutes": duration,
                     "menu_explicit": True,
                     "assumed_menu": False,
                 }
@@ -2503,13 +2519,42 @@ async def _merge_autopilot_slots(
     # 患者が指定しなかった条件は登録情報（スタッフ設定のいつもの／初回ルール）で補う。
     # 「いつもの」を押した人だけが良い候補を受け取れる状態を解消するため。
     preview = {**previous, **{key: value for key, value in update.items() if value not in (None, "")}}
+    # 施術時間が分からないなら、前に入っていた分数（別のメニューの分数・登録値）も捨てる
+    drop = ("duration_minutes", "assumed_duration") if duration_unknown else ()
+    for key in drop:
+        preview.pop(key, None)
     if not (preview.get("menu_name") and preview.get("duration_minutes") and preview.get("practitioner_id")):
         defaults = await _resolve_booking_defaults(db, user_id=user_id, patient=patient)
         for key, value in defaults.items():
+            # 「いつもの」・前回の分数は、別のメニューのものなので使わない。初回の60分は使う（正解 C8）
+            if duration_unknown and key in drop and not defaults.get("first_visit"):
+                continue
             if preview.get(key) in (None, "") and update.get(key) in (None, ""):
                 update[key] = value
 
-    return await merge_user_draft(db, user_id, update)
+    return await merge_user_draft(db, user_id, update, drop=drop)
+
+
+async def _usual_minutes_for_menu(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    patient: Patient | None,
+    menu: Menu,
+) -> int | None:
+    """「いつもの」か前回の予約が同じメニューなら、その分数（正解 C8・まことさん 2026-10-07）。
+
+    別のメニューの分数は使わない（前回が保険診療15分の人のマッスルセラピーを15分にしない）。
+    「いつもの」に分数が登録されていなければメニューの登録値になるが、時間を選べるメニューでは
+    それは施術時間ではないので使わない。
+    """
+    if patient is not None and getattr(patient, "default_menu_id", None) == menu.id:
+        if getattr(patient, "default_duration", None):
+            return int(patient.default_duration)
+    latest = await _get_latest_reservation_for_line_user(db, user_id)
+    if latest and latest.get("menu_id") == menu.id and latest.get("duration_minutes"):
+        return int(latest["duration_minutes"])
+    return None
 
 
 async def _menu_named_in_text(db: AsyncSession, text: str) -> Menu | None:
@@ -2963,7 +3008,9 @@ def _chat_change_guidance_plan(reservation_count: int) -> ReplyPlan:
     return ReplyPlan(facts=facts, keep=["このチャット", "医院に直接お電話ください"])
 
 
-def _duration_question_plan() -> ReplyPlan:
+def _duration_question_plan(menu_name: str | None = None) -> ReplyPlan:
+    if menu_name:
+        return ReplyPlan(ask=f"{menu_name}の施術時間は何分をご希望ですか？", ask_about="施術時間", keep=["何分"])
     return ReplyPlan(
         ask="施術時間は何分をご希望ですか？メニューがお決まりでしたら、メニュー名でも承ります。",
         ask_about="施術時間",
@@ -3042,6 +3089,12 @@ async def _reoffer_autopilot_candidates(
     menu = await _resolve_menu(db, draft.get("menu_name"))
     if not menu and not draft.get("duration_minutes"):
         return False
+    # 時間を選べるメニューで施術時間が分からないときは、下限の分数で探し直さずに何分かを聞く（正解 C8）
+    if menu and menu.is_duration_variable and not draft.get("duration_minutes"):
+        await set_user_mode(db, user_id, "waiting_time_duration", state.get("request_id"))
+        if reply_token:
+            await reply_to_line(reply_token, await _polished_from_plan(_duration_question_plan(menu.name)))
+        return True
 
     base_duration = int(draft.get("duration_minutes") or (menu.duration_minutes if menu else 60))
     # menus.duration_minutes は可変メニューでは「10分刻みの単位」であり最低施術時間ではない。
@@ -5167,17 +5220,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             if reply_token:
                 prompt = f"{menu.name}は時間を選べます。{min_minutes}〜{max_minutes}分で教えてください。"
                 if is_autopilot_patient:
-                    prompt = await _compose_autopilot_reply(
-                        "ask_missing",
-                        {
-                            "missing_fields": ["duration_minutes"],
-                            "menu": menu.name,
-                            "min_minutes": min_minutes,
-                            "max_minutes": max_minutes,
-                            "patient_message": text,
-                        },
-                        parsed_intent,
-                    )
+                    # 「何分をご希望ですか」と文字で聞く（正解 C7・C8・D7）。登録の最小値（マッスルセラピーは10分）は
+                    # 自動予約の下限（20分）を下回ることがあるので、幅を伝えない
+                    prompt = await _polished_from_plan(_duration_question_plan(menu.name))
                 await reply_to_line(reply_token, prompt)
             return
 

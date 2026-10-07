@@ -2328,7 +2328,7 @@ async def test_autopilot_usual_button_still_fills_slots():
     patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
     preset = {"menu_id": 5, "menu_name": "マッスルセラピー", "duration_minutes": 60, "practitioner_id": 3, "practitioner_name": "時田"}
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch("app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)
     ):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
@@ -3336,7 +3336,7 @@ async def test_autopilot_uses_registered_preset_without_usual_button():
     }
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
         "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)
-    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)):
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
             user_id="U-autopilot",
@@ -3365,7 +3365,7 @@ async def test_autopilot_first_visit_defaults_to_60min_and_director():
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
         "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=None)
     ), patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)
     ):
         merged = await _merge_autopilot_slots(
             _fake_db_returning_director(director),
@@ -3398,7 +3398,7 @@ async def test_autopilot_explicit_practitioner_request_beats_registered_default(
     requested = SimpleNamespace(id=4, name="上田 花子")
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=requested)), patch(
         "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)
-    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)):
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
             user_id="U-autopilot",
@@ -3441,7 +3441,7 @@ async def test_autopilot_returning_patient_is_never_treated_as_first_visit():
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
         "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=None)
     ), patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=latest)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)
     ):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
@@ -3486,7 +3486,7 @@ async def test_autopilot_time_only_reply_keeps_the_date_being_discussed():
         "practitioner_id": 3,
     }
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: {**previous, **update})
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: {**previous, **update})
     ):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
@@ -3515,7 +3515,7 @@ async def test_autopilot_explicit_new_date_still_moves_the_day():
         "practitioner_id": 3,
     }
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: {**previous, **update})
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: {**previous, **update})
     ):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
