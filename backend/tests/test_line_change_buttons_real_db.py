@@ -29,6 +29,7 @@ from tests.test_line_change_cancel_real_db import (
     _at,
     _buttons,
     _day,
+    _dispatch,
     _patient,
     _state,
     clinic,
@@ -593,6 +594,42 @@ async def test_the_insurance_button_with_an_insurance_previous_visit_uses_that_m
 
 
 # ─── C11：相談したい ＝ メニューは空・施術時間だけ決める・水色 ───
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("label", ["相談したい", "保険診療", "自費診療"])
+async def test_a_menu_button_is_a_booking_answer_even_if_the_ai_reads_it_as_a_question(label):
+    """10/7 23:19〜 の実機：［相談したい］を押すと、AIが「相談したい」を質問・人に回す内容と読み、
+    予約の処理に入らずに引き継ぎになった（1回目は存在しない予約の作り話、2回目は「お電話ください」）。
+    ボタンの答えはAIの読み方で行き先を変えない（正解 H3）。"""
+    from uuid import uuid4
+
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["tokita"], _day(-14), "10:00", 60, None, None)
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+        button = next(item for item in _buttons(sent) if item.get("label") == label)
+        event = {
+            "type": "postback",
+            "webhookEventId": f"ev-{uuid4().hex}",
+            "replyToken": "reply-token",
+            "source": {"userId": uid},
+            "postback": {"data": button["data"]},
+        }
+        # 実機と同じ読み取り（10/7 23:19:26 の記録）
+        sent = await _dispatch(
+            sessions,
+            event,
+            {"intent": "question", "has_reservation_intent": False, "needs_human": True, "confidence": "high"},
+        )
+        state = await _state(sessions, uid)
+
+    text = _text(sent)
+    assert "お電話" not in text and "最初からやり直" not in text, f"引き継ぎになった: {text}"
+    assert state["draft"].get("menu_kind") == {"相談したい": "consult", "保険診療": "insurance", "自費診療": "self"}[label]
+    assert state["mode"] in {"idle", "waiting_datetime", "waiting_time_duration"}
 
 
 @pytest.mark.asyncio

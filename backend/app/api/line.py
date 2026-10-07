@@ -4282,6 +4282,17 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             recent_history=None,
             conversation_state=(user_state.get("context_data") or {}).get("recent_completed_booking"),
         )
+        if button_menu_kind:
+            # メニューのボタン（保険診療／自費診療／相談したい）は、新しい予約のメニューへの答え。
+            # AIが「相談したい」を質問・人に回す内容と読んでも、その読み方で行き先を変えない（正解 H3）。
+            # 10/7 23:19 の実機：引き継ぎになり、存在しない予約の作り話や「お電話ください」を返した
+            parsed_intent = {
+                **parsed_intent,
+                "intent": "new",
+                "has_reservation_intent": True,
+                "needs_human": False,
+                "reply_action": "reply",
+            }
 
         # 予約確定直後の感謝・締めの挨拶は、Geminiが返信不要と判断できる。
         # 新しい予約操作を含まない場合だけ受け入れ、次の会話へ確定文脈を持ち越さない。
