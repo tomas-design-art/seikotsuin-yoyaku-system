@@ -357,6 +357,51 @@ async def test_minutes_said_by_the_patient_are_not_asked_again(text, parse):
     assert state["draft"]["duration_minutes"] == 60
 
 
+# ─── C16：前回が「ホームページ」（HP予約の新規）＝ 前回の60分は施術時間ではない。何分かを聞く（まことさん 2026-10-07） ───
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_text, parse, press",
+    [
+        ("予約したいです", {}, None),
+        ("予約/変更", {}, "相談したい"),  # 相談したい でも前回の60分を使わない
+    ],
+)
+async def test_a_previous_homepage_visit_asks_the_minutes_instead_of_using_60(first_text, parse, press):
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _channel_menus(sessions)
+        await _reserve_past(sessions, patient_id, ids["tokita"], menus["homepage"], 60)
+
+        sent = await send(sessions, uid, first_text, {"intent": "new", "date": _day().isoformat(), **parse})
+        if press:
+            button = next(item for item in _buttons(sent) if item.get("label") == press)
+            sent = await tap(sessions, uid, button["data"])
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "waiting_time_duration", f"施術時間を聞いていない（{state['mode']}）"
+    assert "何分" in _text(sent)
+    assert not state["draft"].get("duration_minutes"), "前回（初回）の60分を施術時間にしている"
+    assert state["draft"].get("menu_name") not in CHANNEL_NAMES
+
+
+@pytest.mark.asyncio
+async def test_answering_the_minutes_after_a_homepage_visit_goes_on_to_candidates():
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _channel_menus(sessions)
+        await _reserve_past(sessions, patient_id, ids["tokita"], menus["homepage"], 60)
+
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+        await send(sessions, uid, "30分で", {"intent": "new", "duration_minutes": 30})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["duration_minutes"] == 30
+    assert state["mode"] == "adjusting"
+    assert state["draft"]["autopilot_offer"]["duration_minutes"] == 30
+
+
 async def _reserve_past(sessions, patient_id: int, practitioner_id: int, menu_id: int, minutes: int) -> None:
     begin = _at(_day(-14), "10:00")
     async with sessions() as db:

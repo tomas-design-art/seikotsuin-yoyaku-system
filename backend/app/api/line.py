@@ -535,6 +535,8 @@ async def _previous_visit_for_booking(db: AsyncSession, latest: dict | None) -> 
     - 予約の入り口のメニュー（ホットペッパー・ホームページ）は引き継がない（正解 C14）
     - 前回がホットペッパーからの予約なら自費診療（マッスルセラピー）で受け、施術時間は決めつけずに
       確かめる印を付ける（正解 C15・まことさん 2026-10-07：院が いつもの を決めるまでは）
+    - 前回が「ホームページ」（ホームページ予約の新規）なら、その60分も使わない。初回の60分は
+      カウンセリングを含む枠で、施術時間ではない。メニューも施術時間も空にして、何分かを聞く（正解 C16）
     """
     if not latest or not is_channel_menu_name(latest.get("menu_name")):
         return latest
@@ -542,7 +544,7 @@ async def _previous_visit_for_booking(db: AsyncSession, latest: dict | None) -> 
         self_pay = await _configured_menu(db, "self")
         menu = {"menu_id": self_pay.id, "menu_name": self_pay.name} if self_pay else {"menu_id": None, "menu_name": "前回メニュー"}
         return {**latest, **menu, "minutes_unconfirmed": True}
-    return {**latest, "menu_id": None, "menu_name": "前回メニュー"}
+    return {**latest, "menu_id": None, "menu_name": None, "duration_minutes": None}
 
 
 async def _get_patient_default_preset(db: AsyncSession, patient: Patient | None) -> dict | None:
