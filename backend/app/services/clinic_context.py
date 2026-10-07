@@ -19,7 +19,7 @@ from datetime import date, timedelta
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.menu import Menu
+from app.models.menu import CHANNEL_MENU_NAMES, Menu
 from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.setting import Setting
@@ -187,7 +187,11 @@ async def _practitioner_facts(db: AsyncSession, start: date, horizon_days: int) 
 async def _menu_facts(db: AsyncSession, floor: int) -> list[dict]:
     menus = (
         await db.execute(
-            select(Menu).where(Menu.is_active == True).order_by(Menu.display_order)
+            select(Menu)
+            # 予約の入り口のメニュー（ホットペッパー・ホームページ）は LINE で患者さんが選べるメニューではない。
+            # AIの一覧にも、本文のメニュー名の照合にも入れない（正解 C14・まことさん 2026-10-07）
+            .where(Menu.is_active == True, Menu.name.notin_(CHANNEL_MENU_NAMES))  # noqa: E712
+            .order_by(Menu.display_order)
         )
     ).scalars().all()
 

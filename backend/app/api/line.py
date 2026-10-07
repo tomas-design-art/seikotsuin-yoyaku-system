@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.line_parser import classify_conversation_control, extract_full_name, parse_line_message
 from app.config import settings
 from app.database import async_session, get_db
-from app.models.menu import HOMEPAGE_MENU_NAME, Menu
+from app.models.menu import CHANNEL_MENU_NAMES, HOMEPAGE_MENU_NAME, Menu, is_channel_menu_name
 from app.models.patient import Patient
 from app.models.practitioner import Practitioner
 from app.models.reservation import Reservation
@@ -523,6 +523,14 @@ async def _get_latest_reservation_for_line_user(db: AsyncSession, line_user_id: 
     }
 
 
+def _without_channel_menu(latest: dict | None) -> dict | None:
+    """前回の予約のメニューが予約の入り口のメニュー（ホットペッパー等）なら、メニューは引き継がずに
+    施術時間だけ使う（正解 C14・C7 の「前回」）。メニューの無い前回の予約と同じ形にする。"""
+    if latest and is_channel_menu_name(latest.get("menu_name")):
+        return {**latest, "menu_id": None, "menu_name": "前回メニュー"}
+    return latest
+
+
 async def _get_patient_default_preset(db: AsyncSession, patient: Patient | None) -> dict | None:
     """患者のデフォルト設定からいつものプリセットを返す。
     default_menu_id が設定されていれば返す。preferred_practitioner_id は任意。
@@ -534,6 +542,10 @@ async def _get_patient_default_preset(db: AsyncSession, patient: Patient | None)
         await db.execute(select(Menu).where(Menu.id == default_menu_id, Menu.is_active == True))
     ).scalar_one_or_none()
     if not menu:
+        return None
+    if getattr(patient, "line_autopilot_enabled", False) and is_channel_menu_name(menu.name):
+        # 予約の入り口のメニュー（ホットペッパー・ホームページ）は LINE の自動予約とは関係がないので、
+        # いつもの にしない（正解 C14・まことさん 2026-10-07）
         return None
     duration = getattr(patient, "default_duration", None) or menu.duration_minutes
     practitioner_id = None
@@ -592,7 +604,7 @@ async def _resolve_booking_defaults(
         return defaults
 
     # ② 来院実績があれば前回の内容を引き継ぐ。担当は勝手に決めない。
-    latest = await _get_latest_reservation_for_line_user(db, user_id)
+    latest = _without_channel_menu(await _get_latest_reservation_for_line_user(db, user_id))
     if latest:
         return {
             "menu_id": latest.get("menu_id"),
@@ -2987,7 +2999,7 @@ async def _merge_autopilot_slots(
                 }
             )
         else:
-            latest = await _get_latest_reservation_for_line_user(db, user_id)
+            latest = _without_channel_menu(await _get_latest_reservation_for_line_user(db, user_id))
             if latest:
                 _fill_gaps(
                     {
@@ -3002,6 +3014,9 @@ async def _merge_autopilot_slots(
         # 以前は本文のメニュー名を見ておらず、AIが読めないとメニューが空のまま残り、
         # 登録上のいつもの（マッスルセラピー）で埋まった（2026-09-28 実機・保険延長が消えた件）。
         selected_menu = named_menu or await _resolve_menu(db, str(menu_hint))
+        if selected_menu is not None and is_channel_menu_name(selected_menu.name):
+            # 予約の入り口のメニュー（「ホームページを見て」など）は患者さんが選べるメニューではない（正解 C14）
+            selected_menu = None
         if selected_menu:
             duration = update.get("duration_minutes")
             if not duration and selected_menu.is_duration_variable:
@@ -3175,7 +3190,11 @@ async def _menu_named_by_patient(
     if not hint or hint == "usual":
         return None
     menu = (
-        await db.execute(select(Menu).where(Menu.is_active == True, Menu.name == hint).limit(1))  # noqa: E712
+        await db.execute(
+            select(Menu)
+            .where(Menu.is_active == True, Menu.name == hint, Menu.name.notin_(CHANNEL_MENU_NAMES))  # noqa: E712
+            .limit(1)
+        )
     ).scalar_one_or_none()
     if menu is None or menu.id == current_menu_id:
         return None

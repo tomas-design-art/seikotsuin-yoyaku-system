@@ -208,6 +208,103 @@ async def test_a_paraphrased_menu_name_in_a_new_booking_is_the_clinic_menu():
     assert state["draft"]["menu_name"] == "産ケア"
 
 
+# ─── C14：予約の入り口のメニュー（ホームページ・ホットペッパー）は、LINE で患者さんが選べるメニューに入れない ───
+# まことさん 2026-10-07：「LINE からの自動予約とは全く関係がないので、そちらのメニューに行かないように」。
+# 予約システムのメニューとしては残す（消さない）。
+
+
+async def _channel_menus(sessions) -> dict:
+    async with sessions() as db:
+        hotpepper = Menu(name="ホットペッパー", duration_minutes=40, is_active=True, display_order=8)
+        homepage = Menu(name="ホームページ", duration_minutes=60, is_active=True, display_order=9)
+        extension = Menu(name="保険延長", duration_minutes=30, is_active=True, display_order=1)
+        db.add_all([hotpepper, homepage, extension])
+        await db.commit()
+        return {"hotpepper": hotpepper.id, "homepage": homepage.id}
+
+
+CHANNEL_NAMES = {"ホットペッパー", "ホームページ"}
+
+
+@pytest.mark.asyncio
+async def test_the_menu_list_given_to_the_ai_leaves_out_the_channel_menus():
+    async with clinic() as (sessions, _ids):
+        await _channel_menus(sessions)
+        async with sessions() as db:
+            facts = await clinic_context.build_clinic_context(db, patient=None, preset=None)
+
+    names = {menu["name"] for menu in facts["menus"]}
+    assert "保険延長" in names
+    assert not names & CHANNEL_NAMES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, parse",
+    [
+        ("ホームページを見て予約したいです", {"menu_name": "ホームページ"}),  # AIが当てはめた
+        ("ホットペッパーで予約したこともあります。予約したいです", {}),  # 本文にメニュー名
+    ],
+)
+async def test_a_channel_menu_named_by_the_patient_or_the_ai_is_not_used(text, parse):
+    async with clinic() as (sessions, _ids):
+        uid, _patient_id = await _patient(sessions)
+        await _channel_menus(sessions)
+
+        await send(sessions, uid, text, {"intent": "new", "date": _day().isoformat(), **parse})
+        state = await _state(sessions, uid)
+
+    assert state["draft"].get("menu_name") not in CHANNEL_NAMES
+
+
+@pytest.mark.asyncio
+async def test_a_channel_menu_registered_as_the_usual_is_not_offered_as_the_usual():
+    """スタッフの「いつもの」がホットペッパーでも、LINE では いつもの として出さない・聞かない（本番に1名いる）。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _channel_menus(sessions)
+        await _reserve_past(sessions, patient_id, ids["tokita"], menus["hotpepper"], 40)
+        async with sessions() as db:
+            patient = (await db.execute(select(Patient).where(Patient.id == patient_id))).scalar_one()
+            patient.default_menu_id = menus["hotpepper"]
+            patient.default_duration = 40
+            await db.commit()
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+        labels = [button.get("label") or "" for button in _buttons(sent)]
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+        state = await _state(sessions, uid)
+
+    assert labels == ["保険診療", "自費診療", "相談したい"]
+    assert state["mode"] != "autopilot_confirm_usual"
+    assert state["draft"].get("menu_name") not in CHANNEL_NAMES
+
+
+@pytest.mark.asyncio
+async def test_a_previous_visit_booked_via_hotpepper_gives_only_its_minutes():
+    """前回がホットペッパーからの予約（40分）。メニューは引き継がず、施術時間だけ使う（C7 の「前回」）。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _channel_menus(sessions)
+        await _reserve_past(sessions, patient_id, ids["tokita"], menus["hotpepper"], 40)
+
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+        state = await _state(sessions, uid)
+
+    assert state["draft"].get("menu_name") not in CHANNEL_NAMES
+    assert state["draft"].get("menu_id") not in (menus["hotpepper"], menus["homepage"])
+    assert state["draft"]["duration_minutes"] == 40
+
+
+async def _reserve_past(sessions, patient_id: int, practitioner_id: int, menu_id: int, minutes: int) -> None:
+    begin = _at(_day(-14), "10:00")
+    async with sessions() as db:
+        db.add(Reservation(patient_id=patient_id, practitioner_id=practitioner_id, menu_id=menu_id,
+                           start_time=begin, end_time=begin + timedelta(minutes=minutes),
+                           status="CONFIRMED", channel="HOTPEPPER"))
+        await db.commit()
+
+
 # ─── D7・D11・C9：院のメニューはボタンで並べない。メニューのボタンは「⭐️いつもの」と保険／自費／相談だけ（まことさん 2026-10-07） ───
 
 

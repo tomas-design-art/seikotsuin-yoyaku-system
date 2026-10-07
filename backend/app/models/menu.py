@@ -7,6 +7,16 @@ from app.database import Base
 # ホームページからの新規予約に入れるメニュー。この色が「ホームページ予約／新規」（フレッシュグリーン）。
 # LINE自動予約の初回の人も、この色で入れる（正解 C12・まことさん 2026-10-07）。
 HOMEPAGE_MENU_NAME = "ホームページ"
+# ホットペッパーのメール取り込みが予約に入れるメニュー。
+HOTPEPPER_MENU_NAME = "ホットペッパー"
+# 予約の入り口（ホームページ・ホットペッパー）を表すメニュー。LINE の自動予約とは関係がないので、
+# 患者さんが選べるメニューに入れない（AIに渡す一覧・言われたメニュー・いつもの・前回から補うメニュー）。
+# 予約システムのメニューとしては残す（まことさん 2026-10-07）。
+CHANNEL_MENU_NAMES = (HOMEPAGE_MENU_NAME, HOTPEPPER_MENU_NAME)
+
+
+def is_channel_menu_name(name: str | None) -> bool:
+    return (name or "").strip() in CHANNEL_MENU_NAMES
 
 
 class Menu(Base):
