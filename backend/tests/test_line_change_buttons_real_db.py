@@ -633,6 +633,45 @@ async def test_a_menu_button_is_a_booking_answer_even_if_the_ai_reads_it_as_a_qu
 
 
 @pytest.mark.asyncio
+async def test_a_menu_the_ai_reads_from_the_context_does_not_replace_the_chosen_button():
+    """10/8 1:13 の実機：［相談したい］のあと「今日の夕方以降で」と送ると、AIが登録の いつもの（マッスルセラピー）を
+    読み取りに入れ、相談したい の選択が消えてマッスルセラピーになった。ボタンで選んだあとは、
+    本文に院のメニュー名がそのまま書かれたときだけメニューを変える。"""
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _set_usual(sessions, patient_id, menus["muscle"], 60, ids["tokita"])
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+        await press(sessions, uid, sent, "相談したい")
+        # 実機と同じ読み取り（本文にメニュー名は無いのに、AIが いつもの を入れてきた）
+        await send(sessions, uid, "今日の夕方以降で",
+                   {"intent": "new", "date": day.isoformat(), "menu_name": "マッスルセラピー", "duration_minutes": 60})
+        state = await _state(sessions, uid)
+
+    assert state["draft"].get("menu_kind") == "consult", "相談したい の選択が消えた"
+    assert not state["draft"].get("menu_name")
+
+
+@pytest.mark.asyncio
+async def test_a_menu_name_written_by_the_patient_after_a_button_is_used():
+    """ボタンのあとでも、本文に院のメニュー名を書けばそのメニュー（本人の言葉が優先・C3）。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _set_usual(sessions, patient_id, menus["muscle"], 60, ids["tokita"])
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+        await press(sessions, uid, sent, "相談したい")
+        await send(sessions, uid, "やっぱり保険延長でお願いします", {"intent": "new", "menu_name": "保険延長"})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["menu_name"] == "保険延長"
+    assert not state["draft"].get("menu_kind")
+
+
+@pytest.mark.asyncio
 async def test_the_consult_button_books_without_a_menu_in_the_consult_color():
     async with clinic() as (sessions, ids):
         day = _day()
