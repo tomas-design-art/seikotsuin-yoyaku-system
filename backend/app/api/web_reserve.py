@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agents.line_parser import parse_line_message
 from app.database import get_db
-from app.models.menu import Menu
+from app.models.menu import HOMEPAGE_MENU_NAME, Menu
 
 from app.schemas.reservation import ReservationCreate
 from app.services.reservation_service import create_reservation
@@ -26,7 +26,7 @@ from app.services.slot_scorer import find_best_practitioner, score_candidates
 
 router = APIRouter(prefix="/api", tags=["web_reserve"])
 
-HOMEPAGE_DEFAULT_MENU_NAME = "ホームページ"
+HOMEPAGE_DEFAULT_MENU_NAME = HOMEPAGE_MENU_NAME
 
 # DB保存しないWebチャット用の一時セッション
 _WEB_CHAT_SESSIONS: dict[str, dict] = {}

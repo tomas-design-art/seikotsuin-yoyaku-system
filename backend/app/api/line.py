@@ -12,7 +12,7 @@ import re
 import traceback
 import unicodedata
 from collections.abc import Awaitable, Callable
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from urllib.parse import parse_qs
 
 import httpx
@@ -24,10 +24,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.line_parser import classify_conversation_control, extract_full_name, parse_line_message
 from app.config import settings
 from app.database import async_session, get_db
-from app.models.menu import Menu
+from app.models.menu import HOMEPAGE_MENU_NAME, Menu
 from app.models.patient import Patient
 from app.models.practitioner import Practitioner
 from app.models.reservation import Reservation
+from app.models.reservation_color import CONSULT_COLOR_CODE, ReservationColor
 from app.models.line_user_state import LineUserState
 from app.models.setting import Setting
 from app.schemas.reservation import ReservationCreate
@@ -105,7 +106,12 @@ from app.services.patient_match import (
     match_identity_token,
     normalize_phone,
 )
-from app.services.reservation_service import create_reservation, reschedule_reservation, transition_status
+from app.services.reservation_service import (
+    change_reservation_menu,
+    create_reservation,
+    reschedule_reservation,
+    transition_status,
+)
 from app.services.shadow_service import handle_shadow_message
 from app.utils.datetime_jst import JST, now_jst
 from app.utils.normalize import normalize_input_text
@@ -123,6 +129,12 @@ _DEFERRED_REPLY_TOKEN: ContextVar[str | None] = ContextVar("deferred_reply_token
 _DEFERRED_REPLY_RECEIVED_AT: ContextVar[datetime | None] = ContextVar("deferred_reply_received_at", default=None)
 _DEFERRED_REPLY_TOKEN_USED: ContextVar[bool] = ContextVar("deferred_reply_token_used", default=False)
 _LINE_WEBHOOK_EVENT_ID: ContextVar[str | None] = ContextVar("line_webhook_event_id", default=None)
+# ボタンで受けた答え（はい／いいえ・メニュー）。文を読まずにそのまま使い、AIの「会話をやめるか」の判定に
+# 回さない（正解 H3：10/7 に変更の確認の「いいえ」がAIに「やめる」と読まれ、手続きごと終わった）。
+# 押した1通の処理の間だけ入れて、終わったら戻す。
+_BUTTON_ANSWER: ContextVar[dict | None] = ContextVar("line_button_answer", default=None)
+# 次に送る返信の頭に付ける一言。20分より短く言われたときの「かしこまりました」（正解 X6'）。1通ごとに空に戻す。
+_REPLY_ACK: ContextVar[str | None] = ContextVar("line_reply_ack", default=None)
 _REPLY_TOKEN_MAX_AGE_SECONDS = 60
 _LINE_EVENT_WORKER_LOCK = asyncio.Lock()
 
@@ -174,7 +186,17 @@ async def _dispatch_line_response(
     return push_sent
 
 
+def _with_reply_ack(message: str) -> str:
+    """この1通で最初に送る返信に、決まった一言（「かしこまりました。」）を付ける。付けたら空に戻す。"""
+    ack = _REPLY_ACK.get()
+    if not ack:
+        return message
+    _REPLY_ACK.set(None)
+    return message if message.startswith(ack) else f"{ack}\n{message}"
+
+
 async def reply_to_line(reply_token: str | None, message: str) -> bool:
+    message = _with_reply_ack(message)
     return await _dispatch_line_response(
         reply_token,
         lambda token: _reply_to_line_api(token, message),
@@ -187,6 +209,7 @@ async def reply_text_with_quick_reply(
     message: str,
     items: list[dict],
 ) -> bool:
+    message = _with_reply_ack(message)
     return await _dispatch_line_response(
         reply_token,
         lambda token: _reply_text_with_quick_reply_api(token, message, items),
@@ -622,15 +645,28 @@ async def _build_menu_quick_reply_items(
     db: AsyncSession,
     line_user_id: str | None = None,
     patient: Patient | None = None,
+    include_usual: bool = True,
 ) -> list[dict]:
-    """メニューを聞くときのボタン。**「⭐️いつもの」だけ**（正解 D7・まことさん 2026-10-07）。
+    """メニューを聞くときのボタン。
 
-    メニューを全部ボタンで並べると、ホットペッパーのような患者さんに見せないものまで出て、
-    数が多いとボタンを横に送る必要がある。ボタンは候補と、はい／いいえのところだけにする。
-    「いつもの」が無い人にはボタンを出さない（メニューは文字で受ける）。
-    以前は「⭐️いつもの」に加えてメニューを並び順に最大6つ出していた（2026-04 から）。
+    自動予約の人（正解 C9・まことさん 2026-10-07）：いつもの がある人は［⭐️いつもの］［保険診療］［自費診療］［相談したい］、
+    いつもの が無いリピーターは後ろの3つ。初回の人にはメニューを聞かない（ボタン無し）。
+    院のメニューを全部は並べない（ホットペッパーのような患者さんに見せないものまで出る・数が多いと横に送る）。
+    患者さんはメニューの中身までは覚えていないので、保険か自費か・相談かの大きな分け方で受ける
+    （院長には実物を見せてから相談＝変わる可能性あり）。
+    自動予約でない人は、これまでどおり いつもの（登録か前回）だけ。
     """
     preset = await _get_patient_default_preset(db, patient)
+    if patient is not None and getattr(patient, "line_autopilot_enabled", False):
+        items: list[dict] = []
+        if preset and include_usual:
+            usual_text = _format_usual_shortcut_text(
+                preset["menu_name"], preset["duration_minutes"], preset["practitioner_name"]
+            )
+            items.append({"type": "action", "action": {"type": "message", "label": "⭐️いつもの", "text": usual_text}})
+        if not preset and not (await _get_latest_reservation_for_line_user(db, line_user_id) if line_user_id else None):
+            return []
+        return items + _menu_kind_quick_reply_items("menu_kind")
     if preset:
         quick_text = _format_usual_shortcut_text(
             preset["menu_name"], preset["duration_minutes"], preset["practitioner_name"]
@@ -938,6 +974,27 @@ def _slot_confirmation_plan(
     purpose: str = "ご予約",
 ) -> ReplyPlan:
     """枠の確認の骨格。日時・担当・メニューはここで決まり、LLMは言い回しだけ整える。"""
+    detail, keep = _slot_detail(start_dt, end_dt, practitioner_name, menu_name)
+    return ReplyPlan(
+        facts=[detail],
+        note=note,
+        ask=f"こちらで{purpose}をお取りしてよろしいですか？",
+        ask_about="よろしい",
+        yes_no=True,
+        keep=keep,
+    )
+
+
+def _slot_detail(
+    start_dt: datetime,
+    end_dt: datetime,
+    practitioner_name: str | None,
+    menu_name: str | None = None,
+) -> tuple[str, list[str]]:
+    """「10/9(金) 16:30〜17:30（担当: 時田・メニュー: マッスルセラピー）」と、整えた文に必ず残す語。"""
+    # 予約ボードの時刻は UTC で持っているので、表示は日本時間に直す（時刻を持たない値はそのまま）
+    start_dt = start_dt.astimezone(JST) if start_dt.tzinfo else start_dt
+    end_dt = end_dt.astimezone(JST) if end_dt.tzinfo else end_dt
     day = _format_date_with_weekday_jp(start_dt.date())
     begin = start_dt.strftime("%H:%M")
     finish = end_dt.strftime("%H:%M")
@@ -955,15 +1012,7 @@ def _slot_confirmation_plan(
         keep.append(practitioner_name)
     if menu_name:
         keep.append(menu_name)
-
-    return ReplyPlan(
-        facts=[detail],
-        note=note,
-        ask=f"こちらで{purpose}をお取りしてよろしいですか？",
-        ask_about="よろしい",
-        yes_no=True,
-        keep=keep,
-    )
+    return detail, keep
 
 
 def _parse_iso_datetime(raw: Any) -> datetime | None:
@@ -1787,6 +1836,259 @@ async def _reply_with_loop_guard(
     return False
 
 
+# 変更で「どこを変えるか」のボタン（正解 F7・まことさん 2026-10-07）
+_CHANGE_ITEMS = (
+    ("datetime", "日時を変更したい"),
+    ("duration", "施術時間を変更したい"),
+    ("menu", "メニューの内容を変更したい"),
+    ("practitioner", "施術者を変更したい"),
+)
+# メニューのボタン。保険診療／自費診療／相談したい（正解 C9〜C11・F7）
+_MENU_KINDS = (("insurance", "保険診療"), ("self", "自費診療"), ("consult", "相談したい"))
+_MENU_KIND_LABELS = dict(_MENU_KINDS)
+# 「相談したい」で入った予約（メニューは当日スタッフと決める）の確認での書き方
+_CONSULT_MENU_LABEL = "当日ご相談"
+# 変更で、いま何を聞いているか（文字の返事をどう読むかに使う）
+_CHANGE_ASKED_KEY = "autopilot_change_asked"
+# 確認待ちの変更の中身。聞き直すとき・別の変更を始めるときは捨てる
+_CHANGE_PENDING_KEYS = (
+    "autopilot_change_start_time_iso",
+    "autopilot_change_end_time_iso",
+    "autopilot_change_practitioner_id",
+    "autopilot_change_practitioner_name",
+    "autopilot_change_picked",
+    "autopilot_change_menu_id",
+    "autopilot_change_menu_name",
+    "autopilot_change_menu_kind",
+    "autopilot_change_same",
+)
+# 保険診療／自費診療で入れるメニュー。名前は設定で変えられる（決め打ちにしない）。既定は 2026-10-07 の本番の名前
+_MENU_ROLE_SETTINGS = {
+    "self": ("autopilot_menu_self_pay", "マッスルセラピー"),
+    "insurance_short": ("autopilot_menu_insurance", "保険診療"),
+    "insurance_long": ("autopilot_menu_insurance_long", "保険延長"),
+}
+
+
+def _postback_items(pairs: Iterable[tuple[str, str]]) -> list[dict]:
+    """ボタン（押すと文ではなく決まった答えが届く）。押した文字は displayText で会話に残る。"""
+    return [
+        {
+            "type": "action",
+            "action": {"type": "postback", "label": label, "data": data, "displayText": label},
+        }
+        for data, label in pairs
+    ]
+
+
+def _change_item_quick_reply_items() -> list[dict]:
+    return _postback_items((f"action=change_item&item={item}", label) for item, label in _CHANGE_ITEMS)
+
+
+def _menu_kind_quick_reply_items(action: str) -> list[dict]:
+    return _postback_items((f"action={action}&kind={kind}", label) for kind, label in _MENU_KINDS)
+
+
+async def _configured_menu(db: AsyncSession, role: str) -> Menu | None:
+    key, default = _MENU_ROLE_SETTINGS[role]
+    name = (await _get_setting(db, key, default)).strip() or default
+    return (
+        await db.execute(select(Menu).where(Menu.is_active == True, Menu.name == name).limit(1))  # noqa: E712
+    ).scalar_one_or_none()
+
+
+async def _menu_side(db: AsyncSession, menu: Menu | None) -> str | None:
+    """メニューが保険の側か自費の側か。保険診療・自費診療で入れるメニューと同じ色かで見る。"""
+    if menu is None or menu.color_id is None:
+        return None
+    insurance = await _configured_menu(db, "insurance_short")
+    if insurance is not None and insurance.color_id == menu.color_id:
+        return "insurance"
+    self_pay = await _configured_menu(db, "self")
+    if self_pay is not None and self_pay.color_id == menu.color_id:
+        return "self"
+    return None
+
+
+async def _menu_for_kind_and_minutes(db: AsyncSession, kind: str, minutes: int) -> Menu | None:
+    """自費診療＝マッスルセラピー。保険診療＝15分なら保険診療、それより長ければ保険延長（正解 C10）。"""
+    if kind == "self":
+        return await _configured_menu(db, "self")
+    short = await _configured_menu(db, "insurance_short")
+    if short is not None and minutes <= int(short.duration_minutes or 0):
+        return short
+    return await _configured_menu(db, "insurance_long") or short
+
+
+async def _consult_color_id(db: AsyncSession) -> int | None:
+    rows = (await db.execute(select(ReservationColor))).scalars().all()
+    for color in rows:
+        if (color.color_code or "").strip().lower() == CONSULT_COLOR_CODE:
+            return color.id
+    return None
+
+
+async def _new_patient_color_id(db: AsyncSession) -> int | None:
+    """初回の人の色。ホームページの新規予約と同じ「ホームページ」メニューの色（正解 C12）。"""
+    menu = (
+        await db.execute(
+            select(Menu).where(Menu.name == HOMEPAGE_MENU_NAME, Menu.is_active == True).limit(1)  # noqa: E712
+        )
+    ).scalar_one_or_none()
+    return menu.color_id if menu else None
+
+
+async def _autopilot_color_id(db: AsyncSession, user_id: str, draft: dict, menu_id: int | None) -> int | None:
+    """メニューが無い自動予約の色。メニューがあればメニューの色（create_reservation が決める）。
+
+    初回の人＝「ホームページ予約／新規」の色（正解 C12）、相談したい＝相談の水色（正解 C11）。
+    以前はメニュー無しの予約に色が付かず、予約ボードで見分けられなかった。
+    """
+    if menu_id:
+        return None
+    if draft.get("first_visit") or await _get_latest_reservation_for_line_user(db, user_id) is None:
+        return await _new_patient_color_id(db)
+    if draft.get("menu_kind") == "consult":
+        return await _consult_color_id(db)
+    return None
+
+
+async def _resolve_change_minutes(
+    db: AsyncSession,
+    reservation: Reservation,
+    minutes: int,
+) -> tuple[int, dict | None]:
+    """変更で言われた施術時間を、予約に入れてよい分数にする。メニューを切り替えるならその中身も返す。
+
+    - 保険診療（15分固定）で施術時間が変わったら保険延長に切り替える（まことさん 2026-10-07）
+    - 固定のメニューより短くはしない（保険診療は15分のまま）
+    - 時間を選べるメニュー・メニュー無しは、20分より短く言われたら「かしこまりました」とだけ返して20分（正解 X6'）
+    """
+    menu = await db.get(Menu, reservation.menu_id) if reservation.menu_id else None
+    menu_change: dict | None = None
+    if menu is not None and not menu.is_duration_variable:
+        fixed = int(menu.duration_minutes or 0)
+        short = await _configured_menu(db, "insurance_short")
+        if minutes > fixed and short is not None and short.id == menu.id:
+            extension = await _configured_menu(db, "insurance_long")
+            if extension is not None:
+                menu_change = {"kind": "insurance", "menu": extension}
+                menu = extension
+        elif minutes < fixed:
+            minutes = fixed
+    if menu is None or menu.is_duration_variable:
+        floor = await get_autopilot_min_duration(db)
+        if minutes < floor:
+            minutes = floor
+            _REPLY_ACK.set("かしこまりました。")
+    return minutes, menu_change
+
+
+async def _pending_menu_change(db: AsyncSession, draft: dict) -> dict | None:
+    """確認待ちの変更に入っているメニューの切り替え。"""
+    kind = draft.get("autopilot_change_menu_kind")
+    if not kind:
+        return None
+    menu_id = draft.get("autopilot_change_menu_id")
+    return {"kind": kind, "menu": await db.get(Menu, int(menu_id)) if menu_id else None}
+
+
+def _menu_change_draft(menu_change: dict | None) -> dict:
+    if not menu_change:
+        return {}
+    menu = menu_change.get("menu")
+    values = {"autopilot_change_menu_kind": menu_change["kind"]}
+    if menu is not None:
+        values.update({"autopilot_change_menu_id": menu.id, "autopilot_change_menu_name": menu.name})
+    return values
+
+
+async def _propose_change(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    reservation: Reservation,
+    start_dt: datetime,
+    end_dt: datetime,
+    practitioner: Practitioner,
+    menu_change: dict | None = None,
+    picked: dict | bool = False,
+) -> None:
+    """変更後の予約を確認する（はい／いいえ）。今の予約とまったく同じなら、同じだと伝える（正解 F8）。"""
+    same_time = (
+        start_dt == reservation.start_time
+        and end_dt == reservation.end_time
+        and practitioner.id == reservation.practitioner_id
+    )
+    if menu_change is None:
+        same_menu = True
+    elif menu_change["kind"] == "consult":
+        same_menu = reservation.menu_id is None and reservation.color_id == await _consult_color_id(db)
+    else:
+        new_menu = menu_change.get("menu")
+        same_menu = new_menu is not None and new_menu.id == reservation.menu_id
+    await set_user_mode(db, user_id, "autopilot_change_confirm")
+    if same_time and same_menu:
+        await merge_user_draft(
+            db,
+            user_id,
+            {"autopilot_change_reservation_id": reservation.id, "autopilot_change_same": True},
+            drop=_CHANGE_PENDING_KEYS,
+        )
+        current_menu = await db.get(Menu, reservation.menu_id) if reservation.menu_id else None
+        current_practitioner = await db.get(Practitioner, reservation.practitioner_id) if reservation.practitioner_id else None
+        detail, keep = _slot_detail(
+            reservation.start_time,
+            reservation.end_time,
+            current_practitioner.name if current_practitioner else None,
+            current_menu.name if current_menu else None,
+        )
+        await _reply_plan(
+            reply_token,
+            "change",
+            ReplyPlan(
+                facts=["今のご予約と同じ内容です。", detail],
+                ask="このままでよろしいですか？",
+                ask_about="このまま",
+                yes_no=True,
+                keep=["今のご予約と同じ内容です", *keep],
+            ),
+        )
+        return
+
+    await merge_user_draft(
+        db,
+        user_id,
+        {
+            "autopilot_change_reservation_id": reservation.id,
+            "autopilot_change_start_time_iso": start_dt.isoformat(),
+            "autopilot_change_end_time_iso": end_dt.isoformat(),
+            "autopilot_change_practitioner_id": practitioner.id,
+            "autopilot_change_practitioner_name": practitioner.name,
+            # 候補から選んだときだけ、どの提示の何番目かを残す（動かす直前に突き合わせる）。
+            # 前に選んだ候補の記録が残っていると食い違い扱いになるので、選んでいなければ False
+            "autopilot_change_picked": picked or False,
+            **_menu_change_draft(menu_change),
+        },
+        drop=_CHANGE_PENDING_KEYS,
+    )
+    menu_label = None
+    if menu_change:
+        menu_label = menu_change["menu"].name if menu_change.get("menu") else _CONSULT_MENU_LABEL
+    await _reply_plan(
+        reply_token,
+        "change",
+        _slot_confirmation_plan(
+            start_dt=start_dt,
+            end_dt=end_dt,
+            practitioner_name=practitioner.name,
+            menu_name=menu_label,
+            purpose="変更後のご予約",
+        ),
+    )
+
+
 async def _complete_autopilot_reschedule(
     db: AsyncSession,
     *,
@@ -1798,12 +2100,16 @@ async def _complete_autopilot_reschedule(
     patient_message: str = "",
     selected_candidate: dict | None = None,
     preferred_practitioner_id: int | None = None,
+    duration_minutes: int | None = None,
+    menu_change: dict | None = None,
 ) -> bool:
     """DBで確認した変更候補を提示し、患者の明示確認を待つ。
 
     言われた日時が今の担当（名指しがあればその人）で空いていれば、その枠で確認へ進む。
     空いていなければ、黙って別の担当にせず、近い枠を候補として選んでもらう（正解 F2）。
     空きは、動かそうとしている予約そのものを除いて調べる（正解 F1）。
+    施術時間は、本人が言っていればその分数、言っていなければ今の予約の長さ（正解 F6）。
+    以前はいつも今の予約の長さで計算し、「30分にしてほしい」が捨てられていた（2026-10-07 実機）。
     """
     try:
         if selected_candidate:
@@ -1816,7 +2122,7 @@ async def _complete_autopilot_reschedule(
         else:
             target_date = date.fromisoformat(desired_date)
             target_time = time.fromisoformat(str(desired_time)[:5])
-            duration = int((reservation.end_time - reservation.start_time).total_seconds() // 60)
+            duration = int(duration_minutes or _reservation_minutes(reservation))
             keep_practitioner_id = preferred_practitioner_id or reservation.practitioner_id
             practitioner, start_dt, end_dt, _, _ = await find_best_practitioner(
                 db,
@@ -1836,6 +2142,10 @@ async def _complete_autopilot_reschedule(
                     reply_token=reply_token,
                     patient_message=patient_message,
                     preferred_practitioner_id=keep_practitioner_id,
+                    duration_minutes=duration,
+                    menu_change=menu_change,
+                    # 担当を変えたいと言われたときは、その担当の枠だけを候補にする
+                    only_preferred=keep_practitioner_id != reservation.practitioner_id,
                 )
         if not practitioner:
             raise HTTPException(status_code=409, detail="変更先に空き枠がありません")
@@ -1851,32 +2161,194 @@ async def _complete_autopilot_reschedule(
             )
         return False
 
+    await _propose_change(
+        db,
+        user_id=user_id,
+        reply_token=reply_token,
+        reservation=reservation,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        practitioner=practitioner,
+        menu_change=menu_change,
+    )
+    return True
+
+
+async def _offer_duration_change(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    reservation: Reservation,
+    minutes: int,
+    patient_message: str,
+) -> None:
+    """施術時間だけの変更（正解 F6）。開始はそのまま、終わりを変える。日時は聞き返さない。
+
+    長くして後ろが空いていなければ、時刻をずらす変更と同じく近い枠を候補にする。
+    """
+    minutes, menu_change = await _resolve_change_minutes(db, reservation, minutes)
+    start = reservation.start_time.astimezone(JST)
+    await _complete_autopilot_reschedule(
+        db,
+        reservation=reservation,
+        desired_date=start.date().isoformat(),
+        desired_time=start.strftime("%H:%M"),
+        user_id=user_id,
+        reply_token=reply_token,
+        patient_message=patient_message,
+        duration_minutes=minutes,
+        menu_change=menu_change,
+    )
+
+
+async def _offer_menu_change(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    reservation: Reservation,
+    kind: str,
+) -> None:
+    """メニューの変更（正解 F7・C10・C11）。予約の時間は変えず、色はメニューに合わせる。
+
+    今のメニューが選んだ側（保険／自費）と同じなら、そのまま（今と同じ内容になる＝F8）。
+    """
+    if kind == "consult":
+        menu_change = {"kind": "consult", "menu": None}
+    else:
+        current = await db.get(Menu, reservation.menu_id) if reservation.menu_id else None
+        if current is not None and await _menu_side(db, current) == kind:
+            menu_change = {"kind": kind, "menu": current}
+        else:
+            menu = await _menu_for_kind_and_minutes(db, kind, _reservation_minutes(reservation))
+            if menu is None:
+                # 設定のメニュー名が院のメニューに無い（名前が変わった等）。勝手に別のメニューにしない
+                logger.warning("LINE autopilot: menu for kind=%s is not configured", kind)
+                await _ask_change_item(
+                    db,
+                    user_id=user_id,
+                    reply_token=reply_token,
+                    reservation=reservation,
+                    lead="恐れ入ります、メニューの変更はご来院時にスタッフが承ります。",
+                )
+                return
+            menu_change = {"kind": kind, "menu": menu}
+    practitioner = await db.get(Practitioner, reservation.practitioner_id)
+    await _propose_change(
+        db,
+        user_id=user_id,
+        reply_token=reply_token,
+        reservation=reservation,
+        start_dt=reservation.start_time.astimezone(JST),
+        end_dt=reservation.end_time.astimezone(JST),
+        practitioner=practitioner,
+        menu_change=menu_change,
+    )
+
+
+async def _ask_change_item(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    reservation: Reservation,
+    lead: str | None = None,
+) -> None:
+    """どこを変えるかをボタンで聞く（正解 F7）。予約はそのまま。確認待ちの中身は捨てる。"""
     await merge_user_draft(
         db,
         user_id,
-        {
-            "autopilot_change_reservation_id": reservation.id,
-            "autopilot_change_start_time_iso": start_dt.isoformat(),
-            "autopilot_change_end_time_iso": end_dt.isoformat(),
-            "autopilot_change_practitioner_id": practitioner.id,
-            "autopilot_change_practitioner_name": practitioner.name,
-            # 候補から選んだのではない。前に選んだ候補の記録が残っていると、動かす直前の
-            # 突き合わせで食い違い扱いになるので消す（merge_user_draft は None を無視するので False）
-            "autopilot_change_picked": False,
-        },
+        {"autopilot_change_reservation_id": reservation.id, _CHANGE_ASKED_KEY: "what"},
+        drop=_CHANGE_PENDING_KEYS,
     )
-    await set_user_mode(db, user_id, "autopilot_change_confirm")
-    await _reply_plan(
-        reply_token,
-        "change",
-        _slot_confirmation_plan(
-            start_dt=start_dt,
-            end_dt=end_dt,
-            practitioner_name=practitioner.name,
-            purpose="変更後のご予約",
-        ),
+    await set_user_mode(db, user_id, "autopilot_change_datetime")
+    practitioner = await db.get(Practitioner, reservation.practitioner_id) if reservation.practitioner_id else None
+    menu = await db.get(Menu, reservation.menu_id) if reservation.menu_id else None
+    detail, _keep = _slot_detail(
+        reservation.start_time,
+        reservation.end_time,
+        practitioner.name if practitioner else None,
+        menu.name if menu else None,
     )
-    return True
+    plan = ReplyPlan(
+        facts=[*([lead] if lead else []), f"{detail}のご予約ですね。"],
+        ask="どのようにご変更されますか？",
+        ask_about="ご変更",
+        keep=["どのようにご変更"],
+    )
+    autopilot_log.note("plan", form="change_item", plan=plan)
+    if reply_token:
+        await reply_text_with_quick_reply(reply_token, await _polished_from_plan(plan), _change_item_quick_reply_items())
+
+
+def _change_duration_question_plan() -> ReplyPlan:
+    return ReplyPlan(ask="施術時間は何分をご希望ですか？", ask_about="施術時間", keep=["何分"])
+
+
+def _change_datetime_question_plan() -> ReplyPlan:
+    return ReplyPlan(ask="ご希望の日時を教えてください。", ask_about="日時", keep=["日時"])
+
+
+async def _offer_practitioner_choice(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    reply_token: str | None,
+    reservation: Reservation,
+) -> None:
+    """担当の変更。今の担当を除いた施術者をボタンで出す（まことさん 2026-10-07）。"""
+    others = (
+        await db.execute(
+            select(Practitioner)
+            .where(Practitioner.bookable(), Practitioner.id != reservation.practitioner_id)
+            .order_by(Practitioner.display_order, Practitioner.id)
+        )
+    ).scalars().all()[:_MAX_CHOICE_BUTTONS]
+    if not others:
+        await _ask_change_item(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            reservation=reservation,
+            lead="恐れ入ります、ほかにご案内できる担当者がおりません。",
+        )
+        return
+    await merge_user_draft(db, user_id, {_CHANGE_ASKED_KEY: "practitioner"}, drop=_CHANGE_PENDING_KEYS)
+    plan = ReplyPlan(ask="ご希望の担当者をお選びください。", ask_about="担当者", keep=["担当者"])
+    autopilot_log.note("plan", form="change_practitioner", plan=plan)
+    if reply_token:
+        await reply_text_with_quick_reply(
+            reply_token,
+            await _polished_from_plan(plan),
+            _postback_items((f"action=change_practitioner&id={other.id}", other.name) for other in others),
+        )
+
+
+def _stated_change_minutes(text: str, parsed: dict | None) -> int | None:
+    """変更の文で本人が言った施術時間。
+
+    AIの読み取りは、文に「分」「時間」が無ければ使わない（会話の流れから補った分数を本人の希望にしない）。
+    """
+    minutes = _extract_duration_minutes(text)
+    if minutes:
+        return minutes
+    raw = (parsed or {}).get("duration_minutes")
+    if raw and re.search(r"分|時間", text or ""):
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+async def _apply_confirmed_menu_change(db: AsyncSession, reservation_id: int, menu_change: dict) -> None:
+    """確認できたメニューの変更を予約へ入れる。色はメニューの色、「相談したい」は相談の色（正解 C10・C11）。"""
+    menu = menu_change.get("menu")
+    if menu_change["kind"] == "consult":
+        await change_reservation_menu(db, reservation_id, None, await _consult_color_id(db), label=_CONSULT_MENU_LABEL)
+    elif menu is not None:
+        await change_reservation_menu(db, reservation_id, menu.id, menu.color_id, label=menu.name)
 
 
 def _reservation_minutes(reservation: Reservation) -> int:
@@ -1893,18 +2365,27 @@ async def _offer_change_candidates(
     patient_message: str,
     unavailable_note: str | None = None,
     requested_date: date | None = None,
+    duration_minutes: int | None = None,
+    menu_change: dict | None = None,
 ) -> None:
     """変更先の候補を、新しい予約と同じ形で出す（正解 D8）。
 
     候補は表示順のまま1か所（autopilot_offer）へ保存し、ボタン（押した番号）で選ばせる。
     以前は変更用の別の置き場（autopilot_change_offered_slots）に入れ、番号は本文中の
     1桁を拾っていたため、提示と選択が食い違いうる作りのままだった（9/8 に「次に直す筆頭」）。
+    施術時間を変える変更なら、候補はその長さ。メニューの切り替え（保険診療→保険延長）も一緒に覚えておく。
     """
-    offer = offered_slots.new_offer(candidates, _reservation_minutes(reservation))
+    offer = offered_slots.new_offer(candidates, duration_minutes or _reservation_minutes(reservation))
     await merge_user_draft(
         db,
         user_id,
-        {**offer.to_draft(), "autopilot_change_reservation_id": reservation.id, "autopilot_change_picked": False},
+        {
+            **offer.to_draft(),
+            "autopilot_change_reservation_id": reservation.id,
+            "autopilot_change_picked": False,
+            **_menu_change_draft(menu_change),
+        },
+        drop=_CHANGE_PENDING_KEYS,
     )
     await set_user_mode(db, user_id, "autopilot_change_datetime")
     current_name = None
@@ -1940,37 +2421,63 @@ async def _offer_change_alternatives(
     reply_token: str | None,
     patient_message: str,
     preferred_practitioner_id: int | None,
+    duration_minutes: int | None = None,
+    menu_change: dict | None = None,
+    only_preferred: bool = False,
 ) -> bool:
     """言われた時刻がその担当で空いていないとき、前後1時間くらいの空きを候補にする（正解 D10・F2）。
 
     近くに無ければ、その日の空きを出す。それも無ければ空いていないことを伝える。
+    担当を変えたいと言われたとき（only_preferred）は、その担当の枠だけ。元の担当の枠を先頭に出さない。
     """
-    duration = _reservation_minutes(reservation)
+    duration = int(duration_minutes or _reservation_minutes(reservation))
     desired = desired_time.hour * 60 + desired_time.minute
-    scored = await build_same_day_candidates(
-        db,
-        target_date,
-        desired_time,
-        duration,
-        preferred_practitioner_id=preferred_practitioner_id,
-        window_start_min=max(desired - 60, 0),
-        window_end_min=desired + 60 + duration,
-        max_results=_MAX_CHOICE_BUTTONS,
-        preferred_first=True,
-        exclude_reservation_id=reservation.id,
-    )
-    if not scored:
-        scored = await build_same_day_candidates(
+
+    def _keep(found: list) -> list[dict]:
+        rows = [candidate.to_dict() for candidate in found]
+        if only_preferred and preferred_practitioner_id:
+            rows = [row for row in rows if row.get("practitioner_id") == preferred_practitioner_id]
+        return rows[:_MAX_CHOICE_BUTTONS]
+
+    # 担当で絞るときは、絞った後にも3つ残るよう多めに探す
+    search_size = _MAX_CHOICE_BUTTONS * 4 if only_preferred else _MAX_CHOICE_BUTTONS
+    candidates = _keep(
+        await build_same_day_candidates(
             db,
             target_date,
             desired_time,
             duration,
             preferred_practitioner_id=preferred_practitioner_id,
-            max_results=_MAX_CHOICE_BUTTONS,
+            window_start_min=max(desired - 60, 0),
+            window_end_min=desired + 60 + duration,
+            max_results=search_size,
             preferred_first=True,
             exclude_reservation_id=reservation.id,
         )
-    candidates = [candidate.to_dict() for candidate in scored]
+    )
+    if not candidates:
+        candidates = _keep(
+            await build_same_day_candidates(
+                db,
+                target_date,
+                desired_time,
+                duration,
+                preferred_practitioner_id=preferred_practitioner_id,
+                max_results=search_size,
+                preferred_first=True,
+                exclude_reservation_id=reservation.id,
+            )
+        )
+    if not candidates and only_preferred:
+        chosen = await db.get(Practitioner, preferred_practitioner_id)
+        await _ask_change_item(
+            db,
+            user_id=user_id,
+            reply_token=reply_token,
+            reservation=reservation,
+            lead=f"恐れ入ります、{_format_date_with_weekday_jp(target_date)}は{chosen.name if chosen else 'ご希望の担当'}の空きがございません。",
+        )
+        return False
     if not candidates:
         await set_user_mode(db, user_id, "autopilot_change_datetime")
         if reply_token:
@@ -1988,6 +2495,8 @@ async def _offer_change_alternatives(
         candidates=candidates,
         patient_message=patient_message,
         unavailable_note=f"{stamp}〜は空きがございません。",
+        duration_minutes=duration,
+        menu_change=menu_change,
     )
     return True
 
@@ -2001,9 +2510,11 @@ async def _offer_change_day(
     reply_token: str | None,
     patient_message: str,
     preferred_practitioner_id: int | None = None,
+    duration_minutes: int | None = None,
+    menu_change: dict | None = None,
 ) -> bool:
     """日だけ言われた変更。その日の空きを、今の担当の枠を先頭にして候補にする（正解 D2・F2）。"""
-    duration = _reservation_minutes(reservation)
+    duration = int(duration_minutes or _reservation_minutes(reservation))
     scored = await build_same_day_candidates(
         db,
         target_date,
@@ -2025,6 +2536,8 @@ async def _offer_change_day(
         candidates=candidates,
         patient_message=patient_message,
         requested_date=target_date,
+        duration_minutes=duration,
+        menu_change=menu_change,
     )
     return True
 
@@ -2044,28 +2557,20 @@ async def _confirm_change_pick(
         return False
     start_dt = datetime.combine(date.fromisoformat(str(picked["date"])), time.fromisoformat(str(picked["start"])), tzinfo=JST)
     end_dt = datetime.combine(date.fromisoformat(str(picked["date"])), time.fromisoformat(str(picked["end"])), tzinfo=JST)
-    await merge_user_draft(
+    practitioner = await db.get(Practitioner, int(picked["practitioner_id"]))
+    if practitioner is None:
+        return False
+    state = await get_user_state(db, user_id)
+    await _propose_change(
         db,
-        user_id,
-        {
-            "autopilot_change_reservation_id": reservation.id,
-            "autopilot_change_start_time_iso": start_dt.isoformat(),
-            "autopilot_change_end_time_iso": end_dt.isoformat(),
-            "autopilot_change_practitioner_id": picked.get("practitioner_id"),
-            "autopilot_change_practitioner_name": picked.get("practitioner_name"),
-            "autopilot_change_picked": picked,
-        },
-    )
-    await set_user_mode(db, user_id, "autopilot_change_confirm")
-    await _reply_plan(
-        reply_token,
-        "change",
-        _slot_confirmation_plan(
-            start_dt=start_dt,
-            end_dt=end_dt,
-            practitioner_name=picked.get("practitioner_name"),
-            purpose="変更後のご予約",
-        ),
+        user_id=user_id,
+        reply_token=reply_token,
+        reservation=reservation,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        practitioner=practitioner,
+        menu_change=await _pending_menu_change(db, state.get("draft") or {}),
+        picked=picked,
     )
     return True
 
@@ -2079,18 +2584,9 @@ async def _begin_change_for(
     reservation: Reservation,
     text: str,
 ) -> None:
-    """変更する予約が決まった。変更先の日時を聞く。"""
+    """変更する予約が決まった。どこを変えるかをボタンで聞く（正解 F7）。"""
     await clear_user_draft(db, user_id)
-    await merge_user_draft(db, user_id, {"autopilot_change_reservation_id": reservation.id})
-    await set_user_mode(db, user_id, "autopilot_change_datetime")
-    if reply_token:
-        await reply_to_line(
-            reply_token,
-            await _compose_autopilot_reply(
-                "ask_datetime",
-                {"patient_name": patient.name, "patient_message": text, "purpose": "予約変更"},
-            ),
-        )
+    await _ask_change_item(db, user_id=user_id, reply_token=reply_token, reservation=reservation)
 
 
 async def _start_change_selection(
@@ -2418,6 +2914,7 @@ async def _merge_autopilot_slots(
     patient: Patient,
     previous: dict,
     parsed: dict,
+    menu_kind: str | None = None,
 ) -> dict:
     stated_duration = parsed.get("duration_minutes") or _extract_duration_minutes(text)
     update = {
@@ -2430,17 +2927,41 @@ async def _merge_autopilot_slots(
         "constraints": parsed.get("constraints"),
         "parse_confidence": parsed.get("confidence"),
     }
-    # 時間を選べるメニューを名前で言われ、施術時間がまだ分からない（このときは何分かを聞く）
+    # 施術時間がまだ分からない（このときは何分かを聞く）
     duration_unknown = False
+    # 前に入っていた値を捨てる箱
+    drop: list[str] = []
     # 患者が日付を口にしていないなら、話していた日を動かさない。
     # 解析側が時刻だけの返事に今日の日付を補うことがあり、そのまま採ると
     # 8/31の話をしていたのに今日で確定してしまう（実機で発生）。
     if update["date"] and previous.get("date") and not _mentions_explicit_date(text):
         update["date"] = previous["date"]
     menu_hint = parsed.get("menu_name") or parsed.get("menu_hint")
-    wants_usual = menu_hint == "usual" or bool(re.search(r"いつもの|前回と同じ|この前と同じ", text)) or text.startswith("⭐️いつもの")
-    named_menu = None if wants_usual else await _menu_named_in_text(db, text)
-    if wants_usual:
+    named_menu = None if menu_kind else await _menu_named_in_text(db, text)
+    # 保険診療を選んで、施術時間を聞いている途中（分数が分かったら保険診療か保険延長かを決める）
+    pending_kind = (
+        "insurance"
+        if not menu_kind and not named_menu and previous.get("menu_kind") == "insurance" and not previous.get("menu_id")
+        else None
+    )
+    wants_usual = not (menu_kind or pending_kind) and (
+        menu_hint == "usual" or bool(re.search(r"いつもの|前回と同じ|この前と同じ", text)) or text.startswith("⭐️いつもの")
+    )
+    if menu_kind or pending_kind:
+        # ボタンの保険診療／自費診療／相談したい（正解 C9〜C11）。ボタンの文字（「保険診療」）を
+        # 院のメニュー名として読まない（読むと保険診療15分固定になり、施術時間で分ける決めごとに反する）
+        kind_values, duration_unknown = await _booking_menu_for_kind(
+            db,
+            user_id=user_id,
+            patient=patient,
+            kind=menu_kind or pending_kind,
+            stated_duration=stated_duration,
+            previous=previous,
+        )
+        update.update(kind_values)
+        if not kind_values.get("menu_id"):
+            drop += ["menu_id", "menu_name"]
+    elif wants_usual:
         # 「いつもの」は空いている箱を埋めるだけ。患者が述べた値は上書きしない。
         # 以前は preset で必ず上書きしていたため、「マッスルセラピーを60分お願いします」の
         # 60分が捨てられ、同じ質問へ戻り続けた（2026-09-07 実機）。
@@ -2453,6 +2974,7 @@ async def _merge_autopilot_slots(
 
         # 本人が「いつもの」を選んだ。改めて「いつものでよろしいですか」とは聞かない（正解 C2）
         update["usual_confirmed"] = True
+        drop.append("menu_kind")
         preset = await _get_patient_default_preset(db, patient)
         if preset:
             _fill_gaps(
@@ -2501,6 +3023,8 @@ async def _merge_autopilot_slots(
                     "assumed_menu": False,
                 }
             )
+            # 院のメニュー名を言われたら、ボタンの保険／自費／相談より本人の言葉を優先する
+            drop.append("menu_kind")
 
     # 本人が担当を明言していれば、登録上の既定より本人の希望を優先する。
     # 名前が出ていないメッセージで施術者一覧を引かない（毎回の問い合わせを避ける）。
@@ -2516,23 +3040,95 @@ async def _merge_autopilot_slots(
             }
         )
 
+    # 施術時間が分からないなら、前に入っていた分数（別のメニューの分数・登録値）も捨てる
+    if duration_unknown:
+        drop += ["duration_minutes", "assumed_duration"]
     # 患者が指定しなかった条件は登録情報（スタッフ設定のいつもの／初回ルール）で補う。
     # 「いつもの」を押した人だけが良い候補を受け取れる状態を解消するため。
     preview = {**previous, **{key: value for key, value in update.items() if value not in (None, "")}}
-    # 施術時間が分からないなら、前に入っていた分数（別のメニューの分数・登録値）も捨てる
-    drop = ("duration_minutes", "assumed_duration") if duration_unknown else ()
     for key in drop:
         preview.pop(key, None)
+    # 保険診療／自費診療／相談したい を選んだ人のメニューは、登録上の いつもの・前回 で埋めない
+    kind_chosen = bool(preview.get("menu_kind"))
     if not (preview.get("menu_name") and preview.get("duration_minutes") and preview.get("practitioner_id")):
         defaults = await _resolve_booking_defaults(db, user_id=user_id, patient=patient)
         for key, value in defaults.items():
             # 「いつもの」・前回の分数は、別のメニューのものなので使わない。初回の60分は使う（正解 C8）
-            if duration_unknown and key in drop and not defaults.get("first_visit"):
+            if duration_unknown and key in ("duration_minutes", "assumed_duration") and not defaults.get("first_visit"):
+                continue
+            if kind_chosen and key in ("menu_id", "menu_name", "assumed_menu"):
                 continue
             if preview.get(key) in (None, "") and update.get(key) in (None, ""):
                 update[key] = value
 
-    return await merge_user_draft(db, user_id, update, drop=drop)
+    # 20分より短い施術は予約しない（正解 X6'：20分を1枠・まことさん 2026-10-07）。
+    # 本人が短く言ったときは「かしこまりました」とだけ返し、20分で探す。固定のメニュー（保険診療15分）はそのまま
+    duration_now = update.get("duration_minutes") or (None if "duration_minutes" in drop else previous.get("duration_minutes"))
+    if duration_now:
+        menu_id = update.get("menu_id") or (None if "menu_id" in drop else previous.get("menu_id"))
+        menu = await db.get(Menu, int(menu_id)) if menu_id else None
+        if menu is None or menu.is_duration_variable:
+            floor = await get_autopilot_min_duration(db)
+            if int(duration_now) < floor:
+                update["duration_minutes"] = floor
+                if stated_duration and int(stated_duration) < floor:
+                    _REPLY_ACK.set("かしこまりました。")
+
+    return await merge_user_draft(db, user_id, update, drop=tuple(dict.fromkeys(drop)))
+
+
+async def _booking_menu_for_kind(
+    db: AsyncSession,
+    *,
+    user_id: str,
+    patient: Patient,
+    kind: str,
+    stated_duration: int | None,
+    previous: dict,
+) -> tuple[dict, bool]:
+    """新しい予約で選ばれた保険診療／自費診療／相談したい を、メニューと施術時間にする（正解 C10・C11）。
+
+    返すのは（箱に入れる値, 施術時間がまだ分からないか）。
+    - 相談したい：メニューは空のまま。施術時間は 本人が言った → いつもの → 前回（C7）。色は相談の水色
+    - 保険診療・自費診療：いつもの・前回のメニューが同じ側なら、そのメニューと分数。
+      違えば 自費＝マッスルセラピー（分数は本人が言ったもの・無ければ聞く＝C8）、
+      保険＝15分なら保険診療・それより長ければ保険延長（分数が無ければ聞いてから決める）
+    """
+    said = stated_duration or previous.get("stated_duration_minutes")
+    values: dict = {"menu_kind": kind, "menu_explicit": True, "assumed_menu": False}
+    preset = await _get_patient_default_preset(db, patient)
+    latest = await _get_latest_reservation_for_line_user(db, user_id)
+    if kind == "consult":
+        minutes = said or (preset or {}).get("duration_minutes") or (latest or {}).get("duration_minutes")
+        values["duration_minutes"] = minutes
+        return values, not minutes and bool(preset or latest)
+
+    if not (said and kind == "insurance"):
+        # いつもの・前回のメニューが同じ側なら、それで進める（保険診療は分数で分けるので、分数を言われたらそちら）
+        for source, minutes in (
+            (preset, getattr(patient, "default_duration", None) if preset else None),
+            (latest, (latest or {}).get("duration_minutes")),
+        ):
+            if not source or not source.get("menu_id"):
+                continue
+            menu = await db.get(Menu, int(source["menu_id"]))
+            if menu is None or not menu.is_active or await _menu_side(db, menu) != kind:
+                continue
+            if not menu.is_duration_variable:
+                minutes = menu.duration_minutes
+            minutes = said or minutes
+            values.update({"menu_id": menu.id, "menu_name": menu.name, "duration_minutes": minutes})
+            return values, not minutes
+
+    if kind == "insurance" and not said:
+        # 保険診療か保険延長かは分数で決める。まず何分かを聞く（メニューは空のまま）
+        return values, True
+    menu = await _menu_for_kind_and_minutes(db, kind, int(said or 0))
+    if menu is None:
+        return values, not said
+    minutes = said if menu.is_duration_variable else menu.duration_minutes
+    values.update({"menu_id": menu.id, "menu_name": menu.name, "duration_minutes": minutes})
+    return values, not minutes
 
 
 async def _usual_minutes_for_menu(
@@ -3434,10 +4030,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     # キャンセルの依頼は「会話をやめる」の判定に回さない。変更の途中の「キャンセルだけよろしく」が
     # 会話の中止として扱われると、予約は消えずに会話だけ終わる（正解 G1）。
+    # ボタンの答えも回さない。答えの意味はボタンが決めている（正解 H3・B2：AIに会話の進め方を決めさせない）。
     if (
         is_autopilot_patient
         and (user_state or {}).get("mode") in _AUTOPILOT_BOOKING_MODES
         and not _CANCEL_WORDS.search(text or "")
+        and not _BUTTON_ANSWER.get()
     ):
         control = await classify_conversation_control(text, "booking")
         action = control.get("action")
@@ -3563,6 +4161,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     prev_draft = user_state.get("draft") or {}
     current_mode = user_state.get("mode")
+    # 押されたメニューのボタン（保険診療／自費診療／相談したい・正解 C9）
+    button_menu_kind = (_BUTTON_ANSWER.get() or {}).get("menu_kind")
     latest_reservation = await _get_latest_reservation_for_line_user(db, user_id)
     merged: dict | None = None
     parsed_intent: dict | None = None
@@ -3708,9 +4308,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 "adjusting",
                 "autopilot_booking_confirm",
             }
-            and parsed_intent.get("intent") not in {"cancel", "change", "question"}
-            and not _has_cancellation_intent(text)
-            and not _has_change_intent(text)
+            and (
+                # メニューのボタン（保険診療／自費診療／相談したい）は、AIの読み取りに関係なく箱へ入れる
+                button_menu_kind
+                or (
+                    parsed_intent.get("intent") not in {"cancel", "change", "question"}
+                    and not _has_cancellation_intent(text)
+                    and not _has_change_intent(text)
+                )
+            )
         ):
             merged = await _merge_autopilot_slots(
                 db,
@@ -3719,6 +4325,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 patient=line_patient,
                 previous=prev_draft,
                 parsed=parsed_intent,
+                menu_kind=button_menu_kind,
             )
 
         # 候補提示中に担当を名指しされたら、それも条件変更として扱って探し直す。
@@ -3838,6 +4445,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     patient_id=line_patient.id,
                     practitioner_id=int(request_data["practitioner_id"]),
                     menu_id=request_data.get("menu_id"),
+                    color_id=await _autopilot_color_id(db, user_id, prev_draft, request_data.get("menu_id")),
                     start_time=start_dt,
                     end_time=end_dt,
                     channel="LINE",
@@ -4003,6 +4611,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     patient_id=line_patient.id,
                     practitioner_id=int(picked["practitioner_id"]),
                     menu_id=prev_draft.get("menu_id"),
+                    color_id=await _autopilot_color_id(db, user_id, prev_draft, prev_draft.get("menu_id")),
                     start_time=start_dt,
                     end_time=end_dt,
                     channel="LINE",
@@ -4443,6 +5052,37 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         if parsed.get("practitioner") or re.search(r"先生|担当", text or ""):
             requested_practitioner = await _extract_requested_practitioner(db, text, parsed)
         preferred_id = requested_practitioner.id if requested_practitioner else None
+        # 本人が言った施術時間（正解 F6）。言っていなければ今の予約の長さのまま
+        stated_minutes = _stated_change_minutes(text, parsed)
+        change_minutes, menu_change = (
+            await _resolve_change_minutes(db, reservation, stated_minutes) if stated_minutes else (None, None)
+        )
+        if not parsed.get("date") and not parsed.get("time"):
+            current_start = reservation.start_time.astimezone(JST)
+            if change_minutes or (requested_practitioner and requested_practitioner.id != reservation.practitioner_id):
+                # 施術時間だけ・担当だけの変更。開始はそのまま（正解 F6・F7）
+                await _complete_autopilot_reschedule(
+                    db,
+                    reservation=reservation,
+                    desired_date=current_start.date().isoformat(),
+                    desired_time=current_start.strftime("%H:%M"),
+                    user_id=user_id,
+                    reply_token=reply_token,
+                    patient_message=text,
+                    preferred_practitioner_id=preferred_id,
+                    duration_minutes=change_minutes,
+                    menu_change=menu_change,
+                )
+                return
+            asked = prev_draft.get(_CHANGE_ASKED_KEY)
+            if asked == "duration":
+                if reply_token:
+                    await reply_to_line(reply_token, await _polished_from_plan(_change_duration_question_plan()))
+                return
+            if asked in {"what", "menu", "practitioner"}:
+                # 読めなかった。どこを変えるかを聞き直す（予約はそのまま）
+                await _ask_change_item(db, user_id=user_id, reply_token=reply_token, reservation=reservation)
+                return
         if parsed.get("date") and not parsed.get("time"):
             target_date = _parse_iso_date(parsed["date"])
             if target_date and await _offer_change_day(
@@ -4453,6 +5093,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 reply_token=reply_token,
                 patient_message=text,
                 preferred_practitioner_id=preferred_id,
+                duration_minutes=change_minutes,
+                menu_change=menu_change,
             ):
                 return
         if parsed.get("time") and not parsed.get("date"):
@@ -4481,6 +5123,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             reply_token=reply_token,
             patient_message=text,
             preferred_practitioner_id=preferred_id,
+            duration_minutes=change_minutes,
+            menu_change=menu_change,
         )
         return
 
@@ -4491,6 +5135,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         practitioner_id = prev_draft.get("autopilot_change_practitioner_id")
         change_start = _parse_iso_datetime(start_time_iso)
         change_end = _parse_iso_datetime(end_time_iso)
+        # 今の予約と同じ内容だと伝えて「このままでよろしいですか」と聞いている（正解 F8）
+        keeping = bool(prev_draft.get("autopilot_change_same"))
+        target = await db.get(Reservation, int(reservation_id)) if reservation_id else None
         answer = confirmation.read_answer(
             text,
             parsed_intent,
@@ -4501,6 +5148,14 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             ),
         )
         if answer == confirmation.NO:
+            if target is not None and target.status not in {"CANCELLED", "REJECTED", "EXPIRED"}:
+                # 予約はそのままにして、どこを変えるかを聞く（正解 F7・F8）。
+                # 以前は会話の記録ごと消して日時を聞き直しており、ボタンの「いいえ」は
+                # AIに「やめる」と読まれて手続きごと終わっていた（2026-10-07 実機）
+                await _ask_change_item(
+                    db, user_id=user_id, reply_token=reply_token, reservation=target, lead="承知いたしました。"
+                )
+                return
             await clear_user_draft(db, user_id)
             await set_user_mode(db, user_id, "autopilot_change_datetime")
             if reply_token:
@@ -4508,6 +5163,31 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     reply_token,
                     await _compose_autopilot_reply("change_aborted", {"patient_message": text}, parsed_intent),
                 )
+            return
+        if keeping:
+            if answer == confirmation.YES:
+                # 何も変えない。予約に手を付けない（備考も足さない）
+                await clear_user_draft(db, user_id)
+                await set_user_mode(db, user_id, "idle")
+                if reply_token:
+                    await reply_to_line(
+                        reply_token,
+                        await _polished_from_plan(
+                            ReplyPlan(facts=["承知いたしました。ご予約はこのままで承っております。"], keep=["このまま"])
+                        ),
+                    )
+                return
+            await _reask_confirmation(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                form="change",
+                plan=None,
+                message="恐れ入ります、今のご予約のままでよろしいでしょうか。",
+            )
             return
         if answer != confirmation.YES or not all([reservation_id, start_time_iso, end_time_iso, practitioner_id]):
             # 既存の予約を動かす場面。読めない返事で実行しない。
@@ -4524,6 +5204,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         start_dt=change_start,
                         end_dt=change_end,
                         practitioner_name=prev_draft.get("autopilot_change_practitioner_name"),
+                        menu_name=prev_draft.get("autopilot_change_menu_name"),
                         purpose="ご変更",
                     )
                     if change_start and change_end
@@ -4556,10 +5237,20 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     notification=f"LINE予約変更の枠が選択と一致せず中止（{mismatch}）: {line_patient.id}",
                 )
                 return
+        menu_change = await _pending_menu_change(db, prev_draft)
         try:
             start_dt = datetime.fromisoformat(start_time_iso)
             end_dt = datetime.fromisoformat(end_time_iso)
-            await reschedule_reservation(db, int(reservation_id), start_dt, end_dt, int(practitioner_id))
+            # 時刻・担当が変わるときだけ動かす（メニューだけの変更で「予約変更」の記録を足さない）
+            time_changed = target is None or not (
+                start_dt == target.start_time
+                and end_dt == target.end_time
+                and int(practitioner_id) == target.practitioner_id
+            )
+            if time_changed:
+                await reschedule_reservation(db, int(reservation_id), start_dt, end_dt, int(practitioner_id))
+            if menu_change:
+                await _apply_confirmed_menu_change(db, int(reservation_id), menu_change)
         except (HTTPException, ValueError):
             await set_user_mode(db, user_id, "autopilot_change_datetime")
             if reply_token:
@@ -4581,19 +5272,18 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         )
         await set_user_mode(db, user_id, "idle")
         if reply_token:
+            done = {
+                "date": start_dt.strftime("%Y/%m/%d"),
+                "start": start_dt.strftime("%H:%M"),
+                "end": end_dt.strftime("%H:%M"),
+                "practitioner": prev_draft.get("autopilot_change_practitioner_name"),
+                "patient_message": text,
+            }
+            if menu_change:
+                done["menu"] = menu_change["menu"].name if menu_change.get("menu") else _CONSULT_MENU_LABEL
             await reply_to_line(
                 reply_token,
-                await _compose_autopilot_reply(
-                    "change_done",
-                    {
-                        "date": start_dt.strftime("%Y/%m/%d"),
-                        "start": start_dt.strftime("%H:%M"),
-                        "end": end_dt.strftime("%H:%M"),
-                        "practitioner": prev_draft.get("autopilot_change_practitioner_name"),
-                        "patient_message": text,
-                    },
-                    parsed_intent,
-                ),
+                await _compose_autopilot_reply("change_done", done, parsed_intent),
             )
         return
 
@@ -4649,7 +5339,10 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         elif usual_answer == confirmation.NO or text.strip() == "別のメニュー":
             await set_user_mode(db, user_id, "waiting_menu")
             if reply_token:
-                quick_items = await _build_menu_quick_reply_items(db, line_user_id=user_id, patient=line_patient)
+                # いつもの は断られたので出さない。保険診療／自費診療／相談したい（正解 C9）
+                quick_items = await _build_menu_quick_reply_items(
+                    db, line_user_id=user_id, patient=line_patient, include_usual=False
+                )
                 await reply_text_with_quick_reply(
                     reply_token,
                     await _compose_autopilot_reply("ask_menu", {"patient_message": text}, parsed_intent),
@@ -4797,6 +5490,44 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             return
         parsed_change = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
         desired_date, desired_time = parsed_change.get("date"), parsed_change.get("time")
+        # 前の変更の途中の中身を持ち越さない
+        await merge_user_draft(
+            db,
+            user_id,
+            {"autopilot_change_reservation_id": reservation.id},
+            drop=(_CHANGE_ASKED_KEY, *_CHANGE_PENDING_KEYS),
+        )
+        # 本人が言った施術時間（正解 F6）。「30分にしてほしい」は日時を聞き返さずに、開始はそのままで変える
+        stated_minutes = _stated_change_minutes(text, parsed_change)
+        change_minutes, menu_change = (
+            await _resolve_change_minutes(db, reservation, stated_minutes) if stated_minutes else (None, None)
+        )
+        requested_practitioner = None
+        if parsed_change.get("practitioner") or re.search(r"先生|担当", text or ""):
+            requested_practitioner = await _extract_requested_practitioner(db, text, parsed_change)
+        preferred_id = requested_practitioner.id if requested_practitioner else None
+        if desired_time and not desired_date:
+            # 日付を言っていなければ、今の予約の日のこと（正解 E4）
+            desired_date = reservation.start_time.astimezone(JST).date().isoformat()
+        if not desired_date and not desired_time:
+            if change_minutes or (requested_practitioner and requested_practitioner.id != reservation.practitioner_id):
+                current_start = reservation.start_time.astimezone(JST)
+                await _complete_autopilot_reschedule(
+                    db,
+                    reservation=reservation,
+                    desired_date=current_start.date().isoformat(),
+                    desired_time=current_start.strftime("%H:%M"),
+                    user_id=user_id,
+                    reply_token=reply_token,
+                    patient_message=text,
+                    preferred_practitioner_id=preferred_id,
+                    duration_minutes=change_minutes,
+                    menu_change=menu_change,
+                )
+                return
+            # 何を変えるか言っていない（「予約変更して」）。どこを変えるかをボタンで聞く（正解 F7）
+            await _ask_change_item(db, user_id=user_id, reply_token=reply_token, reservation=reservation)
+            return
         if desired_date and not desired_time:
             target_date = _parse_iso_date(desired_date)
             if target_date and await _offer_change_day(
@@ -4806,10 +5537,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 user_id=user_id,
                 reply_token=reply_token,
                 patient_message=text,
+                preferred_practitioner_id=preferred_id,
+                duration_minutes=change_minutes,
+                menu_change=menu_change,
             ):
                 return
-        if not desired_date or not desired_time:
-            await merge_user_draft(db, user_id, {"autopilot_change_reservation_id": reservation.id})
             await set_user_mode(db, user_id, "autopilot_change_datetime")
             if reply_token:
                 await reply_to_line(
@@ -4829,6 +5561,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             user_id=user_id,
             reply_token=reply_token,
             patient_message=text,
+            preferred_practitioner_id=preferred_id,
+            duration_minutes=change_minutes,
+            menu_change=menu_change,
         )
         return
 
@@ -5181,7 +5916,14 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             # 施術時間も分からないときだけ、何分のご希望かを文字で聞く（ボタンにしない＝正解 D7）
             await set_user_mode(db, user_id, "waiting_time_duration", user_state.get("request_id"))
             if reply_token:
-                await reply_to_line(reply_token, await _polished_from_plan(_duration_question_plan()))
+                # 保険診療／相談したい を選んだ人には、メニュー名を聞き返さない（選んだばかり）
+                kind = merged.get("menu_kind")
+                plan = (
+                    _change_duration_question_plan() if kind == "consult"
+                    else _duration_question_plan(_MENU_KIND_LABELS[kind]) if kind in _MENU_KIND_LABELS
+                    else _duration_question_plan()
+                )
+                await reply_to_line(reply_token, await _polished_from_plan(plan))
             return
         preset = await _get_patient_default_preset(db, line_patient) if is_autopilot_patient else None
         if preset:
@@ -5604,6 +6346,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                             patient_id=line_patient.id,
                             practitioner_id=practitioner.id,
                             menu_id=menu.id if menu else None,
+                            color_id=await _autopilot_color_id(db, user_id, merged, menu.id if menu else None),
                             start_time=start_dt,
                             end_time=end_dt,
                             channel="LINE",
@@ -5818,15 +6561,19 @@ async def _handle_confirmation_postback(
             )
         return
 
-    # 判定済みの答えを、既存の確認処理へそのまま渡す。
-    await _handle_text_message(
-        {
-            **event,
-            "type": "message",
-            "message": {"type": "text", "text": "はい" if answer == "yes" else "いいえ"},
-        },
-        db,
-    )
+    # 判定済みの答えを、既存の確認処理へそのまま渡す。ボタンの答えなので、AIの「やめるか」の判定には回さない（正解 H3）
+    token = _BUTTON_ANSWER.set({"form": form, "answer": answer})
+    try:
+        await _handle_text_message(
+            {
+                **event,
+                "type": "message",
+                "message": {"type": "text", "text": "はい" if answer == "yes" else "いいえ"},
+            },
+            db,
+        )
+    finally:
+        _BUTTON_ANSWER.reset(token)
 
 
 async def _handle_cancel_selection(
@@ -5892,6 +6639,140 @@ async def _handle_change_selection(
     )
 
 
+async def _change_postback_target(
+    db: AsyncSession,
+    actor_user_id: str | None,
+    reply_token: str | None,
+) -> Reservation | None:
+    """変更のボタンが押された予約。変更の途中でなければ（古いボタン）何もしない。持ち主を必ず照合する。"""
+    if not actor_user_id:
+        return None
+    patient = await _find_line_patient(db, actor_user_id)
+    if not patient or not patient.line_autopilot_enabled:
+        return None
+    state = await get_user_state(db, actor_user_id)
+    reservation_id = (state.get("draft") or {}).get("autopilot_change_reservation_id")
+    reservation = None
+    if state.get("mode") == "autopilot_change_datetime" and reservation_id:
+        reservation = await _find_owned_cancellable_reservation(db, patient.id, int(reservation_id))
+    if reservation is None and reply_token:
+        await reply_to_line(reply_token, "恐れ入ります、そちらのご案内はすでに終了しています。改めてご用件をお知らせください。")
+    return reservation
+
+
+async def _handle_change_item_postback(
+    db: AsyncSession,
+    query: dict,
+    reply_token: str | None,
+    actor_user_id: str | None,
+) -> None:
+    """どこを変えるか（日時・施術時間・メニュー・施術者）のボタン（正解 F7）。"""
+    item = (query.get("item") or [""])[0]
+    if item not in {key for key, _label in _CHANGE_ITEMS}:
+        return
+    reservation = await _change_postback_target(db, actor_user_id, reply_token)
+    if reservation is None:
+        return
+    if item == "practitioner":
+        await _offer_practitioner_choice(db, user_id=actor_user_id, reply_token=reply_token, reservation=reservation)
+        return
+    await merge_user_draft(db, actor_user_id, {_CHANGE_ASKED_KEY: item}, drop=_CHANGE_PENDING_KEYS)
+    if not reply_token:
+        return
+    if item == "menu":
+        plan = ReplyPlan(ask="ご希望のメニューをお選びください。", ask_about="メニュー", keep=["メニュー"])
+        autopilot_log.note("plan", form="change_menu", plan=plan)
+        await reply_text_with_quick_reply(
+            reply_token, await _polished_from_plan(plan), _menu_kind_quick_reply_items("change_menu")
+        )
+        return
+    # 日時・施術時間は文字で受ける（正解 D7）
+    plan = _change_duration_question_plan() if item == "duration" else _change_datetime_question_plan()
+    await reply_to_line(reply_token, await _polished_from_plan(plan))
+
+
+async def _handle_change_practitioner_postback(
+    db: AsyncSession,
+    query: dict,
+    reply_token: str | None,
+    actor_user_id: str | None,
+) -> None:
+    """担当の変更で選ばれた施術者。同じ時刻で探し、空いていなければ近い枠を候補にする。"""
+    try:
+        practitioner_id = int((query.get("id") or [""])[0])
+    except (TypeError, ValueError):
+        return
+    reservation = await _change_postback_target(db, actor_user_id, reply_token)
+    if reservation is None:
+        return
+    practitioner = await db.get(Practitioner, practitioner_id)
+    if practitioner is None or not (practitioner.is_active and practitioner.is_visible):
+        await _offer_practitioner_choice(db, user_id=actor_user_id, reply_token=reply_token, reservation=reservation)
+        return
+    start = reservation.start_time.astimezone(JST)
+    await _complete_autopilot_reschedule(
+        db,
+        reservation=reservation,
+        desired_date=start.date().isoformat(),
+        desired_time=start.strftime("%H:%M"),
+        user_id=actor_user_id,
+        reply_token=reply_token,
+        preferred_practitioner_id=practitioner.id,
+    )
+
+
+async def _handle_change_menu_postback(
+    db: AsyncSession,
+    query: dict,
+    reply_token: str | None,
+    actor_user_id: str | None,
+) -> None:
+    """メニューの変更で選ばれた保険診療／自費診療／相談したい（正解 F7・C10・C11）。"""
+    kind = (query.get("kind") or [""])[0]
+    if kind not in _MENU_KIND_LABELS:
+        return
+    reservation = await _change_postback_target(db, actor_user_id, reply_token)
+    if reservation is None:
+        return
+    await _offer_menu_change(db, user_id=actor_user_id, reply_token=reply_token, reservation=reservation, kind=kind)
+
+
+async def _handle_menu_kind_postback(
+    db: AsyncSession,
+    event: dict,
+    query: dict,
+    reply_token: str | None,
+    actor_user_id: str | None,
+) -> None:
+    """新しい予約で選ばれた保険診療／自費診療／相談したい（正解 C9〜C11）。
+
+    ボタンの答えとして新しい予約の処理へ渡す（「保険診療」の文字を院のメニュー名として読まない）。
+    """
+    kind = (query.get("kind") or [""])[0]
+    if kind not in _MENU_KIND_LABELS or not actor_user_id:
+        return
+    patient = await _find_line_patient(db, actor_user_id)
+    if not patient or not patient.line_autopilot_enabled:
+        return
+    mode = await get_user_mode(db, actor_user_id)
+    finished = mode in _CHANGE_MODES or (mode in _CONFIRM_FORM_MODES.values() and mode != "autopilot_confirm_usual")
+    if finished:
+        if reply_token:
+            await reply_to_line(reply_token, "恐れ入ります、そちらのご案内はすでに終了しています。改めてご用件をお知らせください。")
+        return
+    if mode == "autopilot_confirm_usual":
+        # 「いつものでよろしいですか」の途中で別のメニューを選んだ＝いつものではない
+        await set_user_mode(db, actor_user_id, "waiting_menu")
+    token = _BUTTON_ANSWER.set({"menu_kind": kind})
+    try:
+        await _handle_text_message(
+            {**event, "type": "message", "message": {"type": "text", "text": _MENU_KIND_LABELS[kind]}},
+            db,
+        )
+    finally:
+        _BUTTON_ANSWER.reset(token)
+
+
 async def _notify_shadow_admin(text: str, reply_token: str | None, actor_user_id: str | None) -> None:
     """同じ本文を push と reply の両方で送ると、操作した管理者に2通届く。"""
     await push_message(settings.line_admin_user_id, text)
@@ -5925,6 +6806,22 @@ async def _handle_postback(event: dict, db: AsyncSession):
 
     if action == "change_select":
         await _handle_change_selection(db, q, reply_token, actor_user_id)
+        return
+
+    if action == "change_item":
+        await _handle_change_item_postback(db, q, reply_token, actor_user_id)
+        return
+
+    if action == "change_practitioner":
+        await _handle_change_practitioner_postback(db, q, reply_token, actor_user_id)
+        return
+
+    if action == "change_menu":
+        await _handle_change_menu_postback(db, q, reply_token, actor_user_id)
+        return
+
+    if action == "menu_kind":
+        await _handle_menu_kind_postback(db, event, q, reply_token, actor_user_id)
         return
 
     req = await get_request(db, rid, line_user_id=line_user_id)
@@ -6261,6 +7158,8 @@ async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
     db_context = _AUTOPILOT_DB_CONTEXT.set(db)
     user_context = _AUTOPILOT_USER_CONTEXT.set((event.get("source") or {}).get("userId"))
     clinic_context_token = _AUTOPILOT_CLINIC_CONTEXT.set({})
+    button_token = _BUTTON_ANSWER.set(None)
+    ack_token = _REPLY_ACK.set(None)
     try:
         # LINE自動予約の記録。autopilot の人と登録の途中の人の分だけ、1通ごとに1行残す
         async with autopilot_log.recording(
@@ -6274,6 +7173,8 @@ async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
             elif event.get("type") == "postback":
                 await _handle_postback(event, db)
     finally:
+        _REPLY_ACK.reset(ack_token)
+        _BUTTON_ANSWER.reset(button_token)
         _AUTOPILOT_CLINIC_CONTEXT.reset(clinic_context_token)
         _AUTOPILOT_USER_CONTEXT.reset(user_context)
         _AUTOPILOT_DB_CONTEXT.reset(db_context)

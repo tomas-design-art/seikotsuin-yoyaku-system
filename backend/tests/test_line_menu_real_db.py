@@ -130,22 +130,25 @@ async def test_choosing_a_menu_by_name_does_not_ask_about_the_usual_menu():
     assert state["draft"]["menu_name"] == menus["extension"]
 
 
-# ─── D7・D11：ボタンは候補と、はい／いいえだけ。メニューは「⭐️いつもの」だけ（まことさん 2026-10-07） ───
+# ─── D7・D11・C9：院のメニューはボタンで並べない。メニューのボタンは「⭐️いつもの」と保険／自費／相談だけ（まことさん 2026-10-07） ───
 
 
 @pytest.mark.asyncio
-async def test_the_menu_question_offers_only_the_usual_button():
-    """メニューを全部ボタンで並べない（ホットペッパー等も出てしまう・スクロールが要る）。「⭐️いつもの」だけ。"""
+async def test_the_menu_question_does_not_list_the_clinic_menus():
+    """メニューを全部ボタンで並べない（ホットペッパー等も出てしまう・スクロールが要る＝D7）。
+    ボタンは「⭐️いつもの」と、保険診療／自費診療／相談したい の大きな分け方だけ（C9・まことさん 2026-10-07 に
+    「⭐️いつもの」だけから変更。ボタンの「保険診療」は院のメニューの保険診療（15分固定）とは別の、保険の側を選ぶボタン）。"""
     async with clinic() as (sessions, ids):
         uid, patient_id = await _patient(sessions)
         menus = await _menus_and_usual(sessions, ids, patient_id)
 
         sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
 
-    buttons = _buttons(sent)
-    assert len(buttons) == 1
-    assert "いつもの" in buttons[0]["label"]
-    assert not any(menus["extension"] in (button.get("label") or "") for button in buttons)
+    labels = [button.get("label") or "" for button in _buttons(sent)]
+    assert len(labels) == 4 and "いつもの" in labels[0]
+    assert labels[1:] == ["保険診療", "自費診療", "相談したい"]
+    assert not any(menus["extension"] in label for label in labels)
+    assert not any(label.startswith("見本メニュー") for label in labels)
 
 
 @pytest.mark.asyncio

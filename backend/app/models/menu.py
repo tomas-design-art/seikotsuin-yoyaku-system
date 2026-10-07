@@ -4,6 +4,10 @@ from sqlalchemy.sql import func
 
 from app.database import Base
 
+# ホームページからの新規予約に入れるメニュー。この色が「ホームページ予約／新規」（フレッシュグリーン）。
+# LINE自動予約の初回の人も、この色で入れる（正解 C12・まことさん 2026-10-07）。
+HOMEPAGE_MENU_NAME = "ホームページ"
+
 
 class Menu(Base):
     __tablename__ = "menus"
