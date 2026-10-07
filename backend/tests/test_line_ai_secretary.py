@@ -4769,6 +4769,8 @@ def test_every_confirmation_situation_has_a_button_form():
         "autopilot_change_confirm",
         # 「1日」を「◯/1(◯)のことでしょうか？」と確かめる場面（正解 E2・2026-10-07）
         "autopilot_date_confirm",
+        # 前回がホットペッパーの人に「前回と同じ施術時間（○○分）でよろしいでしょうか」と確かめる場面（正解 C15・2026-10-07）
+        "autopilot_confirm_previous",
     }
     # 確認の場面はコードが質問を握る側にも入っていること
     assert "confirm_slot" in _CODE_OWNED_QUESTION_SITUATIONS

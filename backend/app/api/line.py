@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agents.line_parser import classify_conversation_control, extract_full_name, parse_line_message
 from app.config import settings
 from app.database import async_session, get_db
-from app.models.menu import CHANNEL_MENU_NAMES, HOMEPAGE_MENU_NAME, Menu, is_channel_menu_name
+from app.models.menu import CHANNEL_MENU_NAMES, HOMEPAGE_MENU_NAME, HOTPEPPER_MENU_NAME, Menu, is_channel_menu_name
 from app.models.patient import Patient
 from app.models.practitioner import Practitioner
 from app.models.reservation import Reservation
@@ -270,6 +270,7 @@ _AUTOPILOT_BOOKING_MODES = {
     "autopilot_change_datetime",
     "autopilot_change_confirm",
     "autopilot_date_confirm",
+    "autopilot_confirm_previous",
 }
 # 変更の途中の場面。ここでキャンセルと言われたら、動かそうとしている予約のキャンセルとして受ける。
 _CHANGE_MODES = {"autopilot_change_select", "autopilot_change_datetime", "autopilot_change_confirm"}
@@ -283,6 +284,7 @@ _NEW_BOOKING_MODES = {
     "autopilot_slot_confirm",
     "adjusting",
     "autopilot_date_confirm",
+    "autopilot_confirm_previous",
 }
 _CANCEL_MODES = {"autopilot_cancel_select", "autopilot_cancel_confirm"}
 # 押して選ぶボタンは3つまで（正解 D11・まことさん 2026-10-07）。
@@ -523,12 +525,24 @@ async def _get_latest_reservation_for_line_user(db: AsyncSession, line_user_id: 
     }
 
 
-def _without_channel_menu(latest: dict | None) -> dict | None:
-    """前回の予約のメニューが予約の入り口のメニュー（ホットペッパー等）なら、メニューは引き継がずに
-    施術時間だけ使う（正解 C14・C7 の「前回」）。メニューの無い前回の予約と同じ形にする。"""
-    if latest and is_channel_menu_name(latest.get("menu_name")):
-        return {**latest, "menu_id": None, "menu_name": "前回メニュー"}
-    return latest
+# 前回がホットペッパーからの予約で、施術時間をまだ本人に確かめていない（値はその分数・正解 C15）
+_PREVIOUS_MINUTES_KEY = "previous_minutes_unconfirmed"
+
+
+async def _previous_visit_for_booking(db: AsyncSession, latest: dict | None) -> dict | None:
+    """前回の予約を、新しい予約の補いに使う形にする。
+
+    - 予約の入り口のメニュー（ホットペッパー・ホームページ）は引き継がない（正解 C14）
+    - 前回がホットペッパーからの予約なら自費診療（マッスルセラピー）で受け、施術時間は決めつけずに
+      確かめる印を付ける（正解 C15・まことさん 2026-10-07：院が いつもの を決めるまでは）
+    """
+    if not latest or not is_channel_menu_name(latest.get("menu_name")):
+        return latest
+    if latest.get("menu_name") == HOTPEPPER_MENU_NAME:
+        self_pay = await _configured_menu(db, "self")
+        menu = {"menu_id": self_pay.id, "menu_name": self_pay.name} if self_pay else {"menu_id": None, "menu_name": "前回メニュー"}
+        return {**latest, **menu, "minutes_unconfirmed": True}
+    return {**latest, "menu_id": None, "menu_name": "前回メニュー"}
 
 
 async def _get_patient_default_preset(db: AsyncSession, patient: Patient | None) -> dict | None:
@@ -604,14 +618,17 @@ async def _resolve_booking_defaults(
         return defaults
 
     # ② 来院実績があれば前回の内容を引き継ぐ。担当は勝手に決めない。
-    latest = _without_channel_menu(await _get_latest_reservation_for_line_user(db, user_id))
+    latest = await _previous_visit_for_booking(db, await _get_latest_reservation_for_line_user(db, user_id))
     if latest:
-        return {
+        defaults = {
             "menu_id": latest.get("menu_id"),
             "menu_name": latest["menu_name"],
             "duration_minutes": latest["duration_minutes"],
             "assumed_menu": latest["menu_name"],
         }
+        if latest.get("minutes_unconfirmed"):
+            defaults[_PREVIOUS_MINUTES_KEY] = latest["duration_minutes"]
+        return defaults
 
     # ③ 来院実績が無い＝LINE連携時に予約システムで照合できなかった新規の人。
     #    HP経由の新規獲得と同じ扱い（60分・院長優先）はこの人だけに適用する。
@@ -951,6 +968,7 @@ _CONFIRM_FORM_MODES = {
     "cancel": "autopilot_cancel_confirm",
     "change": "autopilot_change_confirm",
     "date": "autopilot_date_confirm",
+    "previous": "autopilot_confirm_previous",
 }
 
 
@@ -2294,6 +2312,15 @@ async def _ask_change_item(
         await reply_text_with_quick_reply(reply_token, await _polished_from_plan(plan), _change_item_quick_reply_items())
 
 
+def _previous_minutes_plan(minutes: int) -> ReplyPlan:
+    return ReplyPlan(
+        ask=f"前回と同じ施術時間（{minutes}分）でよろしいでしょうか？",
+        ask_about="施術時間",
+        yes_no=True,
+        keep=["前回と同じ施術時間", f"{minutes}分"],
+    )
+
+
 def _change_duration_question_plan() -> ReplyPlan:
     return ReplyPlan(ask="施術時間は何分をご希望ですか？", ask_about="施術時間", keep=["何分"])
 
@@ -2943,6 +2970,9 @@ async def _merge_autopilot_slots(
     duration_unknown = False
     # 前に入っていた値を捨てる箱
     drop: list[str] = []
+    if stated_duration:
+        # 本人が分数を言った。前回の分数を確かめる必要は無い（正解 C15）
+        drop.append(_PREVIOUS_MINUTES_KEY)
     # 患者が日付を口にしていないなら、話していた日を動かさない。
     # 解析側が時刻だけの返事に今日の日付を補うことがあり、そのまま採ると
     # 8/31の話をしていたのに今日で確定してしまう（実機で発生）。
@@ -2973,6 +3003,8 @@ async def _merge_autopilot_slots(
         update.update(kind_values)
         if not kind_values.get("menu_id"):
             drop += ["menu_id", "menu_name"]
+        if _PREVIOUS_MINUTES_KEY not in kind_values:
+            drop.append(_PREVIOUS_MINUTES_KEY)
     elif wants_usual:
         # 「いつもの」は空いている箱を埋めるだけ。患者が述べた値は上書きしない。
         # 以前は preset で必ず上書きしていたため、「マッスルセラピーを60分お願いします」の
@@ -2986,7 +3018,7 @@ async def _merge_autopilot_slots(
 
         # 本人が「いつもの」を選んだ。改めて「いつものでよろしいですか」とは聞かない（正解 C2）
         update["usual_confirmed"] = True
-        drop.append("menu_kind")
+        drop += ["menu_kind", _PREVIOUS_MINUTES_KEY]
         preset = await _get_patient_default_preset(db, patient)
         if preset:
             _fill_gaps(
@@ -2999,7 +3031,7 @@ async def _merge_autopilot_slots(
                 }
             )
         else:
-            latest = _without_channel_menu(await _get_latest_reservation_for_line_user(db, user_id))
+            latest = await _previous_visit_for_booking(db, await _get_latest_reservation_for_line_user(db, user_id))
             if latest:
                 _fill_gaps(
                     {
@@ -3039,7 +3071,7 @@ async def _merge_autopilot_slots(
                 }
             )
             # 院のメニュー名を言われたら、ボタンの保険／自費／相談より本人の言葉を優先する
-            drop.append("menu_kind")
+            drop += ["menu_kind", _PREVIOUS_MINUTES_KEY]
 
     # 本人が担当を明言していれば、登録上の既定より本人の希望を優先する。
     # 名前が出ていないメッセージで施術者一覧を引かない（毎回の問い合わせを避ける）。
@@ -3067,7 +3099,11 @@ async def _merge_autopilot_slots(
     kind_chosen = bool(preview.get("menu_kind"))
     if not (preview.get("menu_name") and preview.get("duration_minutes") and preview.get("practitioner_id")):
         defaults = await _resolve_booking_defaults(db, user_id=user_id, patient=patient)
+        # 施術時間を登録情報（前回）から補うときだけ、前回の分数を確かめる印を付ける
+        minutes_from_defaults = preview.get("duration_minutes") in (None, "") and update.get("duration_minutes") in (None, "")
         for key, value in defaults.items():
+            if key == _PREVIOUS_MINUTES_KEY and not minutes_from_defaults:
+                continue
             # 「いつもの」・前回の分数は、別のメニューのものなので使わない。初回の60分は使う（正解 C8）
             if duration_unknown and key in ("duration_minutes", "assumed_duration") and not defaults.get("first_visit"):
                 continue
@@ -3112,10 +3148,12 @@ async def _booking_menu_for_kind(
     said = stated_duration or previous.get("stated_duration_minutes")
     values: dict = {"menu_kind": kind, "menu_explicit": True, "assumed_menu": False}
     preset = await _get_patient_default_preset(db, patient)
-    latest = await _get_latest_reservation_for_line_user(db, user_id)
+    latest = await _previous_visit_for_booking(db, await _get_latest_reservation_for_line_user(db, user_id))
     if kind == "consult":
         minutes = said or (preset or {}).get("duration_minutes") or (latest or {}).get("duration_minutes")
         values["duration_minutes"] = minutes
+        if not said and not preset and (latest or {}).get("minutes_unconfirmed") and minutes:
+            values[_PREVIOUS_MINUTES_KEY] = minutes
         return values, not minutes and bool(preset or latest)
 
     if not (said and kind == "insurance"):
@@ -3131,6 +3169,8 @@ async def _booking_menu_for_kind(
                 continue
             if not menu.is_duration_variable:
                 minutes = menu.duration_minutes
+            if not said and minutes and source is latest and latest.get("minutes_unconfirmed"):
+                values[_PREVIOUS_MINUTES_KEY] = minutes
             minutes = said or minutes
             values.update({"menu_id": menu.id, "menu_name": menu.name, "duration_minutes": minutes})
             return values, not minutes
@@ -5435,6 +5475,53 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
             return
 
+    if is_autopilot_patient and current_mode == "autopilot_confirm_previous":
+        minutes = prev_draft.get("duration_minutes")
+        said = _extract_duration_minutes(text) or (
+            (parsed_intent or {}).get("duration_minutes") if re.search(r"分|時間", text or "") else None
+        )
+        previous_answer = None if said else confirmation.read_answer(text, parsed_intent)
+        if said:
+            # 「30分で」のように分数で答えた＝その分数（本人が言った）
+            merged = await _merge_autopilot_slots(
+                db,
+                user_id=user_id,
+                text=text,
+                patient=line_patient,
+                previous=prev_draft,
+                parsed={**(parsed_intent or {}), "duration_minutes": said},
+            )
+            await set_user_mode(db, user_id, "idle")
+            parsed_intent = {**(parsed_intent or {}), "intent": "new"}
+        elif previous_answer == confirmation.YES:
+            merged = await merge_user_draft(
+                db,
+                user_id,
+                {_CONFIRM_UNCLEAR_KEY: 0, "stated_duration_minutes": minutes, "assumed_duration": False},
+                drop=(_PREVIOUS_MINUTES_KEY,),
+            )
+            await set_user_mode(db, user_id, "idle")
+            parsed_intent = {**(parsed_intent or {}), "intent": "new"}
+        elif previous_answer == confirmation.NO:
+            await merge_user_draft(db, user_id, {}, drop=(_PREVIOUS_MINUTES_KEY, "duration_minutes", "assumed_duration"))
+            await set_user_mode(db, user_id, "waiting_time_duration")
+            if reply_token:
+                await reply_to_line(reply_token, await _polished_from_plan(_change_duration_question_plan()))
+            return
+        else:
+            await _reask_confirmation(
+                db,
+                user_id=user_id,
+                reply_token=reply_token,
+                patient=line_patient,
+                text=text,
+                parsed_intent=parsed_intent,
+                form="previous",
+                plan=_previous_minutes_plan(int(minutes)) if minutes else None,
+                message="恐れ入ります、前回と同じ施術時間でよろしいでしょうか。",
+            )
+            return
+
     # 「時田先生お休みの日ある？」を担当者の指名と誤読して予約フローへ流さない。
     # 休み・出勤を尋ねているのに日時を述べていなければ、intentの判定に関わらず質問として扱う。
     asks_schedule = bool(ASKS_FOR_DAYS_OFF.search(text)) and not (parsed_intent or {}).get("time")
@@ -6059,6 +6146,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     ),
                 )
             return
+
+    # 前回がホットペッパーからの予約の人は、施術時間を決めつけずに確かめる（正解 C15・まことさん 2026-10-07）
+    if is_autopilot_patient and merged.get(_PREVIOUS_MINUTES_KEY) and merged.get("duration_minutes"):
+        await set_user_mode(db, user_id, "autopilot_confirm_previous", user_state.get("request_id"))
+        await _reply_plan(reply_token, "previous", _previous_minutes_plan(int(merged["duration_minutes"])))
+        return
 
     # 日付が確定したら、時刻が揃うのを待たずに休診日を見る。
     # 予約できない日に「何時がご希望ですか」と聞き返さないため（2026-09-08 実機）。
