@@ -757,3 +757,44 @@ async def reschedule_reservation(
     )
     reservation = result.scalar_one()
     return build_reservation_response(reservation)
+
+
+async def change_reservation_menu(
+    db: AsyncSession,
+    reservation_id: int,
+    menu_id: int | None,
+    color_id: int | None,
+    *,
+    label: str | None = None,
+) -> dict:
+    """予約のメニューと色だけを変える（LINE自動予約のメニューの変更）。時刻・担当は変えない。備考に記録を足す。"""
+    result = await db.execute(select(Reservation).where(Reservation.id == reservation_id))
+    reservation = result.scalar_one_or_none()
+    if not reservation:
+        raise HTTPException(status_code=404, detail="予約が見つかりません")
+    if reservation.status in TERMINAL_STATUSES:
+        raise HTTPException(status_code=400, detail="終了済みの予約は変更できません")
+
+    change_log = f"メニューを「{label or 'なし'}」に変更（{now_jst().strftime('%Y/%m/%d %H:%M')}）"
+    reservation.notes = f"{reservation.notes}\n{change_log}" if reservation.notes else change_log
+    reservation.menu_id = menu_id
+    reservation.color_id = color_id
+
+    await create_notification(
+        db, "reservation_changed",
+        f"予約変更: 予約#{reservation_id} メニュー → {label or 'なし'}",
+        reservation_id,
+    )
+
+    await db.commit()
+    result = await db.execute(
+        select(Reservation)
+        .where(Reservation.id == reservation_id)
+        .options(
+            selectinload(Reservation.patient),
+            selectinload(Reservation.practitioner),
+            selectinload(Reservation.menu),
+            selectinload(Reservation.color),
+        )
+    )
+    return build_reservation_response(result.scalar_one())

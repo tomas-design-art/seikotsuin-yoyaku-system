@@ -6,7 +6,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.models.menu import Menu
+from app.models.menu import HOMEPAGE_MENU_NAME, Menu
 from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
 from app.models.reservation import Reservation
@@ -21,7 +21,7 @@ from app.utils.datetime_jst import JST
 
 router = APIRouter(prefix="/api/public", tags=["public"])
 
-HOMEPAGE_DEFAULT_MENU_NAME = "ホームページ"
+HOMEPAGE_DEFAULT_MENU_NAME = HOMEPAGE_MENU_NAME
 DEFAULT_SLOT_INTERVAL_MIN = 30  # HP予約フォームは30分刻み
 
 

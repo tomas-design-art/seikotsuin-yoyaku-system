@@ -12,7 +12,7 @@ from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
-from app.models.menu import Menu
+from app.models.menu import HOTPEPPER_MENU_NAME as _HOTPEPPER_MENU_NAME, Menu
 from app.models.patient import Patient
 from app.models.practitioner import Practitioner
 from app.models.practitioner_unavailable_time import PractitionerUnavailableTime
@@ -37,7 +37,7 @@ MAX_PROCESSED_HASHES = 1000
 MAX_FAILED_TRACKED = 2000
 DEAD_LETTER_RETRY_LIMIT = 3
 HOTPEPPER_FIXED_COLOR_CODE = HOTPEPPER_COLOR_CODE
-HOTPEPPER_MENU_NAME = "ホットペッパー"
+HOTPEPPER_MENU_NAME = _HOTPEPPER_MENU_NAME
 
 
 @dataclass

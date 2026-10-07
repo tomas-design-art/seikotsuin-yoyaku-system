@@ -12,6 +12,11 @@ def is_hotpepper_color_code(code: str | None) -> bool:
     return (code or "").strip().lower() == HOTPEPPER_COLOR_CODE
 
 
+# LINE自動予約の「相談したい」（メニューは当日スタッフと決める）予約の色（水色・正解 C11・まことさん 2026-10-07）。
+# LINE の処理はこの色コードで色を探す。migration 032 が「相談（当日決定）」として足す。
+CONSULT_COLOR_CODE = "#38bdf8"
+
+
 class ReservationColor(Base):
     __tablename__ = "reservation_colors"
 

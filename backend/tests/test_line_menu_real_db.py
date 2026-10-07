@@ -6,21 +6,26 @@
 """
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from sqlalchemy import select
 
 from app.models.menu import Menu
 from app.models.patient import Patient
+from app.models.reservation import Reservation
 from app.services import clinic_context
 from tests.test_line_change_cancel_real_db import (
     TOKITA,
     YES,
+    _at,
     _buttons,
     _day,
     _patient,
     _state,
     clinic,
     send,
+    tap,
 )
 
 
@@ -126,22 +131,305 @@ async def test_choosing_a_menu_by_name_does_not_ask_about_the_usual_menu():
     assert state["draft"]["menu_name"] == menus["extension"]
 
 
-# ─── D7・D11：ボタンは候補と、はい／いいえだけ。メニューは「⭐️いつもの」だけ（まことさん 2026-10-07） ───
+# ─── C13：言い方が違うメニューの名前・「いつものでよろしいですか」の最中の別のメニュー（まことさん 2026-10-07） ───
+
+
+async def _paraphrased_menus(sessions) -> None:
+    async with sessions() as db:
+        db.add_all(
+            [
+                Menu(name="産ケア", duration_minutes=20, is_duration_variable=True, max_duration_minutes=40,
+                     is_active=True, display_order=20),
+                Menu(name="パーソナライズ", duration_minutes=30, is_duration_variable=True, max_duration_minutes=90,
+                     is_active=True, display_order=21),
+            ]
+        )
+        await db.commit()
+
+
+async def _asked_about_the_usual(sessions, ids) -> str:
+    """いつもの（見本マッスル60分・時田）がある人に「いつものメニューでよろしいでしょうか」と聞いている状態。"""
+    uid, patient_id = await _patient(sessions)
+    await _menus_and_usual(sessions, ids, patient_id)
+    await _paraphrased_menus(sessions)
+    await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+    assert (await _state(sessions, uid))["mode"] == "autopilot_confirm_usual"
+    return uid
 
 
 @pytest.mark.asyncio
-async def test_the_menu_question_offers_only_the_usual_button():
-    """メニューを全部ボタンで並べない（ホットペッパー等も出てしまう・スクロールが要る）。「⭐️いつもの」だけ。"""
+@pytest.mark.parametrize(
+    "text, parse, menu",
+    [
+        ("保険延長でお願いします", {}, "保険延長"),  # 本文に院のメニュー名
+        ("産後のケアして欲しいです", {"menu_name": "産ケア"}, "産ケア"),  # AIが院のメニュー一覧に当てはめた
+        ("パーソナルで", {"menu_name": "パーソナライズ"}, "パーソナライズ"),
+    ],
+)
+async def test_naming_another_menu_while_asked_about_the_usual_goes_with_that_menu(text, parse, menu):
+    """10/7 まで：「いつものでよろしいですか」の最中に別のメニューを文字で言うと、同じことを聞き直していた。"""
+    async with clinic() as (sessions, ids):
+        uid = await _asked_about_the_usual(sessions, ids)
+        await send(sessions, uid, text, {"intent": "new", **parse})
+        state = await _state(sessions, uid)
+
+    assert state["mode"] != "autopilot_confirm_usual", "聞き直している"
+    assert state["draft"]["menu_name"] == menu
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, parse",
+    [
+        ("うーん、どうしようかな", {"intent": "other", "menu_name": "見本マッスル"}),  # AIが前の会話のメニューを持ち越しただけ
+        ("骨盤もやってほしい", {"intent": "other", "menu_name": "骨盤矯正"}),  # 院のメニューに無い名前
+    ],
+)
+async def test_a_menu_the_patient_did_not_name_does_not_replace_the_usual(text, parse):
+    async with clinic() as (sessions, ids):
+        uid = await _asked_about_the_usual(sessions, ids)
+        await send(sessions, uid, text, parse)
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "autopilot_confirm_usual"
+    assert state["draft"]["menu_name"] == "見本マッスル"
+
+
+@pytest.mark.asyncio
+async def test_a_paraphrased_menu_name_in_a_new_booking_is_the_clinic_menu():
+    """いつもの を聞いていない場面でも、AIが院のメニューに当てはめた名前でそのメニュー（もとから動いていた）。"""
+    async with clinic() as (sessions, ids):
+        uid, _patient_id = await _patient(sessions)
+        await _paraphrased_menus(sessions)
+
+        await send(sessions, uid, "産後のケアをお願いしたいです",
+                   {"intent": "new", "date": _day().isoformat(), "menu_name": "産ケア"})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["menu_name"] == "産ケア"
+
+
+# ─── C14：予約の入り口のメニュー（ホームページ・ホットペッパー）は、LINE で患者さんが選べるメニューに入れない ───
+# まことさん 2026-10-07：「LINE からの自動予約とは全く関係がないので、そちらのメニューに行かないように」。
+# 予約システムのメニューとしては残す（消さない）。
+
+
+async def _channel_menus(sessions) -> dict:
+    async with sessions() as db:
+        hotpepper = Menu(name="ホットペッパー", duration_minutes=40, is_active=True, display_order=8)
+        homepage = Menu(name="ホームページ", duration_minutes=60, is_active=True, display_order=9)
+        extension = Menu(name="保険延長", duration_minutes=30, is_active=True, display_order=1)
+        muscle = Menu(name="マッスルセラピー", duration_minutes=10, is_duration_variable=True, max_duration_minutes=120,
+                      is_active=True, display_order=3)
+        db.add_all([hotpepper, homepage, extension, muscle])
+        await db.commit()
+        return {"hotpepper": hotpepper.id, "homepage": homepage.id, "muscle": muscle.id}
+
+
+CHANNEL_NAMES = {"ホットペッパー", "ホームページ"}
+
+
+@pytest.mark.asyncio
+async def test_the_menu_list_given_to_the_ai_leaves_out_the_channel_menus():
+    async with clinic() as (sessions, _ids):
+        await _channel_menus(sessions)
+        async with sessions() as db:
+            facts = await clinic_context.build_clinic_context(db, patient=None, preset=None)
+
+    names = {menu["name"] for menu in facts["menus"]}
+    assert "保険延長" in names
+    assert not names & CHANNEL_NAMES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, parse",
+    [
+        ("ホームページを見て予約したいです", {"menu_name": "ホームページ"}),  # AIが当てはめた
+        ("ホットペッパーで予約したこともあります。予約したいです", {}),  # 本文にメニュー名
+    ],
+)
+async def test_a_channel_menu_named_by_the_patient_or_the_ai_is_not_used(text, parse):
+    async with clinic() as (sessions, _ids):
+        uid, _patient_id = await _patient(sessions)
+        await _channel_menus(sessions)
+
+        await send(sessions, uid, text, {"intent": "new", "date": _day().isoformat(), **parse})
+        state = await _state(sessions, uid)
+
+    assert state["draft"].get("menu_name") not in CHANNEL_NAMES
+
+
+@pytest.mark.asyncio
+async def test_a_channel_menu_registered_as_the_usual_is_not_offered_as_the_usual():
+    """スタッフの「いつもの」がホットペッパーでも、LINE では いつもの として出さない・聞かない（本番に1名いる）。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _channel_menus(sessions)
+        await _reserve_past(sessions, patient_id, ids["tokita"], menus["hotpepper"], 40)
+        async with sessions() as db:
+            patient = (await db.execute(select(Patient).where(Patient.id == patient_id))).scalar_one()
+            patient.default_menu_id = menus["hotpepper"]
+            patient.default_duration = 40
+            await db.commit()
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+        labels = [button.get("label") or "" for button in _buttons(sent)]
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+        state = await _state(sessions, uid)
+
+    assert labels == ["保険診療", "自費診療", "相談したい"]
+    assert state["mode"] != "autopilot_confirm_usual"
+    assert state["draft"].get("menu_name") not in CHANNEL_NAMES
+
+
+# ─── C15：前回がホットペッパーからの予約 ＝ 自費診療（マッスルセラピー）・施術時間は決めつけずに確かめる（まことさん 2026-10-07） ───
+
+
+async def _previous_hotpepper_visit(sessions, ids) -> tuple[str, dict]:
+    uid, patient_id = await _patient(sessions)
+    menus = await _channel_menus(sessions)
+    await _reserve_past(sessions, patient_id, ids["tokita"], menus["hotpepper"], 40)
+    return uid, menus
+
+
+@pytest.mark.asyncio
+async def test_a_previous_hotpepper_visit_asks_whether_the_same_minutes_are_fine():
+    async with clinic() as (sessions, ids):
+        uid, menus = await _previous_hotpepper_visit(sessions, ids)
+
+        sent = await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+        state = await _state(sessions, uid)
+
+    text = _text(sent)
+    assert "前回と同じ施術時間" in text and "40分" in text
+    assert [button.get("label") for button in _buttons(sent)] == ["はい", "いいえ"]
+    assert state["mode"] == "autopilot_confirm_previous"
+    assert state["draft"]["menu_name"] == "マッスルセラピー", "自費診療（マッスルセラピー）で受けていない"
+    assert state["draft"].get("menu_id") not in (menus["hotpepper"], menus["homepage"])
+
+
+@pytest.mark.asyncio
+async def test_yes_to_the_previous_minutes_goes_on_to_candidates_of_that_length():
+    async with clinic() as (sessions, ids):
+        uid, _menus = await _previous_hotpepper_visit(sessions, ids)
+
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+        assert (await _state(sessions, uid))["mode"] == "autopilot_confirm_previous"
+        await tap(sessions, uid, "action=confirm&form=previous&answer=yes")
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "adjusting", f"候補が出ていない（{state['mode']}）"
+    assert state["draft"]["duration_minutes"] == 40
+    assert state["draft"]["autopilot_offer"]["duration_minutes"] == 40
+
+
+@pytest.mark.asyncio
+async def test_no_to_the_previous_minutes_asks_how_many_minutes():
+    async with clinic() as (sessions, ids):
+        uid, _menus = await _previous_hotpepper_visit(sessions, ids)
+
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+        sent = await tap(sessions, uid, "action=confirm&form=previous&answer=no")
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "waiting_time_duration"
+    assert "何分" in _text(sent)
+    assert not state["draft"].get("duration_minutes")
+    assert state["draft"]["menu_name"] == "マッスルセラピー"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, parse",
+    [
+        ("60分で予約したいです", {"duration_minutes": 60}),  # 本人が分数を言った
+    ],
+)
+async def test_minutes_said_by_the_patient_are_not_asked_again(text, parse):
+    async with clinic() as (sessions, ids):
+        uid, _menus = await _previous_hotpepper_visit(sessions, ids)
+
+        await send(sessions, uid, text, {"intent": "new", "date": _day().isoformat(), **parse})
+        state = await _state(sessions, uid)
+
+    assert state["mode"] != "autopilot_confirm_previous"
+    assert state["draft"]["duration_minutes"] == 60
+
+
+# ─── C16：前回が「ホームページ」（HP予約の新規）＝ 前回の60分は施術時間ではない。何分かを聞く（まことさん 2026-10-07） ───
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_text, parse, press",
+    [
+        ("予約したいです", {}, None),
+        ("予約/変更", {}, "相談したい"),  # 相談したい でも前回の60分を使わない
+    ],
+)
+async def test_a_previous_homepage_visit_asks_the_minutes_instead_of_using_60(first_text, parse, press):
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _channel_menus(sessions)
+        await _reserve_past(sessions, patient_id, ids["tokita"], menus["homepage"], 60)
+
+        sent = await send(sessions, uid, first_text, {"intent": "new", "date": _day().isoformat(), **parse})
+        if press:
+            button = next(item for item in _buttons(sent) if item.get("label") == press)
+            sent = await tap(sessions, uid, button["data"])
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "waiting_time_duration", f"施術時間を聞いていない（{state['mode']}）"
+    assert "何分" in _text(sent)
+    assert not state["draft"].get("duration_minutes"), "前回（初回）の60分を施術時間にしている"
+    assert state["draft"].get("menu_name") not in CHANNEL_NAMES
+
+
+@pytest.mark.asyncio
+async def test_answering_the_minutes_after_a_homepage_visit_goes_on_to_candidates():
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _channel_menus(sessions)
+        await _reserve_past(sessions, patient_id, ids["tokita"], menus["homepage"], 60)
+
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+        await send(sessions, uid, "30分で", {"intent": "new", "duration_minutes": 30})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["duration_minutes"] == 30
+    assert state["mode"] == "adjusting"
+    assert state["draft"]["autopilot_offer"]["duration_minutes"] == 30
+
+
+async def _reserve_past(sessions, patient_id: int, practitioner_id: int, menu_id: int, minutes: int) -> None:
+    begin = _at(_day(-14), "10:00")
+    async with sessions() as db:
+        db.add(Reservation(patient_id=patient_id, practitioner_id=practitioner_id, menu_id=menu_id,
+                           start_time=begin, end_time=begin + timedelta(minutes=minutes),
+                           status="CONFIRMED", channel="HOTPEPPER"))
+        await db.commit()
+
+
+# ─── D7・D11・C9：院のメニューはボタンで並べない。メニューのボタンは「⭐️いつもの」と保険／自費／相談だけ（まことさん 2026-10-07） ───
+
+
+@pytest.mark.asyncio
+async def test_the_menu_question_does_not_list_the_clinic_menus():
+    """メニューを全部ボタンで並べない（ホットペッパー等も出てしまう・スクロールが要る＝D7）。
+    ボタンは「⭐️いつもの」と、保険診療／自費診療／相談したい の大きな分け方だけ（C9・まことさん 2026-10-07 に
+    「⭐️いつもの」だけから変更。ボタンの「保険診療」は院のメニューの保険診療（15分固定）とは別の、保険の側を選ぶボタン）。"""
     async with clinic() as (sessions, ids):
         uid, patient_id = await _patient(sessions)
         menus = await _menus_and_usual(sessions, ids, patient_id)
 
         sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
 
-    buttons = _buttons(sent)
-    assert len(buttons) == 1
-    assert "いつもの" in buttons[0]["label"]
-    assert not any(menus["extension"] in (button.get("label") or "") for button in buttons)
+    labels = [button.get("label") or "" for button in _buttons(sent)]
+    assert len(labels) == 4 and "いつもの" in labels[0]
+    assert labels[1:] == ["保険診療", "自費診療", "相談したい"]
+    assert not any(menus["extension"] in label for label in labels)
+    assert not any(label.startswith("見本メニュー") for label in labels)
 
 
 @pytest.mark.asyncio
@@ -217,4 +505,224 @@ async def test_the_booking_menu_for_a_first_visit_patient_asks_for_a_date_not_a_
     assert "メニュー" not in text
     assert "日時" in text or "日" in text
     assert _buttons(sent) == []
+
+
+# ─── C8：時間を選べるメニューの名前だけを言われたときの施術時間（まことさん 2026-10-07） ───
+#
+# 可変メニューの menus.duration_minutes は刻み・最小値（本番のマッスルセラピーは10分）。
+# 以前はメニュー名を言われるとその値を施術時間に入れていたため、10分刻みの候補が出て、
+# 「はい」と答えると確定直前の検算（下限20分）で落ちて「埋まりました」と返していた。
+# 日時まで言われた即時確定の経路では例外で処理が止まっていた（2026-10-07 再現）。
+
+
+async def _variable_menus(sessions) -> dict:
+    async with sessions() as db:
+        muscle = Menu(name="マッスルセラピー", duration_minutes=10, is_duration_variable=True,
+                      max_duration_minutes=120, is_active=True, display_order=1)
+        extension = Menu(name="保険延長", duration_minutes=20, is_duration_variable=True,
+                         max_duration_minutes=120, is_active=True, display_order=2)
+        insurance = Menu(name="保険診療", duration_minutes=15, is_active=True, display_order=3)
+        db.add_all([muscle, extension, insurance])
+        await db.commit()
+        return {"muscle": muscle.id, "extension": extension.id, "insurance": insurance.id}
+
+
+async def _past_visit(sessions, patient_id: int, practitioner_id: int, menu_id: int | None, minutes: int) -> None:
+    """前回の予約（2週間前）。"""
+    begin = _at(_day(-14), "10:00")
+    async with sessions() as db:
+        db.add(Reservation(patient_id=patient_id, practitioner_id=practitioner_id, menu_id=menu_id,
+                           start_time=begin, end_time=begin + timedelta(minutes=minutes),
+                           status="CONFIRMED", channel="LINE"))
+        await db.commit()
+
+
+async def _reservations(sessions, patient_id: int) -> list:
+    async with sessions() as db:
+        return (await db.execute(select(Reservation).where(Reservation.patient_id == patient_id))).scalars().all()
+
+
+async def _set_usual(sessions, patient_id: int, menu_id: int, minutes: int) -> None:
+    async with sessions() as db:
+        patient = (await db.execute(select(Patient).where(Patient.id == patient_id))).scalar_one()
+        patient.default_menu_id = menu_id
+        patient.default_duration = minutes
+        await db.commit()
+
+
+def _asks_duration(state: dict, sent: list[dict]) -> None:
+    assert state["mode"] == "waiting_time_duration", f"施術時間を聞いていない（mode={state['mode']}）"
+    assert not state["draft"].get("duration_minutes"), "メニューの登録値が施術時間に入っている"
+    assert "何分" in _text(sent)
+    assert _buttons(sent) == []
+
+
+@pytest.mark.asyncio
+async def test_naming_a_variable_menu_asks_the_duration_instead_of_using_the_registered_minutes():
+    """前回は別メニュー（メニュー無し60分）。マッスルセラピーの10分で候補を出さず、何分かを聞く。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        await _variable_menus(sessions)
+        await _past_visit(sessions, patient_id, ids["tokita"], None, 60)
+
+        sent = await send(sessions, uid, "マッスルセラピーで予約したいです", {"intent": "new", "date": _day().isoformat()})
+        state = await _state(sessions, uid)
+
+    _asks_duration(state, sent)
+    assert state["draft"]["menu_name"] == "マッスルセラピー"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, parse",
+    [
+        ("マッスルセラピーで予約したいです", {}),
+        ("マッスルセラピーで時田先生にお願いします", {"practitioner": "時田"}),
+        ("保険延長で予約したいです", {}),
+    ],
+)
+async def test_a_variable_menu_with_a_date_and_time_is_not_booked_with_the_registered_minutes(text, parse):
+    """日時まで言われても（即時確定の経路）、登録値（10分・20分）で予約しない・処理を止めない。何分かを聞く。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        await _variable_menus(sessions)
+        await _past_visit(sessions, patient_id, ids["tokita"], None, 60)
+
+        sent = await send(sessions, uid, text, {"intent": "new", "date": _day().isoformat(), "time": "10:00", **parse})
+        state = await _state(sessions, uid)
+        booked = await _reservations(sessions, patient_id)
+
+    _asks_duration(state, sent)
+    assert len(booked) == 1, "前回の予約のほかに予約が作られた"
+
+
+@pytest.mark.asyncio
+async def test_minutes_said_before_the_menu_name_are_kept():
+    """「60分で」と言ってから「マッスルセラピーで」と言ったら60分のまま（C7 本人が言った）。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        await _variable_menus(sessions)
+        await _past_visit(sessions, patient_id, ids["tokita"], None, 60)
+
+        await send(sessions, uid, "60分で予約したいです",
+                   {"intent": "new", "date": _day().isoformat(), "duration_minutes": 60})
+        await send(sessions, uid, "マッスルセラピーで", {"intent": "new"})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["menu_name"] == "マッスルセラピー"
+    assert state["draft"]["duration_minutes"] == 60
+
+
+@pytest.mark.asyncio
+async def test_the_previous_visit_of_the_same_menu_gives_the_minutes():
+    """前回が同じマッスルセラピー（60分）なら、その60分で候補を出す。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _variable_menus(sessions)
+        await _past_visit(sessions, patient_id, ids["tokita"], menus["muscle"], 60)
+
+        await send(sessions, uid, "マッスルセラピーで予約したいです", {"intent": "new", "date": _day().isoformat()})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["duration_minutes"] == 60
+    assert state["mode"] == "adjusting"
+    assert state["draft"]["autopilot_offer"]["duration_minutes"] == 60
+
+
+@pytest.mark.asyncio
+async def test_the_usual_of_the_same_menu_gives_the_minutes():
+    """スタッフが登録した「いつもの」が同じマッスルセラピー（90分）なら90分。前回（保険診療15分）は使わない。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _variable_menus(sessions)
+        await _past_visit(sessions, patient_id, ids["tokita"], menus["insurance"], 15)
+        await _set_usual(sessions, patient_id, menus["muscle"], 90)
+
+        await send(sessions, uid, "マッスルセラピーで予約したいです", {"intent": "new", "date": _day().isoformat()})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["duration_minutes"] == 90
+
+
+@pytest.mark.asyncio
+async def test_the_minutes_of_a_different_menu_are_not_used():
+    """「いつもの」が保険延長（60分）・前回が保険診療（15分）の人がマッスルセラピーと言ったら、どちらの分数も使わず聞く。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _variable_menus(sessions)
+        await _past_visit(sessions, patient_id, ids["tokita"], menus["insurance"], 15)
+        await _set_usual(sessions, patient_id, menus["extension"], 60)
+
+        sent = await send(sessions, uid, "マッスルセラピーで予約したいです", {"intent": "new", "date": _day().isoformat()})
+        state = await _state(sessions, uid)
+
+    _asks_duration(state, sent)
+
+
+@pytest.mark.asyncio
+async def test_naming_another_menu_while_asked_about_the_usual_drops_the_usual_minutes():
+    """「いつものメニューでよろしいでしょうか」（いつもの＝保険延長60分）に「いいえ」→「マッスルセラピーで」。
+    会話には いつもの の60分が入っているが、別のメニューなので引き継がず聞く。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _variable_menus(sessions)
+        await _set_usual(sessions, patient_id, menus["extension"], 60)
+
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+        assert (await _state(sessions, uid))["mode"] == "autopilot_confirm_usual"
+        await send(sessions, uid, "いいえ", {"intent": "other", "polarity": "negative", "has_reservation_intent": False})
+        assert (await _state(sessions, uid))["draft"]["duration_minutes"] == 60
+        sent = await send(sessions, uid, "マッスルセラピーで", {"intent": "new"})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["menu_name"] == "マッスルセラピー"
+    _asks_duration(state, sent)
+
+
+@pytest.mark.asyncio
+async def test_naming_a_variable_menu_with_a_condition_after_candidates_asks_the_duration():
+    """候補を出した後の「マッスルセラピーで、もっと早い時間」。探し直しの処理でも下限の20分で探さず、何分かを聞く。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        await _variable_menus(sessions)
+        await _past_visit(sessions, patient_id, ids["tokita"], None, 60)
+
+        await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat(), "time": "15:00"})
+        assert (await _state(sessions, uid))["mode"] in {"adjusting", "autopilot_booking_confirm"}
+        sent = await send(sessions, uid, "マッスルセラピーで、もっと早い時間ありますか", {"intent": "new", "constraints": ["earlier"]})
+        state = await _state(sessions, uid)
+
+    _asks_duration(state, sent)
+
+
+@pytest.mark.asyncio
+async def test_a_first_visit_patient_naming_a_variable_menu_gets_60_minutes():
+    """初回（いつものも前回も無い）は60分（A4・C7）。"""
+    async with clinic() as (sessions, _ids):
+        uid, _patient_id = await _patient(sessions)
+        await _variable_menus(sessions)
+
+        await send(sessions, uid, "マッスルセラピーで予約したいです", {"intent": "new", "date": _day().isoformat()})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["duration_minutes"] == 60
+    assert state["mode"] == "adjusting"
+
+
+@pytest.mark.asyncio
+async def test_answering_the_duration_question_moves_on_to_candidates():
+    """「何分をご希望ですか」に「60分で」と答えたら、60分の候補が出る。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        await _variable_menus(sessions)
+        await _past_visit(sessions, patient_id, ids["tokita"], None, 60)
+
+        await send(sessions, uid, "マッスルセラピーで予約したいです", {"intent": "new", "date": _day().isoformat()})
+        await send(sessions, uid, "60分で", {"intent": "new", "duration_minutes": 60})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["duration_minutes"] == 60
+    assert state["draft"]["menu_name"] == "マッスルセラピー"
+    assert state["mode"] == "adjusting"
+    assert state["draft"]["autopilot_offer"]["duration_minutes"] == 60
 

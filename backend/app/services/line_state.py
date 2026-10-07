@@ -310,10 +310,14 @@ async def merge_user_draft(
     line_user_id: str,
     draft: dict,
     request_id: str | None = None,
+    *,
+    drop: tuple[str, ...] = (),
 ) -> dict:
+    """draft に値を足す。空の値では上書きしない。drop の箱は先に空にする（埋め直さない限り空のまま）。"""
     state = await _get_or_create_state(db, line_user_id)
     context = _normalize_context(state.context_data)
     current_draft = context.get("draft") if isinstance(context.get("draft"), dict) else {}
+    current_draft = {k: v for k, v in current_draft.items() if k not in drop}
     merged = {**current_draft, **{k: v for k, v in draft.items() if v not in (None, "")}}
 
     context["draft"] = merged

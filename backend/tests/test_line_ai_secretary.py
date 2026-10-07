@@ -1453,11 +1453,16 @@ async def test_autopilot_cancel_failure_replies_and_keeps_confirmation_active():
 
 
 @pytest.mark.asyncio
-async def test_autopilot_change_without_datetime_asks_and_keeps_conversation_active():
+async def test_autopilot_change_without_details_asks_what_to_change_and_keeps_conversation_active():
+    """何を変えるか言わない変更は、日時を聞き返さずに、変える所をボタンで聞く（正解 F7・まことさん 2026-10-07。
+    以前は日時を聞いていた）。会話は変更の途中のまま。"""
     from app.api.line import _handle_text_message
 
     patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
-    reservation = SimpleNamespace(id=91)
+    start = datetime(2026, 10, 9, 7, 30, tzinfo=timezone.utc)
+    reservation = SimpleNamespace(
+        id=91, practitioner_id=None, menu_id=None, start_time=start, end_time=start + timedelta(minutes=60)
+    )
     event = {
         "replyToken": "reply-token",
         "source": {"userId": "U-autopilot"},
@@ -1476,13 +1481,17 @@ async def test_autopilot_change_without_datetime_asks_and_keeps_conversation_act
     ), patch("app.api.line.create_notification", new=AsyncMock()), patch(
         "app.api.line.merge_user_draft", new=AsyncMock()
     ) as mock_merge, patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
-        "app.api.line.reply_to_line", new=AsyncMock()
+        "app.api.line._polished_from_plan", new=AsyncMock(side_effect=lambda plan: plan.render())
+    ), patch(
+        "app.api.line.reply_text_with_quick_reply", new=AsyncMock()
     ) as mock_reply:
         await _handle_text_message(event, db)
 
     assert mock_merge.await_args.args[2]["autopilot_change_reservation_id"] == 91
     assert mock_set_mode.await_args.args[2] == "autopilot_change_datetime"
-    assert "日時" in mock_reply.await_args.args[1]
+    assert "どのようにご変更" in mock_reply.await_args.args[1]
+    labels = [item["action"]["label"] for item in mock_reply.await_args.args[2]]
+    assert labels == ["日時を変更したい", "施術時間を変更したい", "メニューの内容を変更したい", "施術者を変更したい"]
 
 
 
@@ -2328,7 +2337,7 @@ async def test_autopilot_usual_button_still_fills_slots():
     patient = SimpleNamespace(id=7, name="時田信", line_autopilot_enabled=True)
     preset = {"menu_id": 5, "menu_name": "マッスルセラピー", "duration_minutes": 60, "practitioner_id": 3, "practitioner_name": "時田"}
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch("app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)
     ):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
@@ -3336,7 +3345,7 @@ async def test_autopilot_uses_registered_preset_without_usual_button():
     }
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
         "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)
-    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)):
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
             user_id="U-autopilot",
@@ -3365,7 +3374,7 @@ async def test_autopilot_first_visit_defaults_to_60min_and_director():
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
         "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=None)
     ), patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)
     ):
         merged = await _merge_autopilot_slots(
             _fake_db_returning_director(director),
@@ -3398,7 +3407,7 @@ async def test_autopilot_explicit_practitioner_request_beats_registered_default(
     requested = SimpleNamespace(id=4, name="上田 花子")
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=requested)), patch(
         "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=preset)
-    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)):
+    ), patch("app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
             user_id="U-autopilot",
@@ -3441,7 +3450,7 @@ async def test_autopilot_returning_patient_is_never_treated_as_first_visit():
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
         "app.api.line._get_patient_default_preset", new=AsyncMock(return_value=None)
     ), patch("app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=latest)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: update)
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: update)
     ):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
@@ -3486,7 +3495,7 @@ async def test_autopilot_time_only_reply_keeps_the_date_being_discussed():
         "practitioner_id": 3,
     }
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: {**previous, **update})
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: {**previous, **update})
     ):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
@@ -3515,7 +3524,7 @@ async def test_autopilot_explicit_new_date_still_moves_the_day():
         "practitioner_id": 3,
     }
     with patch("app.api.line._extract_requested_practitioner", new=AsyncMock(return_value=None)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update: {**previous, **update})
+        "app.api.line.merge_user_draft", new=AsyncMock(side_effect=lambda db, uid, update, **_k: {**previous, **update})
     ):
         merged = await _merge_autopilot_slots(
             AsyncMock(),
@@ -4760,6 +4769,8 @@ def test_every_confirmation_situation_has_a_button_form():
         "autopilot_change_confirm",
         # 「1日」を「◯/1(◯)のことでしょうか？」と確かめる場面（正解 E2・2026-10-07）
         "autopilot_date_confirm",
+        # 前回がホットペッパーの人に「前回と同じ施術時間（○○分）でよろしいでしょうか」と確かめる場面（正解 C15・2026-10-07）
+        "autopilot_confirm_previous",
     }
     # 確認の場面はコードが質問を握る側にも入っていること
     assert "confirm_slot" in _CODE_OWNED_QUESTION_SITUATIONS
