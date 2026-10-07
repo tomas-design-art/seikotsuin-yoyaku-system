@@ -212,3 +212,17 @@
 - 手順: 本物の DB で日付を使うテストは、祝日を避けた日を使う（tests/test_line_change_cancel_real_db.py の `_day()` は `holidays.Japan()` で祝日を飛ばす）。
 - 状態: L1（初回）。
 
+## 2026-10-07: 時間を選べるメニューの登録値（刻み・最小値）を施術時間に入れていた
+
+- 症状: マッスルセラピー（本番の登録値10分）を名前で選ぶと、10分刻みの候補が出て、「はい」で確定直前の検算（下限20分）に落ち「候補枠が直前に埋まりました」と返した。日時まで言われた即時確定の経路では、検算の `ValueError` を `except HTTPException` が受けず、処理ごと止まった。
+- 原因: `menus.duration_minutes` は固定メニューでは施術時間、可変メニューでは刻み・最小値と、意味が2つある。`_merge_autopilot_slots` はどちらも施術時間として使っていた（2026-08-18 に「可変では刻み」と記録していたのに、メニュー名を読む経路が増えた 10/7 まで当たる人が少なかった）。
+- 手順: `menu.duration_minutes` を施術時間として使う前に、`is_duration_variable` を見る。可変なら施術時間の出どころ（本人・初回・同じメニューのいつもの／前回）を探し、無ければ聞く（正解 C8）。
+- 状態: L3（tests/test_line_menu_real_db.py の C8 の12件。修正前はすべて失敗）。
+
+## 2026-10-07: 偽の merge_user_draft（引数を決め打ちした lambda）が、新しいキーワード引数で TypeError
+
+- 症状: `merge_user_draft` に `drop=` を足したら、test_line_ai_secretary.py の7件が `<lambda>() got an unexpected keyword argument 'drop'` で落ちた。
+- 原因: 偽の部品が `lambda db, uid, update: update` と引数を決め打ちしていた（本物の仕様の食い違いではなく、検証台の不備）。
+- 手順: 偽の部品は `**_k` を受ける形で書く。検証台の不備は検証台で直し、本体の設計（引数を渡さない等）を変えない。
+- 状態: L1（初回）。
+
