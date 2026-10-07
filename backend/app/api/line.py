@@ -3153,6 +3153,35 @@ async def _usual_minutes_for_menu(
     return None
 
 
+async def _menu_named_by_patient(
+    db: AsyncSession,
+    text: str,
+    parsed: dict | None,
+    *,
+    current_menu_id: int | None,
+) -> Menu | None:
+    """本人がこの1通で言ったメニュー（正解 C13）。
+
+    本文に院のメニュー名があればそれ。無ければ、AIが院のメニュー一覧に当てはめた名前
+    （言い方が違ってもよい：「産後のケア」→産ケア、「パーソナル」→パーソナライズ）。
+    言葉を読むのはAI、一覧にそのままある名前かはここで確かめる。AIの読み取りには前の会話の
+    メニューが持ち越されることがある（line_parser が previous の menu_name で埋める）ので、
+    いま話しているメニューと同じなら、本人が言ったことにしない。
+    """
+    named = await _menu_named_in_text(db, text)
+    if named is not None:
+        return named
+    hint = str((parsed or {}).get("menu_name") or (parsed or {}).get("menu_hint") or "").strip()
+    if not hint or hint == "usual":
+        return None
+    menu = (
+        await db.execute(select(Menu).where(Menu.is_active == True, Menu.name == hint).limit(1))  # noqa: E712
+    ).scalar_one_or_none()
+    if menu is None or menu.id == current_menu_id:
+        return None
+    return menu
+
+
 async def _menu_named_in_text(db: AsyncSession, text: str) -> Menu | None:
     """本文に院のメニュー名（有効なもの）が入っていれば、そのメニュー。長い名前を優先する。
 
@@ -5299,12 +5328,27 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     quick_items,
                 )
             return
+        # 「いつものでよろしいですか」に別のメニューを言われた（言い方が違ってもよい）。
+        # いつものではなく、そのメニューで進む。以前は聞き直していた（正解 C13・まことさん 2026-10-07）
+        other_menu = await _menu_named_by_patient(db, text, parsed_intent, current_menu_id=preset["menu_id"])
         # 確認しているのはメニューであって枠ではない。同じ文に日時が入っていても
         # 「別の希望」とは読まない（下でその日時を拾う）。
-        usual_answer = confirmation.read_answer(
+        usual_answer = None if other_menu else confirmation.read_answer(
             text, parsed_intent, wish_fields=confirmation.MENU_WISH_FIELDS
         )
-        if usual_answer == confirmation.YES:
+        if other_menu is not None:
+            merged = await _merge_autopilot_slots(
+                db,
+                user_id=user_id,
+                text=text,
+                patient=line_patient,
+                previous=prev_draft,
+                parsed={**(parsed_intent or {}), "menu_name": other_menu.name},
+            )
+            await set_user_mode(db, user_id, "idle")
+            # メニューの質問への答え。予約の変更・質問として読まない（「メニューを変更したい」の「変更」など）
+            parsed_intent = {**(parsed_intent or {}), "intent": "new"}
+        elif usual_answer == confirmation.YES:
             usual_draft = {
                 _CONFIRM_UNCLEAR_KEY: 0,
                 "menu_id": preset["menu_id"],

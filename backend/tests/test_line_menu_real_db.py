@@ -130,6 +130,84 @@ async def test_choosing_a_menu_by_name_does_not_ask_about_the_usual_menu():
     assert state["draft"]["menu_name"] == menus["extension"]
 
 
+# ─── C13：言い方が違うメニューの名前・「いつものでよろしいですか」の最中の別のメニュー（まことさん 2026-10-07） ───
+
+
+async def _paraphrased_menus(sessions) -> None:
+    async with sessions() as db:
+        db.add_all(
+            [
+                Menu(name="産ケア", duration_minutes=20, is_duration_variable=True, max_duration_minutes=40,
+                     is_active=True, display_order=20),
+                Menu(name="パーソナライズ", duration_minutes=30, is_duration_variable=True, max_duration_minutes=90,
+                     is_active=True, display_order=21),
+            ]
+        )
+        await db.commit()
+
+
+async def _asked_about_the_usual(sessions, ids) -> str:
+    """いつもの（見本マッスル60分・時田）がある人に「いつものメニューでよろしいでしょうか」と聞いている状態。"""
+    uid, patient_id = await _patient(sessions)
+    await _menus_and_usual(sessions, ids, patient_id)
+    await _paraphrased_menus(sessions)
+    await send(sessions, uid, "予約したいです", {"intent": "new", "date": _day().isoformat()})
+    assert (await _state(sessions, uid))["mode"] == "autopilot_confirm_usual"
+    return uid
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, parse, menu",
+    [
+        ("保険延長でお願いします", {}, "保険延長"),  # 本文に院のメニュー名
+        ("産後のケアして欲しいです", {"menu_name": "産ケア"}, "産ケア"),  # AIが院のメニュー一覧に当てはめた
+        ("パーソナルで", {"menu_name": "パーソナライズ"}, "パーソナライズ"),
+    ],
+)
+async def test_naming_another_menu_while_asked_about_the_usual_goes_with_that_menu(text, parse, menu):
+    """10/7 まで：「いつものでよろしいですか」の最中に別のメニューを文字で言うと、同じことを聞き直していた。"""
+    async with clinic() as (sessions, ids):
+        uid = await _asked_about_the_usual(sessions, ids)
+        await send(sessions, uid, text, {"intent": "new", **parse})
+        state = await _state(sessions, uid)
+
+    assert state["mode"] != "autopilot_confirm_usual", "聞き直している"
+    assert state["draft"]["menu_name"] == menu
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "text, parse",
+    [
+        ("うーん、どうしようかな", {"intent": "other", "menu_name": "見本マッスル"}),  # AIが前の会話のメニューを持ち越しただけ
+        ("骨盤もやってほしい", {"intent": "other", "menu_name": "骨盤矯正"}),  # 院のメニューに無い名前
+    ],
+)
+async def test_a_menu_the_patient_did_not_name_does_not_replace_the_usual(text, parse):
+    async with clinic() as (sessions, ids):
+        uid = await _asked_about_the_usual(sessions, ids)
+        await send(sessions, uid, text, parse)
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "autopilot_confirm_usual"
+    assert state["draft"]["menu_name"] == "見本マッスル"
+
+
+@pytest.mark.asyncio
+async def test_a_paraphrased_menu_name_in_a_new_booking_is_the_clinic_menu():
+    """いつもの を聞いていない場面でも、AIが院のメニューに当てはめた名前でそのメニュー（もとから動いていた）。"""
+    async with clinic() as (sessions, ids):
+        uid, _patient_id = await _patient(sessions)
+        await _paraphrased_menus(sessions)
+
+        await send(sessions, uid, "産後のケアをお願いしたいです",
+                   {"intent": "new", "date": _day().isoformat(), "menu_name": "産ケア"})
+        state = await _state(sessions, uid)
+
+    assert state["draft"]["menu_name"] == "産ケア"
+
+
 # ─── D7・D11・C9：院のメニューはボタンで並べない。メニューのボタンは「⭐️いつもの」と保険／自費／相談だけ（まことさん 2026-10-07） ───
 
 
