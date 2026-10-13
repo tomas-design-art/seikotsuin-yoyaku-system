@@ -1689,6 +1689,9 @@ async def test_autopilot_rich_menu_trigger_restarts_booking_instead_of_manual_mo
     ) as mock_clear, patch("app.api.line.set_user_mode", new=AsyncMock()) as mock_set_mode, patch(
         "app.api.line._build_menu_quick_reply_items", new=AsyncMock(return_value=[])
     ), patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply, patch(
+        # これからの予約は無い（予約がある人には新規か変更かを聞く＝正解 F11）
+        "app.api.line._find_upcoming_reservations", new=AsyncMock(return_value=[])
+    ), patch(
         "app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご希望の日時を教えていただけますか？")
     ) as mock_compose:
         await _handle_text_message(event, db)
