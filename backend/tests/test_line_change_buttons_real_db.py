@@ -31,13 +31,15 @@ from tests.test_line_change_cancel_real_db import (
     _day,
     _dispatch,
     _patient,
+    _set_state,
     _state,
     clinic,
     send,
     tap,
 )
 
-CHANGE_ITEMS = ["日時を変更したい", "施術時間を変更したい", "メニューの内容を変更したい", "施術者を変更したい"]
+ENTRY_CHOICES = ["新しく予約する", "予約を変更する"]
+CHANGE_ITEMS =["日時を変更したい", "施術時間を変更したい", "メニューの内容を変更したい", "施術者を変更したい"]
 MENU_KINDS = ["保険診療", "自費診療", "相談したい"]
 
 
@@ -795,3 +797,132 @@ async def test_halving_after_the_duration_button_keeps_the_start():
 
     assert state["mode"] == "autopilot_change_confirm"
     assert state["draft"]["autopilot_change_end_time_iso"].startswith(f"{day.isoformat()}T17:00")
+
+
+# ─── F11・F3：「予約/変更」「変更」の入口（まことさん 2026-10-13・10/8 8:50 の実機） ───
+
+
+@pytest.mark.asyncio
+async def test_the_rich_menu_with_an_upcoming_reservation_asks_new_or_change():
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["tokita"], _day(), "16:30", 60, menus["muscle"], menus["self_pay_color"])
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+
+    assert _labels(sent) == ENTRY_CHOICES
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("choice, expected", [("予約を変更する", CHANGE_ITEMS), ("新しく予約する", MENU_KINDS)])
+async def test_choosing_new_or_change_from_the_rich_menu(choice, expected):
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["tokita"], _day(), "16:30", 60, menus["muscle"], menus["self_pay_color"])
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+        sent = await press(sessions, uid, sent, choice)
+
+    assert _labels(sent) == expected
+
+
+@pytest.mark.asyncio
+async def test_the_rich_menu_without_a_reservation_is_a_new_booking():
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        # 過去の予約だけ（これからの予約は無い）
+        await _reserve(sessions, patient_id, ids["tokita"], _day(-14), "10:00", 60, menus["muscle"], menus["self_pay_color"])
+
+        sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+
+    assert _labels(sent) == MENU_KINDS
+
+
+@pytest.mark.asyncio
+async def test_the_word_henkou_alone_starts_a_change():
+    """10/8 8:50:53 の実機：「変更」とだけ送ると、新しい予約のメニューを聞いた（F3 に反する）。"""
+    async with clinic() as (sessions, ids):
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        own = await _reserve(sessions, patient_id, ids["tokita"], _day(), "16:30", 60, menus["muscle"], menus["self_pay_color"])
+
+        sent = await send(sessions, uid, "変更", {"intent": "change"})
+        state = await _state(sessions, uid)
+
+    assert _labels(sent) == CHANGE_ITEMS
+    assert state["draft"]["autopilot_change_reservation_id"] == own
+
+
+@pytest.mark.asyncio
+async def test_the_rich_menu_after_a_timeout_is_not_answered_with_the_timeout_notice():
+    """10/8 8:49:46 の実機：時間切れのあとの「予約/変更」に「改めてご希望の日時を」と返し、ボタンはメニューだった。"""
+    async with clinic() as (sessions, ids):
+        uid, _patient_id = await _patient(sessions)
+        await _setup(sessions)
+        await _set_state(sessions, uid, "waiting_datetime", {"menu_kind": "consult"})
+
+        with patch("app.api.line._conversation_is_expired", return_value=True):
+            sent = await send(sessions, uid, "予約/変更", {"intent": "new"})
+
+    assert "経過" not in _text(sent)
+
+
+# ─── F12：変更の「もっと早い時間に」「金曜日午後」（10/8 8:54 の実機） ───
+
+
+@pytest.mark.asyncio
+async def test_earlier_without_a_time_offers_earlier_slots_on_the_same_day():
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["tokita"], day, "16:30", 60, menus["muscle"], menus["self_pay_color"])
+
+        sent = await send(sessions, uid, "予約変更して", {"intent": "change"})
+        await press(sessions, uid, sent, "日時を変更したい")
+        sent = await send(sessions, uid, "もっと早い時間に変えたい", {"intent": "change", "constraints": ["earlier"]})
+        state = await _state(sessions, uid)
+
+    assert "施術時間" not in _text(sent), "分かっている施術時間を聞き直している"
+    offer = state["draft"].get("autopilot_offer")
+    assert offer and offer["candidates"], f"候補が出ていない（{state['mode']}）"
+    assert all(c["date"] == day.isoformat() and c["start"] < "16:30" for c in offer["candidates"])
+    assert offer["duration_minutes"] == 60
+    assert offer["candidates"][0]["practitioner_id"] == ids["tokita"]
+
+
+@pytest.mark.asyncio
+async def test_a_time_period_in_a_change_offers_slots_in_that_period():
+    """「金曜日午後」をAIが14:00ちょうどと読んでも、午後の時間帯の候補を出す（新しい予約と同じ）。"""
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["tokita"], day, "10:00", 60, menus["muscle"], menus["self_pay_color"])
+
+        sent = await send(sessions, uid, "予約変更して", {"intent": "change"})
+        await press(sessions, uid, sent, "日時を変更したい")
+        await send(sessions, uid, "金曜日午後", {"intent": "new", "date": day.isoformat(), "time": "14:00"})
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "autopilot_change_datetime", "14:00ちょうどの確認に進んでいる"
+    offer = state["draft"].get("autopilot_offer")
+    assert offer and offer["candidates"]
+    assert all(c["date"] == day.isoformat() and c["start"] >= "12:00" for c in offer["candidates"])
+
+
+@pytest.mark.asyncio
+async def test_the_unavailable_notice_names_who_is_not_available():
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _reserve(sessions, patient_id, ids["ueda"], day, "16:30", 60, menus["muscle"], menus["self_pay_color"])
+        await _reserve(sessions, None, ids["ueda"], day, "13:30", 120)
+
+        sent = await send(sessions, uid, "14時に変更したい", {"intent": "change", "date": day.isoformat(), "time": "14:00"})
+
+    assert UEDA in _text(sent) and "空き" in _text(sent)
