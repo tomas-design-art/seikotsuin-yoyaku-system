@@ -677,30 +677,6 @@ async def _find_or_create_patient(db: AsyncSession, name: str, reading: str | No
     return await find_or_create_patient(db, name=name, reading=reading)
 
 
-async def _get_or_create_hotpepper_dummy_patient(db: AsyncSession) -> Patient:
-    """シャドーモード専用: ホットペッパーN のダミー患者を新規作成して返す。
-
-    毎回新規（HP予約番号単位で別患者）。既存の「ホットペッパーN」の最大番号を探してインクリメント。
-    本番では shadow_mode=False のため絶対に呼ばれない。
-    """
-    import re
-    from app.services.patient_match import create_new_patient
-
-    existing_result = await db.execute(
-        select(Patient).where(Patient.name.like("ホットペッパー%"))
-    )
-    existing = existing_result.scalars().all()
-    max_number = 0
-    for p in existing:
-        m = re.fullmatch(r"ホットペッパー(\d+)", p.name or "")
-        if m:
-            max_number = max(max_number, int(m.group(1)))
-    alias_name = f"ホットペッパー{max_number + 1}"
-    patient = await create_new_patient(db, name=alias_name, line_id=None)
-    logger.info(f"[shadow] HPダミー患者作成: {alias_name}")
-    return patient
-
-
 async def _find_existing_manual_match(
     db: AsyncSession,
     patient_id: int,

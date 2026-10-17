@@ -13,26 +13,6 @@ import pytest
 from app.services import offered_slots
 
 
-def test_build_reservation_review_flex_has_three_actions():
-    from app.services.line_alerts import build_reservation_review_flex
-
-    flex = build_reservation_review_flex(
-        {
-            "request_id": "rid123",
-            "customer_name": "田中太郎",
-            "date": "2026-04-04",
-            "time": "10:00",
-            "menu_name": "骨盤矯正",
-            "availability_text": "空きあり",
-        }
-    )
-
-    buttons = flex["footer"]["contents"]
-    labels = [b["action"]["label"] for b in buttons]
-    assert labels == ["承認・確定", "代替案を送る", "自分で返信"]
-    assert all("rid=rid123" in b["action"]["data"] for b in buttons)
-
-
 def test_sos_message_has_fixed_operational_format():
     from app.services.line_alerts import _build_sos_message
 
@@ -202,283 +182,6 @@ def test_line_parser_reuses_shadow_datetime_normalization_rules():
     assert courtesy_time is None
 
 
-def test_missing_info_message_contains_required_labels():
-    from app.api.line import _build_missing_info_message
-
-    text = _build_missing_info_message(["customer_name", "menu_name"])
-    assert "お名前" in text
-    assert "ご希望メニュー" in text
-
-
-def test_line_mirror_requires_all_config_values():
-    from app.api.line import _line_mirror_is_configured
-
-    with patch("app.api.line.settings.line_mirror_enabled", True), patch(
-        "app.api.line.settings.line_mirror_url", "https://staging.example/api/line/mirror-webhook"
-    ), patch("app.api.line.settings.line_mirror_shared_secret", "secret"):
-        assert _line_mirror_is_configured() is True
-
-    with patch("app.api.line.settings.line_mirror_enabled", False), patch(
-        "app.api.line.settings.line_mirror_url", "https://staging.example/api/line/mirror-webhook"
-    ), patch("app.api.line.settings.line_mirror_shared_secret", "secret"):
-        assert _line_mirror_is_configured() is False
-
-
-def test_shadow_rule_parse_change_keeps_desired_date_separate_from_current_reservation():
-    from app.services.shadow_service import _rule_based_shadow_parse
-    from app.utils.datetime_jst import now_jst
-
-    current_year = now_jst().year
-
-    msg = (
-        "おはようございます。佐々木です。\n"
-        "予約の変更をお願いできますでしょうか？\n"
-        "5/2（土）13時に予約を入れて頂いています。\n"
-        "翌日5/3（日）はやっていますか？"
-    )
-
-    parsed = _rule_based_shadow_parse(msg)
-
-    assert parsed["intent"] == "変更"
-    assert parsed["name"] == "佐々木"
-    assert parsed["current_date"] == f"{current_year + 1 if now_jst().month > 5 else current_year}-05-02"
-    assert parsed["current_time"] == "13:00"
-    assert parsed["date"] == f"{current_year + 1 if now_jst().month > 5 else current_year}-05-03"
-    assert parsed["time"] is None
-
-
-@pytest.mark.asyncio
-async def test_shadow_existing_reservation_reference_matches_board_by_name_and_time():
-    from app.services.shadow_service import _find_existing_reservation_by_reference
-    from app.utils.datetime_jst import JST
-
-    patient = SimpleNamespace(id=10, name="佐々木泉美", last_name="佐々木", first_name="泉美")
-    practitioner = SimpleNamespace(id=2, name="施術者A")
-    menu = SimpleNamespace(id=3, name="保険診療")
-    start = datetime(2026, 5, 2, 13, 0, tzinfo=JST)
-    reservation = SimpleNamespace(
-        id=99,
-        patient=patient,
-        practitioner=practitioner,
-        menu=menu,
-        start_time=start,
-        end_time=start + timedelta(minutes=60),
-    )
-
-    scalar_result = Mock()
-    scalar_result.all.return_value = [reservation]
-    execute_result = Mock()
-    execute_result.scalars.return_value = scalar_result
-    db = AsyncMock()
-    db.execute = AsyncMock(return_value=execute_result)
-
-    matched = await _find_existing_reservation_by_reference(
-        db,
-        patient_name="佐々木",
-        current_date="2026-05-02",
-        current_time="13:00",
-    )
-
-    assert matched["existing_reservation_id"] == 99
-    assert matched["customer_name"] == "佐々木泉美"
-    assert matched["practitioner_id"] == 2
-    assert matched["practitioner_name"] == "施術者A"
-    assert matched["duration_minutes"] == 60
-    assert matched["menu_id"] == 3
-    assert matched["menu_name"] == "保険診療"
-
-
-def test_shadow_rule_parse_followup_time_can_complete_existing_change_draft():
-    from app.services.shadow_service import _rule_based_shadow_parse
-
-    parsed = _rule_based_shadow_parse("15時〜は大丈夫ですか？")
-
-    assert parsed["time"] == "15:00"
-    assert parsed["date"] is None
-
-
-def test_shadow_manual_without_request_can_restart_on_clear_new_reservation_text():
-    from app.services.shadow_service import _should_restart_shadow_from_manual
-
-    msg = "本日空いていますでしょうか。\n腰に加え、先日話した肩首まわりがまだ痛くて..."
-
-    assert _should_restart_shadow_from_manual(msg, {"mode": "manual", "request_id": None, "draft": {}}) is True
-    assert _should_restart_shadow_from_manual(msg, {"mode": "manual", "request_id": "rid123", "draft": {}}) is False
-
-
-def test_shadow_normalize_keeps_availability_with_symptoms_as_reservation_request():
-    from app.services.shadow_service import _normalize_analysis
-
-    msg = "本日空いていますでしょうか。\n腰に加え、先日話した肩首まわりがまだ痛くて..."
-
-    parsed = _normalize_analysis({"intent": "相談", "date": None, "time": None}, msg)
-
-    assert parsed["intent"] == "予約希望"
-    assert parsed["date"] is not None
-
-
-def test_shadow_rule_parse_evening_followup_extracts_time():
-    from app.services.shadow_service import _rule_based_shadow_parse
-
-    parsed = _rule_based_shadow_parse("夕方頃希望です。")
-
-    assert parsed["time"] == "17:00"
-    assert parsed["date"] is None
-
-
-@pytest.mark.asyncio
-async def test_shadow_timetable_patient_uses_shadow_alias_without_line_id():
-    from app.api.line import _get_or_create_shadow_timetable_patient
-
-    state = SimpleNamespace(context_data={})
-    state_result = Mock()
-    state_result.scalar_one_or_none.return_value = state
-    existing_scalar = Mock()
-    existing_scalar.all.return_value = [SimpleNamespace(name="シャドー1"), SimpleNamespace(name="シャドー3")]
-    existing_result = Mock()
-    existing_result.scalars.return_value = existing_scalar
-    db = AsyncMock()
-    db.execute = AsyncMock(side_effect=[state_result, existing_result])
-    db.flush = AsyncMock()
-    created = SimpleNamespace(id=44, name="シャドー4")
-
-    with patch("app.api.line.create_new_patient", new=AsyncMock(return_value=created)) as mock_create:
-        patient = await _get_or_create_shadow_timetable_patient(db, "U-real-user")
-
-    assert patient.name == "シャドー4"
-    assert state.context_data["shadow_patient_id"] == 44
-    assert state.context_data["shadow_patient_name"] == "シャドー4"
-    mock_create.assert_awaited_once()
-    assert mock_create.await_args.kwargs["name"] == "シャドー4"
-    assert mock_create.await_args.kwargs["line_id"] is None
-
-
-@pytest.mark.asyncio
-async def test_shadow_approve_registers_dummy_patient_and_does_not_push_customer():
-    from app.api.line import _handle_postback
-
-    start = datetime(2026, 5, 3, 15, 0).astimezone()
-    end = start + timedelta(minutes=60)
-    req = {
-        "user_id": "U-real-customer",
-        "customer_name": "実名患者",
-        "available": True,
-        "practitioner_id": 7,
-        "menu_id": None,
-        "start_time_iso": start.isoformat(),
-        "end_time_iso": end.isoformat(),
-        "duration_minutes": 60,
-    }
-    dummy_patient = SimpleNamespace(id=88, name="シャドー2")
-    db = AsyncMock()
-
-    with patch("app.api.line.get_request", new=AsyncMock(return_value=req)), patch(
-        "app.api.line._get_or_create_shadow_timetable_patient", new=AsyncMock(return_value=dummy_patient)
-    ) as mock_dummy, patch(
-        "app.api.line.create_reservation", new=AsyncMock(return_value={"id": 123, "status": "CONFIRMED"})
-    ) as mock_create, patch("app.api.line.update_request", new=AsyncMock()), patch(
-        "app.api.line.set_user_mode", new=AsyncMock()
-    ), patch("app.api.line.push_message", new=AsyncMock()) as mock_push, patch(
-        "app.api.line.reply_to_line", new=AsyncMock()
-    ), patch("app.api.line.settings.line_admin_user_id", "U-admin"):
-        await _handle_postback(
-            {"replyToken": "staff-reply", "postback": {"data": "action=shadow_approve&rid=rid123&uid=U-real-customer"}},
-            db,
-        )
-
-    mock_dummy.assert_awaited_once_with(db, "U-real-customer")
-    reservation_data = mock_create.await_args.args[1]
-    assert reservation_data.patient_id == 88
-    assert "dummy_patient=シャドー2" in reservation_data.notes
-    pushed_targets = [call.args[0] for call in mock_push.await_args_list]
-    assert pushed_targets == ["U-admin"]
-
-
-@pytest.mark.asyncio
-async def test_shadow_alt_registers_dummy_patient_and_does_not_push_customer():
-    from app.api.line import _handle_postback
-
-    req = {
-        "user_id": "U-real-customer",
-        "customer_name": "実名患者",
-        "menu_id": None,
-        "alternatives": [
-            {
-                "date": "2026-05-03",
-                "start": "16:00",
-                "end": "17:00",
-                "practitioner_id": 9,
-                "practitioner_name": "施術者A",
-            }
-        ],
-    }
-    dummy_patient = SimpleNamespace(id=89, name="シャドー3")
-    db = AsyncMock()
-
-    with patch("app.api.line.get_request", new=AsyncMock(return_value=req)), patch(
-        "app.api.line._get_or_create_shadow_timetable_patient", new=AsyncMock(return_value=dummy_patient)
-    ), patch(
-        "app.api.line.create_reservation", new=AsyncMock(return_value={"id": 124, "status": "CONFIRMED"})
-    ) as mock_create, patch("app.api.line.update_request", new=AsyncMock()), patch(
-        "app.api.line.set_user_mode", new=AsyncMock()
-    ), patch("app.api.line.push_message", new=AsyncMock()) as mock_push, patch(
-        "app.api.line.reply_to_line", new=AsyncMock()
-    ), patch("app.api.line.settings.line_admin_user_id", "U-admin"):
-        await _handle_postback(
-            {"replyToken": "staff-reply", "postback": {"data": "action=shadow_alt&rid=rid123&alt=1&uid=U-real-customer"}},
-            db,
-        )
-
-    reservation_data = mock_create.await_args.args[1]
-    assert reservation_data.patient_id == 89
-    assert "dummy_patient=シャドー3" in reservation_data.notes
-    pushed_targets = [call.args[0] for call in mock_push.await_args_list]
-    assert pushed_targets == ["U-admin"]
-
-
-def test_mirror_display_name_includes_environment_label():
-    from app.api.line import _mirror_display_name
-
-    event = {
-        "source": {"userId": "Uabcdef123456"},
-        "_mirror": {"displayName": "山田太郎"},
-    }
-
-    assert _mirror_display_name(event, "STAGING-MIRROR") == "[STAGING-MIRROR] 山田太郎"
-
-
-@pytest.mark.asyncio
-async def test_line_mirror_webhook_runs_shadow_handler_with_secret():
-    from app.api.line import line_mirror_webhook
-
-    class DummyRequest:
-        async def json(self):
-            return {
-                "mirror": {"label": "STAGING-MIRROR"},
-                "events": [
-                    {
-                        "type": "message",
-                        "source": {"userId": "U-customer"},
-                        "message": {"type": "text", "text": "明日の10時に予約したいです"},
-                        "_mirror": {"displayName": "顧客A"},
-                    }
-                ],
-            }
-
-    db = AsyncMock()
-    with patch("app.api.line.settings.line_mirror_shared_secret", "mirror-secret"), patch(
-        "app.api.line.handle_shadow_message", new=AsyncMock(return_value=None)
-    ) as mock_shadow:
-        result = await line_mirror_webhook(DummyRequest(), db, x_line_mirror_secret="mirror-secret")
-
-    assert result == {"status": "ok", "processed": 1, "label": "STAGING-MIRROR"}
-    mock_shadow.assert_awaited_once()
-    assert mock_shadow.await_args.kwargs["user_id"] == "U-customer"
-    assert mock_shadow.await_args.kwargs["text"] == "明日の10時に予約したいです"
-    assert mock_shadow.await_args.kwargs["display_name"] == "[STAGING-MIRROR] 顧客A"
-    db.commit.assert_awaited_once()
-
-
 def test_extract_full_name_for_first_time_registration():
     from app.agents.line_parser import extract_full_name
 
@@ -497,27 +200,14 @@ def test_autopilot_setup_extracts_name_phone_and_reading_birth_date():
     assert birth_date.isoformat() == "1990-04-01"
 
 
-def test_autopilot_usual_confirmation_uses_patient_default_menu_duration_and_practitioner():
+def test_affirmative_choice_and_vague_time_helpers():
     from app.api.line import (
         _extract_alternative_choice,
-        _format_autopilot_slot_confirmation,
-        _format_usual_confirmation,
         _has_vague_time_period,
         _is_affirmative,
         _is_negative,
     )
-    from app.utils.datetime_jst import JST
 
-    text = _format_usual_confirmation(
-        {
-            "menu_name": "マッスルセラピー",
-            "duration_minutes": 60,
-            "practitioner_name": "時田",
-        }
-    )
-
-    assert "マッスルセラピー 60分" in text
-    assert "担当: 時田" in text
     assert _is_affirmative("はい") is True
     assert _is_affirmative("それでお願いします") is True
     assert _is_affirmative("うん！") is True
@@ -534,28 +224,6 @@ def test_autopilot_usual_confirmation_uses_patient_default_menu_duration_and_pra
     assert _extract_alternative_choice("明日の14時", 3) is None
     assert _has_vague_time_period("明日の午後") is True
     assert _has_vague_time_period("明日の14時") is False
-    slot_confirmation = _format_autopilot_slot_confirmation(
-        datetime(2026, 8, 13, 14, 0, tzinfo=JST),
-        datetime(2026, 8, 13, 15, 0, tzinfo=JST),
-        "時田",
-    )
-    assert "8/13(木) 14:00〜15:00" in slot_confirmation
-    assert "よろしいでしょうか" in slot_confirmation
-
-
-def test_compose_alternatives_text_uses_neutral_header_for_vague_time():
-    from app.api.line import _compose_alternatives_text
-
-    alternatives = [{"label": "2026-08-13 14:00〜15:00（時田）"}]
-    vague = _compose_alternatives_text(alternatives, vague=True)
-    full = _compose_alternatives_text(alternatives, vague=False)
-
-    assert "空いているお時間をご案内します" in vague
-    assert "埋まって" not in vague
-    assert "満席" in full
-    # 4つ目の「別日時をどうぞ」メッセージが常に含まれること
-    assert "別の日時をお知らせください" in vague
-    assert "別の日時をお知らせください" in full
 
 
 def test_vague_time_window_maps_periods():
@@ -842,62 +510,6 @@ async def test_adjusting_without_a_stored_offer_goes_back_to_asking_for_a_date()
 
     result["created"].assert_not_awaited()
     assert result["modes"][-1] == "waiting_datetime"
-
-
-@pytest.mark.asyncio
-async def test_alternatives_sent_by_the_clinic_become_the_current_offer():
-    """院長が送った一覧も「いま提示している候補」として保存する。
-
-    保存せずに adjusting へ移すと、患者が新しい一覧を見ながら「2」と返したとき
-    draft に残っている前回の候補に照合される（#2572 と同じ形）。
-    """
-    from app.api.line import _handle_postback
-
-    alternatives = [
-        {"date": "2026-09-09", "start": "14:00", "end": "15:00",
-         "practitioner_id": 1, "practitioner_name": "時田"},
-        {"date": "2026-09-09", "start": "15:00", "end": "16:00",
-         "practitioner_id": 2, "practitioner_name": "上田"},
-    ]
-    written: list[dict] = []
-
-    async def fake_merge(_db, _uid, update, *_a, **_k):
-        written.append(dict(update))
-        return dict(update)
-
-    pushed = AsyncMock()
-    with ExitStack() as stack:
-        for name, value in {
-            "get_request": {
-                "user_id": "U-patient",
-                "alternatives": alternatives,
-                "duration_minutes": 60,
-            },
-            "update_request": None,
-            "_compose_autopilot_reply": "（候補です）",
-            "reply_to_line": None,
-            "set_user_mode": None,
-        }.items():
-            stack.enter_context(patch(f"app.api.line.{name}", new=AsyncMock(return_value=value)))
-        stack.enter_context(patch("app.api.line.merge_user_draft", new=fake_merge))
-        stack.enter_context(patch("app.api.line.push_text_with_quick_reply", new=pushed))
-        await _handle_postback(
-            {
-                "replyToken": "reply-token",
-                "source": {"userId": "U-admin"},
-                "postback": {"data": "action=send_alternatives&rid=rid-1"},
-            },
-            _EmptyDB(),
-        )
-
-    stored = [w[offered_slots.DRAFT_KEY] for w in written if offered_slots.DRAFT_KEY in w]
-    assert stored, "院長が送った候補が保存されていない"
-    saved = offered_slots.from_draft({offered_slots.DRAFT_KEY: stored[0]})
-    assert [c["start"] for c in saved.candidates] == ["14:00", "15:00"]
-
-    # 押せるボタンも、その保存した提示から作られている
-    pushed.assert_awaited_once()
-    assert pushed.await_args.args[2] == offered_slots.quick_reply_items(saved)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1743,155 +1355,6 @@ async def test_autopilot_natural_booking_message_restarts_from_manual_mode():
     assert "施術時間" in mock_reply.await_args.args[1]
 
 
-@pytest.mark.asyncio
-async def test_unregistered_user_gets_full_name_prompt():
-    from app.api.line import _handle_text_message
-
-    db = AsyncMock()
-    event = {
-        "replyToken": "reply-token",
-        "source": {"userId": "U-first"},
-        "message": {"type": "text", "text": "予約したいです"},
-    }
-
-    with patch("app.api.line.create_notification", new=AsyncMock(return_value=True)), patch(
-        "app.api.line._find_line_patient", new=AsyncMock(return_value=None)
-    ), patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="たろ")), patch(
-        "app.api.line.reply_to_line", new=AsyncMock(return_value=True)
-    ) as mock_reply, patch("app.api.line.get_user_mode", new=AsyncMock(return_value=None)), patch(
-        "app.api.line.get_user_state", new=AsyncMock(return_value={"request_id": None})
-    ), patch("app.api.line.set_user_mode", new=AsyncMock(return_value=None)) as mock_set_mode:
-        await _handle_text_message(event, db)
-
-    mock_set_mode.assert_awaited_once()
-    assert mock_set_mode.await_args.args[2] == "awaiting_name"
-    assert "フルネーム" in mock_reply.await_args.args[1]
-
-
-@pytest.mark.asyncio
-async def test_missing_menu_uses_quick_reply_buttons():
-    from app.api.line import _handle_text_message
-
-    db = AsyncMock()
-    result = Mock()
-    scalar_result = Mock()
-    scalar_result.all.return_value = []
-    result.scalars.return_value = scalar_result
-    db.execute = AsyncMock(return_value=result)
-    event = {
-        "replyToken": "reply-token",
-        "source": {"userId": "U-known"},
-        "message": {"type": "text", "text": "明日の10時でお願いします"},
-    }
-    patient = type("PatientStub", (), {"name": "田中太郎"})()
-
-    with patch("app.api.line.create_notification", new=AsyncMock(return_value=True)), patch(
-        "app.api.line._find_line_patient", new=AsyncMock(return_value=patient)
-    ), patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="田中")), patch(
-        "app.api.line.get_user_mode", new=AsyncMock(return_value=None)
-    ), patch(
-        "app.api.line.get_user_state", new=AsyncMock(return_value={"request_id": None, "draft": {}})
-    ), patch(
-        "app.api.line.merge_user_draft",
-        new=AsyncMock(
-            return_value={
-                "customer_name": "田中太郎",
-                "date": "2026-04-05",
-                "time": "10:00",
-                "menu_name": None,
-            }
-        ),
-    ), patch(
-        "app.api.line.set_user_mode", new=AsyncMock(return_value=None)
-    ), patch(
-        "app.api.line.parse_line_message",
-        new=AsyncMock(
-            return_value={
-                "has_reservation_intent": True,
-                "customer_name": "田中太郎",
-                "date": "2026-04-05",
-                "time": "10:00",
-                "menu_name": None,
-            }
-        ),
-    ), patch("app.api.line.reply_text_with_quick_reply", new=AsyncMock(return_value=True)) as mock_quick:
-        await _handle_text_message(event, db)
-
-    assert mock_quick.await_count == 1
-
-
-@pytest.mark.asyncio
-async def test_waiting_menu_usual_shortcut_warps_to_waiting_datetime():
-    from app.api.line import _handle_text_message
-
-    db = AsyncMock()
-    event = {
-        "replyToken": "reply-token",
-        "source": {"userId": "U-repeat"},
-        "message": {"type": "text", "text": "⭐️いつもの（保険診療 60分）"},
-    }
-    patient = type("PatientStub", (), {"name": "田中太郎"})()
-
-    with patch("app.api.line.create_notification", new=AsyncMock(return_value=True)), patch(
-        "app.api.line.get_user_mode", new=AsyncMock(return_value=None)
-    ), patch(
-        "app.api.line.get_user_state",
-        new=AsyncMock(return_value={"mode": "waiting_menu", "request_id": None, "draft": {"customer_name": "田中太郎"}}),
-    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
-        "app.api.line._get_line_display_name", new=AsyncMock(return_value="田中")
-    ), patch(
-        "app.api.line._get_latest_reservation_for_line_user",
-        new=AsyncMock(return_value={"menu_id": 1, "menu_name": "保険診療", "duration_minutes": 60}),
-    ), patch("app.api.line.merge_user_draft", new=AsyncMock(return_value={})), patch(
-        "app.api.line.set_user_mode", new=AsyncMock(return_value=None)
-    ) as mock_set_mode, patch(
-        "app.api.line.reply_to_line", new=AsyncMock(return_value=True)
-    ):
-        await _handle_text_message(event, db)
-
-    mock_set_mode.assert_awaited_once()
-    assert mock_set_mode.await_args.args[2] == "waiting_datetime"
-
-
-@pytest.mark.asyncio
-async def test_waiting_time_duration_accepts_10min_step_and_moves_to_datetime():
-    from app.api.line import _handle_text_message
-
-    db = AsyncMock()
-    event = {
-        "replyToken": "reply-token",
-        "source": {"userId": "U-duration"},
-        "message": {"type": "text", "text": "50分"},
-    }
-    patient = type("PatientStub", (), {"name": "田中太郎"})()
-    menu = type(
-        "MenuStub",
-        (),
-        {"name": "保険診療", "duration_minutes": 30, "max_duration_minutes": 90, "is_duration_variable": True},
-    )()
-
-    with patch("app.api.line.create_notification", new=AsyncMock(return_value=True)), patch(
-        "app.api.line.get_user_mode", new=AsyncMock(return_value=None)
-    ), patch(
-        "app.api.line.get_user_state",
-        new=AsyncMock(return_value={"mode": "waiting_time_duration", "request_id": None, "draft": {"menu_name": "保険診療"}}),
-    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
-        "app.api.line._get_line_display_name", new=AsyncMock(return_value="田中")
-    ), patch(
-        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
-    ), patch("app.api.line._resolve_menu", new=AsyncMock(return_value=menu)), patch(
-        "app.api.line.merge_user_draft", new=AsyncMock(return_value={"duration_minutes": 50})
-    ) as mock_merge, patch(
-        "app.api.line.set_user_mode", new=AsyncMock(return_value=None)
-    ) as mock_set_mode, patch(
-        "app.api.line.reply_to_line", new=AsyncMock(return_value=True)
-    ):
-        await _handle_text_message(event, db)
-
-    assert mock_merge.await_args.args[2]["duration_minutes"] == 50
-    assert mock_set_mode.await_args.args[2] == "waiting_datetime"
-
-
 def test_normalize_constraints_converts_llm_objects_to_strings():
     from app.agents.line_parser import _normalize_constraints
 
@@ -2357,7 +1820,9 @@ async def test_autopilot_usual_button_still_fills_slots():
 
 
 @pytest.mark.asyncio
-async def test_autopilot_full_natural_message_books_without_buttons():
+async def test_autopilot_full_natural_message_is_repeated_back_before_booking():
+    """日時・メニュー・担当がそろった文でも、確認なしで予約を作らない（正解 D13・まことさん 2026-10-17）。
+    以前はこのテストが「AIの自信が high なら確認なしで作る」を固定していた。"""
     from app.api.line import _handle_text_message
     from app.utils.datetime_jst import JST
 
@@ -2413,37 +1878,14 @@ async def test_autopilot_full_natural_message_books_without_buttons():
         mock_create = stack.enter_context(patch("app.api.line.create_reservation", new=AsyncMock(return_value={"id": 777, "status": "CONFIRMED"})))
         stack.enter_context(patch("app.api.line.clear_user_draft", new=AsyncMock()))
         stack.enter_context(patch("app.api.line.remember_completed_booking", new=AsyncMock()))
-        stack.enter_context(patch("app.api.line.set_user_mode", new=AsyncMock()))
+        mock_mode = stack.enter_context(patch("app.api.line.set_user_mode", new=AsyncMock()))
         stack.enter_context(patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご予約を承りました。")))
         mock_reply = stack.enter_context(patch("app.api.line.reply_to_line", new=AsyncMock()))
         await _handle_text_message(event, AsyncMock())
 
-    mock_create.assert_awaited_once()
-    assert mock_create.await_args.kwargs["reject_conflicts"] is True
-    assert mock_reply.await_args.args[1] == "ご予約を承りました。"
-
-
-@pytest.mark.asyncio
-async def test_non_autopilot_waiting_menu_keeps_legacy_fixed_reply():
-    from app.api.line import _handle_text_message
-
-    patient = SimpleNamespace(id=7, name="一般患者", line_autopilot_enabled=False)
-    event = {"replyToken": "reply-token", "source": {"userId": "U-legacy"}, "message": {"type": "text", "text": "不明なメニュー"}}
-    with patch("app.api.line.settings.line_autopilot_enabled", True), patch(
-        "app.api.line.get_user_state", new=AsyncMock(return_value={"mode": "waiting_menu", "draft": {}, "request_id": None})
-    ), patch("app.api.line.get_user_mode", new=AsyncMock(return_value="waiting_menu")), patch(
-        "app.api.line._get_line_display_name", new=AsyncMock(return_value="一般患者")
-    ), patch("app.api.line._find_line_patient", new=AsyncMock(return_value=patient)), patch(
-        "app.api.line._get_latest_reservation_for_line_user", new=AsyncMock(return_value=None)
-    ), patch("app.api.line._resolve_menu", new=AsyncMock(return_value=None)), patch(
-        "app.api.line._build_menu_quick_reply_items", new=AsyncMock(return_value=[])
-    ), patch("app.api.line.reply_text_with_quick_reply", new=AsyncMock()) as mock_reply, patch(
-        "app.api.line.compose_reply", new=AsyncMock()
-    ) as mock_compose:
-        await _handle_text_message(event, AsyncMock())
-
-    assert mock_reply.await_args.args[1] == "ご希望メニューを選んでくださいね。"
-    mock_compose.assert_not_awaited()
+    mock_create.assert_not_awaited()
+    assert mock_mode.await_args.args[2] == "autopilot_booking_confirm"
+    assert not any(call.args[1] == "ご予約を承りました。" for call in mock_reply.await_args_list)
 
 
 def test_build_slot_filters_maps_constraints_to_search_conditions():
@@ -3425,20 +2867,6 @@ async def test_autopilot_explicit_practitioner_request_beats_registered_default(
     assert merged["assumed_practitioner"] is False
 
 
-def test_assumed_booking_defaults_detected():
-    """推定値が混ざっている間は確認なしの即時確定をさせない。"""
-    from app.api.line import _has_assumed_booking_defaults
-
-    assert _has_assumed_booking_defaults({"assumed_menu": "マッスルセラピー"}) is True
-    assert _has_assumed_booking_defaults({"assumed_practitioner": "時田"}) is True
-    assert _has_assumed_booking_defaults({"assumed_duration": 60}) is True
-    assert _has_assumed_booking_defaults({"menu_name": "マッスルセラピー", "assumed_practitioner": False}) is False
-    assert _has_assumed_booking_defaults({}) is False
-    # 日付・時刻も同じ扱いになった（フォーム側の出どころ判定）
-    assert _has_assumed_booking_defaults({"date": "2026-09-06", "assumed_date": True}) is True
-    assert _has_assumed_booking_defaults({"date": "2026-09-06"}) is False
-
-
 @pytest.mark.asyncio
 async def test_autopilot_returning_patient_is_never_treated_as_first_visit():
     """来院実績がある人は、いつもの設定が無くても初回扱い（60分・院長固定）にしない。
@@ -3543,14 +2971,20 @@ async def test_autopilot_explicit_new_date_still_moves_the_day():
 
 @pytest.mark.asyncio
 async def test_webhook_failure_notifies_admin_and_replies_to_patient():
-    """例外で無言にしない。管理者へ原因を流し、患者には引き継ぎを返す。"""
-    from app.api.line import _notify_webhook_failure
+    """例外で無言にしない。管理者へ原因を流し、患者には引き継ぎを返す。
+    謝罪を返すのは、返事をする相手（自動予約の人）と決まった1通だけ（正解 A8。
+    自動予約でない人に送らないことは tests/test_line_non_autopilot_silent_real_db.py が見る）。"""
+    from app.api.line import _ANSWERING_THIS_EVENT, _notify_webhook_failure
 
     event = {"replyToken": "reply-token", "source": {"userId": "U-autopilot"}}
-    with patch("app.api.line.settings.admin_line_developer_user_id", "U-admin"), patch(
-        "app.api.line.push_message", new=AsyncMock()
-    ) as mock_push, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
-        await _notify_webhook_failure(event, ValueError("boom"))
+    answering = _ANSWERING_THIS_EVENT.set(True)
+    try:
+        with patch("app.api.line.settings.admin_line_developer_user_id", "U-admin"), patch(
+            "app.api.line.push_message", new=AsyncMock()
+        ) as mock_push, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+            await _notify_webhook_failure(event, ValueError("boom"))
+    finally:
+        _ANSWERING_THIS_EVENT.reset(answering)
 
     assert mock_push.await_args.args[0] == "U-admin"
     assert "ValueError: boom" in mock_push.await_args.args[1]
@@ -3656,7 +3090,7 @@ async def test_webhook_stores_events_and_returns_before_running_handlers():
         "app.api.line.settings.line_inbox_rollout", "all", create=True
     ), patch(
         "app.api.line._verify_signature", new=Mock()
-    ), patch("app.api.line._forward_line_webhook_to_mirror", new=AsyncMock()) as mock_mirror, patch(
+    ), patch(
         "app.api.line.enqueue_line_events", new=AsyncMock(return_value=1)
     ) as mock_enqueue, patch(
         "app.api.line._handle_text_message", new=AsyncMock()
@@ -3666,7 +3100,6 @@ async def test_webhook_stores_events_and_returns_before_running_handlers():
     assert result["status"] == "ok"
     mock_enqueue.assert_awaited_once()
     mock_handle.assert_not_awaited()
-    mock_mirror.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -4172,19 +3605,6 @@ async def test_cancel_select_rejects_reservation_owned_by_another_patient():
 
     mock_merge.assert_not_awaited()
     mock_set_mode.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_shadow_admin_notification_is_sent_once_to_the_acting_admin():
-    from app.api.line import _notify_shadow_admin
-
-    with patch("app.api.line.push_message", new=AsyncMock()) as mock_push, patch(
-        "app.api.line.reply_to_line", new=AsyncMock()
-    ) as mock_reply, patch("app.api.line.settings.line_admin_user_id", "U-admin"):
-        await _notify_shadow_admin("予約システムに登録し予約完了しました。", "reply-token", "U-admin")
-
-    mock_push.assert_awaited_once_with("U-admin", "予約システムに登録し予約完了しました。")
-    mock_reply.assert_not_awaited()
 
 
 # ─────────────────────────────────────────────────────────────

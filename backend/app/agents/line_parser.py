@@ -499,6 +499,36 @@ async def parse_line_message(
         return _noted(message, "rule_after_ai_error", _normalize_result(fallback, profile_name, previous), error=str(e))
 
 
+def read_button_answer(
+    message: str,
+    *,
+    intent: str,
+    polarity: str,
+    has_reservation_intent: bool,
+    profile_name: str | None = None,
+    previous: dict | None = None,
+) -> dict:
+    """ボタンの答えは AI に読ませない（正解 H3・B2：AIに会話の進め方を決めさせない）。
+
+    意味はボタンが決めている（はい／いいえ・メニューの種類）。後ろの処理が AI の読み取りと同じ形で
+    扱えるよう、同じ形の値をボタンの意味だけで作る。日時・担当・条件は空（ボタンはそれを言っていない）。
+    """
+    result = _normalize_result(
+        {
+            "intent": intent,
+            "polarity": polarity,
+            "has_reservation_intent": has_reservation_intent,
+            "confidence": "high",
+            "needs_human": False,
+            "reply_action": "reply",
+            "constraints": [],
+        },
+        profile_name,
+        previous,
+    )
+    return _noted(message, "button", result)
+
+
 def _noted(message: str, source: str, result: dict, error: str | None = None) -> dict:
     """LINE自動予約の記録に、何を受け取りどう読んだかを残す（記録中でなければ何もしない）。"""
     from app.services import autopilot_log
