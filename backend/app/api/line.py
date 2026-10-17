@@ -20,7 +20,12 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agents.line_parser import classify_conversation_control, extract_full_name, parse_line_message
+from app.agents.line_parser import (
+    classify_conversation_control,
+    extract_full_name,
+    parse_line_message,
+    read_button_answer,
+)
 from app.config import settings
 from app.database import async_session, get_db
 from app.models.menu import CHANNEL_MENU_NAMES, HOMEPAGE_MENU_NAME, HOTPEPPER_MENU_NAME, Menu, is_channel_menu_name
@@ -552,21 +557,6 @@ async def _resolve_booking_defaults(
     return defaults
 
 
-def _has_assumed_booking_defaults(draft: dict) -> bool:
-    """患者が述べていない条件（登録情報からの推定）が混ざっているか。
-
-    混ざっているうちは確認なしで予約を確定させない。
-
-    判定の本体は予約フォーム（services/booking_form.py）が持つ「箱の出どころ」。
-    以前はキー名を3つ直接見ていたため、日付・時刻には同じ扱いが無く、
-    どのスロットが患者の言葉でどれが補われた値かが経路ごとにばらついていた。
-    フォーム側の判定に加えて従来の印も見る（判定を緩めないため）。
-    """
-    if BookingForm.booking(draft).needs_confirmation():
-        return True
-    return any(draft.get(key) for key in ("assumed_menu", "assumed_practitioner", "assumed_duration"))
-
-
 async def _build_menu_quick_reply_items(
     db: AsyncSession,
     line_user_id: str | None = None,
@@ -649,6 +639,14 @@ async def _find_line_patient(db: AsyncSession, user_id: str) -> Patient | None:
             .limit(1)
         )
     ).scalar_one_or_none()
+
+
+def _button_answer_meaning(button_answer: dict) -> dict:
+    """押されたボタンの意味（正解 H3）。はい／いいえは確認への答え、メニューの種類は新しい予約のメニューへの答え。"""
+    if button_answer.get("menu_kind"):
+        return {"intent": "new", "polarity": "none", "has_reservation_intent": True}
+    polarity = "affirmative" if button_answer.get("answer") == "yes" else "negative"
+    return {"intent": "other", "polarity": polarity, "has_reservation_intent": False}
 
 
 async def _is_in_autopilot_setup(db: AsyncSession, user_id: str, text: str) -> bool:
@@ -4154,35 +4152,37 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         preset=await _get_patient_default_preset(db, line_patient),
     )
     _AUTOPILOT_CLINIC_CONTEXT.set(clinic_facts)
-    # 会話の履歴は解析AIに渡さない（_compose_autopilot_reply の冒頭の説明を参照）。
-    # 「9月は？」のような主題の省略は、コードが覚えている直前の話題
-    # （draft の last_question_category）で解決する。
-    parsed_intent = await parse_line_message(
-        text,
-        profile_name=display_name,
-        previous=prev_draft,
-        # 院のメニュー名の一覧（院の確定情報に入っているもの）。AIにも、AIが失敗したときの
-        # 予備の読み取りにも渡す。渡していなかったため「保険延長」が読めなかった（2026-09-28）
-        menu_names=[
-            str(menu.get("name"))
-            for menu in ((clinic_facts or {}).get("menus") or [])
-            if isinstance(menu, dict) and menu.get("name")
-        ],
-        clinic_context=clinic_facts,
-        recent_history=None,
-        conversation_state=(user_state.get("context_data") or {}).get("recent_completed_booking"),
-    )
-    if button_menu_kind:
-        # メニューのボタン（保険診療／自費診療／相談したい）は、新しい予約のメニューへの答え。
-        # AIが「相談したい」を質問・人に回す内容と読んでも、その読み方で行き先を変えない（正解 H3）。
-        # 10/7 23:19 の実機：引き継ぎになり、存在しない予約の作り話や「お電話ください」を返した
-        parsed_intent = {
-            **parsed_intent,
-            "intent": "new",
-            "has_reservation_intent": True,
-            "needs_human": False,
-            "reply_action": "reply",
-        }
+    button_answer = _BUTTON_ANSWER.get() or {}
+    if button_answer:
+        # ボタンの答え（はい／いいえ・メニューの種類）は AI に読ませない。意味はボタンが決めている（正解 H3）。
+        # 以前は「はい」の本文で AI の読み取りを通し、AIが人に回す・キャンセル・条件の変更と読むと、
+        # ボタンの「はい」でもそちらへ分かれえた。メニューのボタンも、10/7 23:19 の実機で「相談したい」が
+        # 質問と読まれて引き継ぎになり、存在しない予約の作り話や「お電話ください」を返した
+        parsed_intent = read_button_answer(
+            text,
+            **_button_answer_meaning(button_answer),
+            profile_name=display_name,
+            previous=prev_draft,
+        )
+    else:
+        # 会話の履歴は解析AIに渡さない（_compose_autopilot_reply の冒頭の説明を参照）。
+        # 「9月は？」のような主題の省略は、コードが覚えている直前の話題
+        # （draft の last_question_category）で解決する。
+        parsed_intent = await parse_line_message(
+            text,
+            profile_name=display_name,
+            previous=prev_draft,
+            # 院のメニュー名の一覧（院の確定情報に入っているもの）。AIにも、AIが失敗したときの
+            # 予備の読み取りにも渡す。渡していなかったため「保険延長」が読めなかった（2026-09-28）
+            menu_names=[
+                str(menu.get("name"))
+                for menu in ((clinic_facts or {}).get("menus") or [])
+                if isinstance(menu, dict) and menu.get("name")
+            ],
+            clinic_context=clinic_facts,
+            recent_history=None,
+            conversation_state=(user_state.get("context_data") or {}).get("recent_completed_booking"),
+        )
 
     # 予約確定直後の感謝・締めの挨拶は、Geminiが返信不要と判断できる。
     # 新しい予約操作を含まない場合だけ受け入れ、次の会話へ確定文脈を持ち越さない。
@@ -5351,7 +5351,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 usual_draft["practitioner_name"] = preset["practitioner_name"]
             merged = await merge_user_draft(db, user_id, usual_draft)
             # 「うん、それでいいよ。明日の午後どう？」のように同じ文へ日時が含まれる場合は拾う。
-            parsed_same = await parse_line_message(text, profile_name=display_name, previous=prev_draft)
+            # ボタンの「はい」には日時が無いので、AI で読み直さない（正解 H3）
+            parsed_same = (
+                parsed_intent if _BUTTON_ANSWER.get()
+                else await parse_line_message(text, profile_name=display_name, previous=prev_draft)
+            )
             if parsed_same.get("date") or parsed_same.get("time"):
                 merged = await merge_user_draft(
                     db,
@@ -6079,67 +6083,9 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     )
 
     if practitioner:
-        # 登録情報から補った条件（assumed_*）が混ざっている間は、患者の同意がまだ無い。
-        # 確認を挟んでから確定させる。
-        if (
-            latest_reservation
-            and merged.get("parse_confidence") == "high"
-            and not _has_assumed_booking_defaults(merged)
-        ):
-            try:
-                await _assert_bookable_duration(
-                    db, menu.id if menu else None, start_dt, end_dt
-                )
-                reservation = await create_reservation(
-                    db,
-                    ReservationCreate(
-                        patient_id=line_patient.id,
-                        practitioner_id=practitioner.id,
-                        menu_id=menu.id if menu else None,
-                        color_id=await _autopilot_color_id(db, user_id, merged, menu.id if menu else None),
-                        start_time=start_dt,
-                        end_time=end_dt,
-                        channel="LINE",
-                        notes="LINE AI秘書 高確信即時確定",
-                        source_ref=_line_reservation_source_ref(),
-                    ),
-                    reject_conflicts=True,
-                )
-            except HTTPException:
-                await update_request(db, request_id, line_user_id=user_id, status="alternatives_sent")
-                await set_user_mode(db, user_id, "waiting_datetime", request_id)
-                if reply_token:
-                    await reply_to_line(
-                        reply_token,
-                        await _compose_autopilot_reply("slot_taken", {"patient_message": text}, parsed_intent),
-                    )
-                return
-            else:
-                await update_request(db, request_id, line_user_id=user_id, status="confirmed", reservation_id=reservation.get("id"))
-                await clear_user_draft(db, user_id)
-                await remember_completed_booking(
-                    db,
-                    user_id,
-                    {"date": start_dt.strftime("%Y/%m/%d"), "start": start_dt.strftime("%H:%M"), "end": end_dt.strftime("%H:%M"), "practitioner": practitioner.name},
-                )
-                await set_user_mode(db, user_id, "idle")
-                if reply_token:
-                    await reply_to_line(
-                        reply_token,
-                        await _compose_autopilot_reply(
-                            "confirmed",
-                            {
-                                "date": start_dt.strftime("%Y/%m/%d"),
-                                "start": start_dt.strftime("%H:%M"),
-                                "end": end_dt.strftime("%H:%M"),
-                                "practitioner": practitioner.name,
-                                "menu": menu.name if menu else menu_name,
-                                "patient_message": text,
-                            },
-                            parsed_intent,
-                        ),
-                    )
-                return
+        # 空いていても、毎回「◯/◯ 10:00〜 担当でよろしいですか」と確認してから取る（正解 D13・まことさん 2026-10-17：
+        # 復唱による互いの確認）。以前は、前回の予約があり、AIの読み取りの自信が high で、登録から補った条件が
+        # 無いと、確認なしで予約を作っていた（備考「LINE AI秘書 高確信即時確定」）。確認を挟むかをAIの自己申告で決めていた。
         await update_request(db, request_id, line_user_id=user_id, status="awaiting_patient_confirmation")
         await set_user_mode(db, user_id, "autopilot_booking_confirm", request_id)
         await _reply_plan(

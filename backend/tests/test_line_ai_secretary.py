@@ -1820,7 +1820,9 @@ async def test_autopilot_usual_button_still_fills_slots():
 
 
 @pytest.mark.asyncio
-async def test_autopilot_full_natural_message_books_without_buttons():
+async def test_autopilot_full_natural_message_is_repeated_back_before_booking():
+    """日時・メニュー・担当がそろった文でも、確認なしで予約を作らない（正解 D13・まことさん 2026-10-17）。
+    以前はこのテストが「AIの自信が high なら確認なしで作る」を固定していた。"""
     from app.api.line import _handle_text_message
     from app.utils.datetime_jst import JST
 
@@ -1876,14 +1878,14 @@ async def test_autopilot_full_natural_message_books_without_buttons():
         mock_create = stack.enter_context(patch("app.api.line.create_reservation", new=AsyncMock(return_value={"id": 777, "status": "CONFIRMED"})))
         stack.enter_context(patch("app.api.line.clear_user_draft", new=AsyncMock()))
         stack.enter_context(patch("app.api.line.remember_completed_booking", new=AsyncMock()))
-        stack.enter_context(patch("app.api.line.set_user_mode", new=AsyncMock()))
+        mock_mode = stack.enter_context(patch("app.api.line.set_user_mode", new=AsyncMock()))
         stack.enter_context(patch("app.api.line._compose_autopilot_reply", new=AsyncMock(return_value="ご予約を承りました。")))
         mock_reply = stack.enter_context(patch("app.api.line.reply_to_line", new=AsyncMock()))
         await _handle_text_message(event, AsyncMock())
 
-    mock_create.assert_awaited_once()
-    assert mock_create.await_args.kwargs["reject_conflicts"] is True
-    assert mock_reply.await_args.args[1] == "ご予約を承りました。"
+    mock_create.assert_not_awaited()
+    assert mock_mode.await_args.args[2] == "autopilot_booking_confirm"
+    assert not any(call.args[1] == "ご予約を承りました。" for call in mock_reply.await_args_list)
 
 
 def test_build_slot_filters_maps_constraints_to_search_conditions():
@@ -2863,20 +2865,6 @@ async def test_autopilot_explicit_practitioner_request_beats_registered_default(
     assert merged["practitioner_id"] == 4
     # 本人が述べた担当なので確認扱いにしない
     assert merged["assumed_practitioner"] is False
-
-
-def test_assumed_booking_defaults_detected():
-    """推定値が混ざっている間は確認なしの即時確定をさせない。"""
-    from app.api.line import _has_assumed_booking_defaults
-
-    assert _has_assumed_booking_defaults({"assumed_menu": "マッスルセラピー"}) is True
-    assert _has_assumed_booking_defaults({"assumed_practitioner": "時田"}) is True
-    assert _has_assumed_booking_defaults({"assumed_duration": 60}) is True
-    assert _has_assumed_booking_defaults({"menu_name": "マッスルセラピー", "assumed_practitioner": False}) is False
-    assert _has_assumed_booking_defaults({}) is False
-    # 日付・時刻も同じ扱いになった（フォーム側の出どころ判定）
-    assert _has_assumed_booking_defaults({"date": "2026-09-06", "assumed_date": True}) is True
-    assert _has_assumed_booking_defaults({"date": "2026-09-06"}) is False
 
 
 @pytest.mark.asyncio
