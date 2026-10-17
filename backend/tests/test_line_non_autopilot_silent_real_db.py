@@ -6,16 +6,18 @@
 
 2026-10-17 に本番で確かめたこと：シャドーモードは 2026-04 から動き続けていた（Render の SHADOW_MODE=true）。
 SHADOW_MODE を false にするだけだと、自動予約でない人が古い自動返信の経路に落ちて
-「カルテ登録のため、フルネーム…」を全患者に返し始める。だから「何もしない」をコードで決める。
+「カルテ登録のため、フルネーム…」を全患者に返し始める。だから「何もしない」をコードで決める（正解 A8）。
 
 「何もしない」＝返信しない・AIを呼ばない・LINEのプロフィールも取りに行かない・会話の状態を作らない・
-シャドーの記録も通知も作らない。
+シャドーの記録も、自動予約の記録も、通知も作らない。処理が例外で止まったときの謝罪も送らない。
 自動予約の人と、合言葉で本人確認を始めた人（登録の途中の人を含む）だけが、これまでどおり返事を受ける。
 """
 from __future__ import annotations
 
+import json
 from contextlib import ExitStack
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock, patch
 from uuid import uuid4
 
 import pytest
@@ -23,20 +25,16 @@ from sqlalchemy import func, select
 
 from app.api import line
 from app.config import Settings
+from app.models.line_autopilot_log import LineAutopilotLog
 from app.models.line_user_state import LineUserState
 from app.models.notification_log import NotificationLog
 from app.models.patient import Patient
 from app.models.shadow_log import ShadowLog
-from tests.test_line_change_cancel_real_db import _patient, _set_state, clinic
+from app.services import autopilot_log
+from tests.test_line_change_cancel_real_db import _patient, _set_state, _state, clinic
 
 
-def _prod_switches(stack: ExitStack) -> None:
-    """本番の Render には SHADOW_MODE=true が残っている。設定の項目がまだあれば、本番と同じにする。"""
-    if "shadow_mode" in type(line.settings).model_fields:
-        stack.enter_context(patch.object(line.settings, "shadow_mode", True))
-
-
-async def _deliver(sessions, event: dict, *, autopilot_switch: bool = True, prod_switches: bool = True) -> dict:
+async def _deliver(sessions, event: dict, *, autopilot_switch: bool = True) -> dict:
     """1件のイベントを処理し、外へ出たもの（HTTP・AIの読み取り）を全部記録して返す。"""
     calls: list[str] = []
     sent: list[dict] = []
@@ -63,8 +61,6 @@ async def _deliver(sessions, event: dict, *, autopilot_switch: bool = True, prod
         stack.enter_context(patch("app.api.line.parse_line_message", new=parse))
         stack.enter_context(patch("app.api.line.merge_debounced_message", new=lambda _uid, text: text))
         stack.enter_context(patch("app.api.line.is_duplicate_message", new=lambda *_a, **_k: False))
-        if prod_switches:
-            _prod_switches(stack)
         async with sessions() as db:
             await line._dispatch_line_event(event, db)
             await db.commit()
@@ -96,7 +92,8 @@ async def _left_behind(sessions, uid: str) -> dict:
         state = (await db.execute(select(LineUserState).where(LineUserState.line_user_id == uid))).scalar_one_or_none()
         shadow = await db.scalar(select(func.count()).select_from(ShadowLog))
         notices = await db.scalar(select(func.count()).select_from(NotificationLog))
-    return {"state": state, "shadow_logs": shadow, "notifications": notices}
+        records = await db.scalar(select(func.count()).select_from(LineAutopilotLog))
+    return {"state": state, "shadow_logs": shadow, "notifications": notices, "autopilot_logs": records}
 
 
 def _assert_nothing_happened(result: dict, left: dict) -> None:
@@ -106,28 +103,38 @@ def _assert_nothing_happened(result: dict, left: dict) -> None:
     assert left["state"] is None
     assert left["shadow_logs"] == 0
     assert left["notifications"] == 0
+    assert left["autopilot_logs"] == 0
+
+
+@pytest.fixture
+def recording_on(monkeypatch):
+    """自動予約の記録（line_autopilot_logs）を、そのテストの使い捨ての院へ書くようにする。"""
+    def turn_on(sessions) -> None:
+        monkeypatch.setattr(autopilot_log, "ENABLED", True)
+        monkeypatch.setattr(autopilot_log, "session_factory", lambda: sessions)
+    return turn_on
 
 
 # ─── 自動予約の人以外 ───
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("prod_switches", [True, False], ids=["shadow-env-left-on", "shadow-env-off"])
-async def test_someone_not_on_the_system_gets_nothing(prod_switches):
-    """予約システムに紐づいていない人の「予約したい」：返信もAIも記録も通知も無い。
-    SHADOW_MODE が本番に残っていても、消してあっても同じ。"""
+async def test_someone_not_on_the_system_gets_nothing(recording_on):
+    """予約システムに紐づいていない人の「予約したい」：返信もAIも記録も通知も無い。"""
     async with clinic() as (sessions, _ids):
+        recording_on(sessions)
         uid = f"U-{uuid4().hex}"
-        result = await _deliver(sessions, _text_event(uid, "明日の10時に予約したいです"), prod_switches=prod_switches)
+        result = await _deliver(sessions, _text_event(uid, "明日の10時に予約したいです"))
         left = await _left_behind(sessions, uid)
 
     _assert_nothing_happened(result, left)
 
 
 @pytest.mark.asyncio
-async def test_a_patient_without_autopilot_gets_nothing():
+async def test_a_patient_without_autopilot_gets_nothing(recording_on):
     """予約システムに紐づいていても、自動予約を有効にしていない人には何もしない（スタッフが手で返す）。"""
     async with clinic() as (sessions, _ids):
+        recording_on(sessions)
         uid = f"U-{uuid4().hex}"
         async with sessions() as db:
             db.add(Patient(name="記録 花子", line_id=uid, line_autopilot_enabled=False))
@@ -140,9 +147,10 @@ async def test_a_patient_without_autopilot_gets_nothing():
 
 
 @pytest.mark.asyncio
-async def test_a_button_from_someone_without_autopilot_does_nothing():
+async def test_a_button_from_someone_without_autopilot_does_nothing(recording_on):
     """自動予約でない人のボタン（古い通知のボタンを含む）も、何もしない。"""
     async with clinic() as (sessions, _ids):
+        recording_on(sessions)
         uid = f"U-{uuid4().hex}"
         result = await _deliver(sessions, _postback_event(uid, "action=confirm&form=booking&answer=yes"))
         left = await _left_behind(sessions, uid)
@@ -151,24 +159,108 @@ async def test_a_button_from_someone_without_autopilot_does_nothing():
 
 
 @pytest.mark.asyncio
-async def test_with_the_autopilot_switch_off_nobody_is_answered():
+async def test_the_keyword_in_the_middle_of_a_sentence_leaves_no_record(recording_on):
+    """合言葉は、それだけを送ったときだけ本人確認の始まり。文の途中に合言葉が入っているだけの人には
+    返事をしないので、自動予約の記録にも残さない（返事は無いのに原文だけ残っていた・2026-10-18 のレビュー）。"""
+    async with clinic() as (sessions, _ids):
+        recording_on(sessions)
+        uid = f"U-{uuid4().hex}"
+        result = await _deliver(sessions, _text_event(uid, f"{line.AUTOPILOT_SETUP_KEYWORD} のことで質問です"))
+        left = await _left_behind(sessions, uid)
+
+    _assert_nothing_happened(result, left)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_mode", ["manual", "shadow_pending_admin", "shadow_drafting"])
+async def test_someone_left_in_an_old_mode_gets_nothing(old_mode):
+    """シャドーモードや古い自動返信のころの状態が残っている人（本番に 2026-10-18 時点で87人）にも、何もしない。
+    状態も書き換えない。"""
+    async with clinic() as (sessions, _ids):
+        uid = f"U-{uuid4().hex}"
+        await _set_state(sessions, uid, old_mode, {"customer_name": "記録 花子"})
+
+        result = await _deliver(sessions, _text_event(uid, "明日の10時に予約したいです"))
+        state = await _state(sessions, uid)
+
+    assert result["sent"] == []
+    assert result["calls"] == []
+    assert result["parsed"] == 0
+    assert state["mode"] == old_mode
+
+
+@pytest.mark.asyncio
+async def test_with_the_autopilot_switch_off_nobody_is_answered(recording_on):
     """自動予約の全体スイッチ（LINE_AUTOPILOT_ENABLED）を切ったら、自動予約の人にも返さない。
     切ったときに古い自動返信へ落ちない＝全体の止め方として使える。"""
     async with clinic() as (sessions, _ids):
         uid, _patient_id = await _patient(sessions)
+        recording_on(sessions)
         result = await _deliver(sessions, _text_event(uid, "明日の10時に予約したいです"), autopilot_switch=False)
         left = await _left_behind(sessions, uid)
 
     _assert_nothing_happened(result, left)
 
 
+# ─── 処理が例外で止まったとき（受け口 /webhook から通す） ───
+
+
+async def _through_the_webhook(sessions, event: dict, broken: str) -> list[str]:
+    """LINE の受け口から1件を通す。broken に指定した関数を壊して、処理を例外で止める。
+    患者へ返信（reply）を送ったかどうかを返す（管理者への知らせ＝push は数えない）。"""
+    replies: list[str] = []
+
+    async def fake_post(_client, url, **kwargs):
+        if str(url).endswith("/message/reply"):
+            replies.extend(str(m.get("text") or "") for m in (kwargs.get("json") or {}).get("messages") or [])
+        return type("Response", (), {"status_code": 200, "text": "{}", "json": lambda self: {}})()
+
+    body = json.dumps({"events": [event]}).encode()
+    request = SimpleNamespace(body=AsyncMock(return_value=body))
+    with ExitStack() as stack:
+        stack.enter_context(patch("app.api.line.settings.line_autopilot_enabled", True))
+        stack.enter_context(patch("app.api.line.settings.line_inbox_rollout", "legacy"))
+        stack.enter_context(patch("app.services.line_reply.settings.line_channel_access_token", "test-token"))
+        stack.enter_context(patch("app.api.line._verify_signature", new=Mock()))
+        stack.enter_context(patch("httpx.AsyncClient.post", new=fake_post))
+        stack.enter_context(patch("app.api.line._get_line_display_name", new=AsyncMock(return_value="記録 太郎")))
+        stack.enter_context(patch(f"app.api.line.{broken}", new=AsyncMock(side_effect=RuntimeError("db is down"))))
+        async with sessions() as db:
+            await line.line_webhook(request, db, "signature")
+    return replies
+
+
+@pytest.mark.asyncio
+async def test_an_error_sends_no_apology_to_someone_not_on_autopilot():
+    """自動予約の人かどうかを調べる途中で例外が起きても、自動予約でない人へ謝罪の返信は送らない。
+    （以前は「確認のうえ担当者からあらためてご案内いたします」が誰にでも届いた・2026-10-18 のレビュー）"""
+    async with clinic() as (sessions, _ids):
+        uid = f"U-{uuid4().hex}"
+        replies = await _through_the_webhook(sessions, _text_event(uid, "こんにちは"), "_find_line_patient")
+
+    assert replies == []
+
+
+@pytest.mark.asyncio
+async def test_an_error_still_apologizes_to_an_autopilot_patient():
+    """自動予約の人の処理が途中で例外で止まったら、これまでどおり謝罪を返す（宙に浮かせない）。"""
+    async with clinic() as (sessions, _ids):
+        uid, _patient_id = await _patient(sessions)
+        replies = await _through_the_webhook(sessions, _text_event(uid, "明日の10時に予約したいです"), "get_user_state")
+
+    assert len(replies) == 1
+    assert "申し訳" in replies[0]
+
+
 # ─── これまでどおり返事をする人 ───
 
 
 @pytest.mark.asyncio
-async def test_the_setup_keyword_still_starts_the_identity_check():
-    """合言葉 #autopilot-setup は、まだ紐づいていない人でも本人確認を始める（テストの2名を足す入口）。"""
+async def test_the_setup_keyword_still_starts_the_identity_check(recording_on):
+    """合言葉 #autopilot-setup は、まだ紐づいていない人でも本人確認を始める（テストの2名を足す入口）。
+    本人確認の途中の人として、自動予約の記録にも残す。"""
     async with clinic() as (sessions, _ids):
+        recording_on(sessions)
         uid = f"U-{uuid4().hex}"
         result = await _deliver(sessions, _text_event(uid, line.AUTOPILOT_SETUP_KEYWORD))
         left = await _left_behind(sessions, uid)
@@ -177,6 +269,7 @@ async def test_the_setup_keyword_still_starts_the_identity_check():
     assert left["state"] is not None
     assert left["state"].current_step == "autopilot_setup_name_phone"
     assert left["shadow_logs"] == 0
+    assert left["autopilot_logs"] == 1
 
 
 @pytest.mark.asyncio
@@ -203,6 +296,23 @@ async def test_an_autopilot_patient_is_still_answered():
     assert result["sent"] != []
     assert result["parsed"] >= 1
     assert left["shadow_logs"] == 0
+
+
+@pytest.mark.asyncio
+async def test_an_enabled_row_wins_when_a_line_id_is_on_two_patients():
+    """同じ LINE のIDが2人の患者に付いていても（本番は 2026-10-18 時点で0件）、自動予約を有効にした方の人として返事をする。
+    受信キューの振り分け（有効な行が1つでもあれば自動予約）と同じ判定にそろえる。"""
+    async with clinic() as (sessions, _ids):
+        uid = f"U-{uuid4().hex}"
+        async with sessions() as db:
+            db.add(Patient(name="記録 一郎", line_id=uid, line_autopilot_enabled=False))
+            await db.flush()
+            db.add(Patient(name="記録 二郎", line_id=uid, line_autopilot_enabled=True))
+            await db.commit()
+
+        result = await _deliver(sessions, _text_event(uid, "明日の10時に予約したいです"))
+
+    assert result["sent"] != []
 
 
 # ─── 本番に残る古い設定 ───

@@ -186,7 +186,8 @@ async def _begin(event: dict, db, setup_modes, setup_keyword: str | None) -> _Tu
         ).first()
         mode = state.current_step if state else None
         on_autopilot = any(enabled for _, enabled in patients)
-        in_setup = mode in setup_modes or bool(setup_keyword and received and setup_keyword in received)
+        # 合言葉は、それだけを送ったときだけ本人確認の始まり（line.py の受け口と同じ判定。正解 A8）
+        in_setup = mode in setup_modes or bool(setup_keyword and received and received.strip() == setup_keyword)
         if not on_autopilot and not in_setup:
             return None
         patient_ids = [patient_id for patient_id, _ in patients]

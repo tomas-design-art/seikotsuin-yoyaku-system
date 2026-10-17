@@ -2983,14 +2983,20 @@ async def test_autopilot_explicit_new_date_still_moves_the_day():
 
 @pytest.mark.asyncio
 async def test_webhook_failure_notifies_admin_and_replies_to_patient():
-    """例外で無言にしない。管理者へ原因を流し、患者には引き継ぎを返す。"""
-    from app.api.line import _notify_webhook_failure
+    """例外で無言にしない。管理者へ原因を流し、患者には引き継ぎを返す。
+    謝罪を返すのは、返事をする相手（自動予約の人）と決まった1通だけ（正解 A8。
+    自動予約でない人に送らないことは tests/test_line_non_autopilot_silent_real_db.py が見る）。"""
+    from app.api.line import _ANSWERING_THIS_EVENT, _notify_webhook_failure
 
     event = {"replyToken": "reply-token", "source": {"userId": "U-autopilot"}}
-    with patch("app.api.line.settings.admin_line_developer_user_id", "U-admin"), patch(
-        "app.api.line.push_message", new=AsyncMock()
-    ) as mock_push, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
-        await _notify_webhook_failure(event, ValueError("boom"))
+    answering = _ANSWERING_THIS_EVENT.set(True)
+    try:
+        with patch("app.api.line.settings.admin_line_developer_user_id", "U-admin"), patch(
+            "app.api.line.push_message", new=AsyncMock()
+        ) as mock_push, patch("app.api.line.reply_to_line", new=AsyncMock()) as mock_reply:
+            await _notify_webhook_failure(event, ValueError("boom"))
+    finally:
+        _ANSWERING_THIS_EVENT.reset(answering)
 
     assert mock_push.await_args.args[0] == "U-admin"
     assert "ValueError: boom" in mock_push.await_args.args[1]

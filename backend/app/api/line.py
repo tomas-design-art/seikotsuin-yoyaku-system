@@ -127,6 +127,9 @@ _LINE_WEBHOOK_EVENT_ID: ContextVar[str | None] = ContextVar("line_webhook_event_
 _BUTTON_ANSWER: ContextVar[dict | None] = ContextVar("line_button_answer", default=None)
 # 次に送る返信の頭に付ける一言。20分より短く言われたときの「かしこまりました」（正解 X6'）。1通ごとに空に戻す。
 _REPLY_ACK: ContextVar[str | None] = ContextVar("line_reply_ack", default=None)
+# この1通が、返事をする相手（自動予約の人・本人確認の途中の人）のものか。処理が例外で止まったときの謝罪を
+# その相手にだけ送るために使う（正解 A8：それ以外の人には何も送らない）。受け口の側で1通ごとに入れて戻す。
+_ANSWERING_THIS_EVENT: ContextVar[bool] = ContextVar("line_answering_this_event", default=False)
 _REPLY_TOKEN_MAX_AGE_SECONDS = 60
 _LINE_EVENT_WORKER_LOCK = asyncio.Lock()
 
@@ -636,8 +639,15 @@ def _is_valid_duration_for_menu(menu: Menu, duration: int) -> bool:
 
 
 async def _find_line_patient(db: AsyncSession, user_id: str) -> Patient | None:
+    """LINE の人に紐づく患者。同じIDが複数の患者に付いていたら、自動予約を有効にした方を返す
+    （受信キューの振り分けと同じ判定。順番を決めずに1件取ると、有効な人が無言になることがあった）。"""
     return (
-        await db.execute(select(Patient).where(Patient.line_id == user_id).limit(1))
+        await db.execute(
+            select(Patient)
+            .where(Patient.line_id == user_id)
+            .order_by(Patient.line_autopilot_enabled.desc(), Patient.id)
+            .limit(1)
+        )
     ).scalar_one_or_none()
 
 
@@ -3968,6 +3978,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     is_autopilot_patient = bool(line_patient and line_patient.line_autopilot_enabled)
     if not is_autopilot_patient and not await _is_in_autopilot_setup(db, user_id, text):
         return
+    _ANSWERING_THIS_EVENT.set(True)
 
     user_state = await get_user_state(db, user_id)
     if "context_data" in user_state:
@@ -6563,6 +6574,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
     actor_patient = await _find_line_patient(db, actor_user_id)
     if not (actor_patient and actor_patient.line_autopilot_enabled):
         return
+    _ANSWERING_THIS_EVENT.set(True)
 
     q = parse_qs(data_str)
     action = (q.get("action") or [""])[0]
@@ -6622,7 +6634,8 @@ async def _notify_webhook_failure(event: dict, error: Exception) -> None:
         except Exception:
             logger.exception("failed to notify admin about webhook failure")
     reply_token = event.get("replyToken")
-    if reply_token:
+    # 謝罪は、返事をする相手（自動予約の人・本人確認の途中の人）にだけ送る。それ以外の人には何も送らない（正解 A8）
+    if reply_token and _ANSWERING_THIS_EVENT.get():
         try:
             await reply_to_line(
                 reply_token,
@@ -6644,6 +6657,9 @@ async def _dispatch_line_event(event: dict, db: AsyncSession) -> None:
     button_token = _BUTTON_ANSWER.set(None)
     ack_token = _REPLY_ACK.set(None)
     try:
+        # 全体のスイッチを切ったら、記録も含めて何もしない（正解 A8）
+        if not _autopilot_is_globally_enabled():
+            return
         # LINE自動予約の記録。autopilot の人と登録の途中の人の分だけ、1通ごとに1行残す
         async with autopilot_log.recording(
             event,
@@ -6721,6 +6737,7 @@ async def process_pending_line_events(limit: int = 20) -> int:
             reply_context = _DEFERRED_REPLY_TOKEN.set(payload.get("replyToken"))
             received_at_context = _DEFERRED_REPLY_RECEIVED_AT.set(record.get("received_at"))
             used_context = _DEFERRED_REPLY_TOKEN_USED.set(False)
+            answering_context = _ANSWERING_THIS_EVENT.set(False)
             try:
                 async with async_session() as db:
                     try:
@@ -6736,6 +6753,7 @@ async def process_pending_line_events(limit: int = 20) -> int:
                             await mark_event_failed(fail_db, record["id"], f"{type(error).__name__}: {error}")
                             await fail_db.commit()
             finally:
+                _ANSWERING_THIS_EVENT.reset(answering_context)
                 _DEFERRED_REPLY_TOKEN_USED.reset(used_context)
                 _DEFERRED_REPLY_RECEIVED_AT.reset(received_at_context)
                 _DEFERRED_REPLY_TOKEN.reset(reply_context)
@@ -6773,12 +6791,15 @@ async def line_webhook(
         await db.commit()
 
     for event in legacy_events:
+        answering_context = _ANSWERING_THIS_EVENT.set(False)
         try:
             await _dispatch_line_event(event, db)
         except Exception as error:
             logger.exception("LINE webhook handler failed")
             await db.rollback()
             await _notify_webhook_failure(event, error)
+        finally:
+            _ANSWERING_THIS_EVENT.reset(answering_context)
 
     if legacy_events:
         await db.commit()

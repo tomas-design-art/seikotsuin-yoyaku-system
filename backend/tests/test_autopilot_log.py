@@ -118,6 +118,8 @@ def recording(monkeypatch):
     def _enable(sessions):
         monkeypatch.setattr(autopilot_log, "ENABLED", True)
         monkeypatch.setattr(autopilot_log, "session_factory", lambda: sessions)
+        # 本番と同じく自動予約の全体スイッチを入れる（切ってあると記録も含めて何もしない＝正解 A8）
+        monkeypatch.setattr("app.config.settings.line_autopilot_enabled", True, raising=False)
         # 送信は LINE へ出さず、成功したことにする
         monkeypatch.setattr("app.services.line_reply.settings.line_channel_access_token", "test-token")
         post = AsyncMock()

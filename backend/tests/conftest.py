@@ -28,7 +28,7 @@ def _no_outbound_line_messages(monkeypatch):
     送る中身を確かめたいテストは、テスト内でトークンを差し替えて httpx を模擬すること。
     """
     monkeypatch.setattr("app.config.settings.line_channel_access_token", "", raising=False)
-    # 開発者向けの通知（SOS・シャドー）は別のトークンで送るので、こちらも空にする
+    # 開発者向けの通知（SOS）は別のトークンで送るので、こちらも空にする
     monkeypatch.setattr("app.config.settings.line_channel_developer_access_token", "", raising=False)
 
 
