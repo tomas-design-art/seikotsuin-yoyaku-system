@@ -132,87 +132,6 @@ def _build_recovered_message(
     return "\n".join(lines)
 
 
-def build_reservation_review_flex(payload: dict) -> dict:
-    request_id = payload.get("request_id", "-")
-    line_user_id = payload.get("line_user_id") or ""
-    uid_suffix = f"&uid={line_user_id}" if line_user_id else ""
-    patient_name = payload.get("customer_name") or "不明"
-    date_str = payload.get("date") or "未抽出"
-    time_str = payload.get("time") or "未抽出"
-    menu_name = payload.get("menu_name") or "未指定"
-    availability = payload.get("availability_text") or "確認不可"
-
-    return {
-        "type": "bubble",
-        "header": {
-            "type": "box",
-            "layout": "vertical",
-            "contents": [
-                {
-                    "type": "text",
-                    "text": "LINE予約確認",
-                    "weight": "bold",
-                    "size": "lg",
-                    "color": "#ffffff",
-                }
-            ],
-            "backgroundColor": "#2563EB",
-            "paddingAll": "12px",
-        },
-        "body": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "sm",
-            "contents": [
-                {"type": "text", "text": f"患者: {patient_name}", "wrap": True},
-                {"type": "text", "text": f"希望: {date_str} {time_str}", "wrap": True},
-                {"type": "text", "text": f"メニュー: {menu_name}", "wrap": True},
-                {"type": "separator", "margin": "md"},
-                {"type": "text", "text": availability, "wrap": True, "size": "sm", "color": "#374151"},
-                {"type": "text", "text": f"RID: {request_id}", "size": "xs", "color": "#9CA3AF"},
-            ],
-        },
-        "footer": {
-            "type": "box",
-            "layout": "vertical",
-            "spacing": "sm",
-            "contents": [
-                {
-                    "type": "button",
-                    "style": "primary",
-                    "color": "#16A34A",
-                    "action": {
-                        "type": "postback",
-                        "label": "承認・確定",
-                        "data": f"action=approve_confirm&rid={request_id}{uid_suffix}",
-                        "displayText": "承認・確定",
-                    },
-                },
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "action": {
-                        "type": "postback",
-                        "label": "代替案を送る",
-                        "data": f"action=send_alternatives&rid={request_id}{uid_suffix}",
-                        "displayText": "代替案を送る",
-                    },
-                },
-                {
-                    "type": "button",
-                    "style": "secondary",
-                    "action": {
-                        "type": "postback",
-                        "label": "自分で返信",
-                        "data": f"action=manual_reply&rid={request_id}{uid_suffix}",
-                        "displayText": "自分で返信",
-                    },
-                },
-            ],
-        },
-    }
-
-
 def build_hotpepper_failure_flex(reason: str, preview: str) -> dict:
     return {
         "type": "bubble",
@@ -236,14 +155,6 @@ def build_hotpepper_failure_flex(reason: str, preview: str) -> dict:
             ],
         },
     }
-
-
-async def push_admin_reservation_review(payload: dict) -> bool:
-    if not settings.line_admin_user_id:
-        logger.warning("LINE_ADMIN_USER_ID is empty; skip admin flex push")
-        return False
-    flex = build_reservation_review_flex(payload)
-    return await push_flex_message(settings.line_admin_user_id, "LINE予約確認", flex)
 
 
 async def push_admin_hotpepper_failure(reason: str, email_body: str) -> bool:

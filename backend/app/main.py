@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
-from app.api import practitioners, patients, menus, settings, notifications, sse, reservations, hotpepper, line, auth, reservation_colors, chatbot, weekly_schedules, practitioner_schedules, patient_import, date_overrides, business_hours, web_reserve, public, shadow_logs, audit_logs
+from app.api import practitioners, patients, menus, settings, notifications, sse, reservations, hotpepper, line, auth, reservation_colors, chatbot, weekly_schedules, practitioner_schedules, patient_import, date_overrides, business_hours, web_reserve, public, audit_logs
 from app.services.hold_expiration import start_hold_expiration_job, stop_hold_expiration_job
 from app.database import async_session
 from app.services.bootstrap import initialize_database
@@ -119,7 +119,6 @@ app.include_router(date_overrides.router)
 app.include_router(business_hours.router)
 app.include_router(web_reserve.router)
 app.include_router(public.router)
-app.include_router(shadow_logs.router)
 app.include_router(audit_logs.router)
 
 

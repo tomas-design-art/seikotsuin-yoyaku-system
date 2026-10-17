@@ -140,31 +140,6 @@ async def get_user_mode(db: AsyncSession, line_user_id: str) -> str | None:
     return result.scalar_one_or_none()
 
 
-async def find_latest_pending_shadow_request(db: AsyncSession) -> tuple[str, str, dict] | None:
-    """全ユーザーを走査して最新の pending_admin 状態のシャドー予約依頼を返す。
-    戻り値: (line_user_id, request_id, request_payload) or None
-    """
-    rows = await db.execute(select(LineUserState))
-    candidates: list[tuple[str, str, dict, str]] = []
-    for state in rows.scalars().all():
-        context = _normalize_context(state.context_data)
-        requests = context.get("requests") if isinstance(context.get("requests"), dict) else {}
-        for rid, req in requests.items():
-            if not isinstance(req, dict):
-                continue
-            if req.get("status") != "pending_admin":
-                continue
-            if not req.get("shadow_mode"):
-                continue
-            updated = req.get("updated_at") or req.get("created_at") or ""
-            candidates.append((state.line_user_id, rid, dict(req), str(updated)))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda x: x[3], reverse=True)
-    uid, rid, req, _ = candidates[0]
-    return uid, rid, req
-
-
 async def get_user_state(db: AsyncSession, line_user_id: str) -> dict:
     state = await _get_or_create_state(db, line_user_id)
     context = _normalize_context(state.context_data)
