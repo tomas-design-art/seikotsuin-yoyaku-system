@@ -3786,9 +3786,19 @@ async def test_practitioner_designation_accepts_honorifics_and_full_name():
 
     for named in ("時田", "時田先生", "時田さん", "時田 太郎"):
         found = await _extract_requested_practitioner(
-            _practitioner_db(), "", {"practitioner": named}
+            _practitioner_db(), f"{named}でお願いします", {"practitioner": named}
         )
         assert found is not None and found.id == 1, named
+
+
+@pytest.mark.asyncio
+async def test_a_practitioner_the_ai_brought_from_the_context_is_not_used():
+    """文に名前が無いのに AI が返した担当（前回・いつもの の持ち込み）は、本人の指名にしない（正解 B2・2026-10-20 の実機）。"""
+    from app.api.line import _extract_requested_practitioner
+
+    assert await _extract_requested_practitioner(
+        _practitioner_db(), "40分でお願いしたい", {"practitioner": "時田"}
+    ) is None
 
 
 @pytest.mark.asyncio

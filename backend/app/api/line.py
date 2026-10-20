@@ -377,6 +377,74 @@ _MAX_STATED_DURATION = 240
 _STATED_DURATION = re.compile(r"(?<![時:：\d])(\d{2,3})\s*分(?!前|後)")
 
 
+# 施術時間を言っている言葉（「1時間」「一時間半」）。数字＋分は _STATED_DURATION が拾う
+_DURATION_WORDS = re.compile(r"[0-9０-９一二三四五六七八九十半]\s*時間")
+
+
+async def _conditions_stated_in(db: AsyncSession, text: str, parsed: dict | None) -> set[str]:
+    """この1通で本人が言った予約の条件（日付・時刻・施術時間・メニュー）。"""
+    body = unicodedata.normalize("NFKC", text or "")
+    stated: set[str] = set()
+    if _stated_duration(text, parsed):
+        stated.add("duration_minutes")
+    if (parsed or {}).get("date") and _mentions_explicit_date(text):
+        stated.add("date")
+    if (parsed or {}).get("time") and re.search(r"\d\s*(?:時|:)", body):
+        stated.add("time")
+    if await _menu_named_in_text(db, text) is not None:
+        stated.add("menu_id")
+    return stated
+
+
+def _booking_conditions_changed(request_data: dict | None, draft: dict | None, *, stated: set[str]) -> bool:
+    """確認中の予約と、いまの箱で、本人が言い直した条件（日付・時刻・施術時間・メニュー）が変わったか。"""
+    if not stated or not request_data or not draft or not request_data.get("start_time_iso"):
+        return False
+    try:
+        start = datetime.fromisoformat(request_data["start_time_iso"])
+    except (TypeError, ValueError):
+        return False
+    asked = {
+        "date": start.date().isoformat(),
+        "time": start.strftime("%H:%M"),
+        "duration_minutes": request_data.get("duration_minutes"),
+        "menu_id": request_data.get("menu_id"),
+    }
+    return any(
+        draft.get(key) not in (None, "") and str(draft.get(key)) != str(asked[key])
+        for key in stated
+    )
+
+
+def _stated_duration(text: str, parsed: dict | None) -> int | None:
+    """本人がこの1通で言った施術時間。
+
+    AIの読み取りの分数は、文に施術時間の言葉（「40分」「1時間」）があるときだけ使う。AIは前回・いつもの
+    分数を文脈から入れてくることがあり、10/20 の実機では「来週の月曜日午前中」で入った60分が、
+    先に言った40分を上書きした（正解 C8①・B2）。
+    """
+    said = _extract_duration_minutes(text)
+    if said:
+        return said
+    ai_minutes = (parsed or {}).get("duration_minutes")
+    if ai_minutes and _DURATION_WORDS.search(unicodedata.normalize("NFKC", text or "")):
+        return int(ai_minutes)
+    return None
+
+
+def _menu_hint_said(hint: str, text: str) -> bool:
+    """AIが院のメニューに当てはめた名前が、この1通の言葉から来ているか（正解 C13・B2）。
+
+    言い方が違ってもよい（「産後のケア」→産ケア、「パーソナル」→パーソナライズ）ので、名前と本文が
+    2文字以上つながって重なるか、「自費」「保険」の言葉がそのメニューの側と合うかで見る。
+    AIは前回・いつもの メニューを文脈から入れてくることがある（10/20 の実機：「40分でお願いしたい」で
+    マッスルセラピーが入った）。言葉の無いメニューは、本人が言ったことにしない。
+    """
+    name = unicodedata.normalize("NFKC", hint or "")
+    body = unicodedata.normalize("NFKC", text or "")
+    return any(name[i:i + 2] in body for i in range(len(name) - 1))
+
+
 def _extract_duration_minutes(text: str) -> int | None:
     """患者が述べた施術時間を取り出す。
 
@@ -1785,6 +1853,19 @@ async def _menu_side(db: AsyncSession, menu: Menu | None) -> str | None:
     return None
 
 
+async def _menu_kind_word_matches(db: AsyncSession, hint: str, text: str) -> bool:
+    """「自費で」「保険で」と言われ、AIが当てはめたメニューがその側（自費／保険）なら、言葉から来たとみなす。"""
+    body = unicodedata.normalize("NFKC", text or "")
+    words = [("自費", "self"), ("保険", "insurance")]
+    sides = {side for word, side in words if word in body}
+    if not sides:
+        return False
+    menu = (
+        await db.execute(select(Menu).where(Menu.is_active == True, Menu.name == hint).limit(1))  # noqa: E712
+    ).scalar_one_or_none()
+    return menu is not None and await _menu_side(db, menu) in sides
+
+
 async def _menu_for_kind_and_minutes(db: AsyncSession, kind: str, minutes: int) -> Menu | None:
     """自費診療＝マッスルセラピー。保険診療＝15分なら保険診療、それより長ければ保険延長（正解 C10）。"""
     if kind == "self":
@@ -2901,7 +2982,7 @@ async def _merge_autopilot_slots(
     parsed: dict,
     menu_kind: str | None = None,
 ) -> dict:
-    stated_duration = parsed.get("duration_minutes") or _extract_duration_minutes(text)
+    stated_duration = _stated_duration(text, parsed)
     update = {
         "customer_name": patient.name,
         "date": parsed.get("date"),
@@ -2925,6 +3006,14 @@ async def _merge_autopilot_slots(
     if update["date"] and previous.get("date") and not _mentions_explicit_date(text):
         update["date"] = previous["date"]
     menu_hint = parsed.get("menu_name") or parsed.get("menu_hint")
+    if (
+        menu_hint
+        and menu_hint not in {"usual", previous.get("menu_name")}
+        and not _menu_hint_said(str(menu_hint), text)
+        and not await _menu_kind_word_matches(db, str(menu_hint), text)
+    ):
+        # この1通に言葉の無いメニュー（前回・いつもの の持ち込み）は使わない（正解 B2・C13）
+        menu_hint = None
     named_menu = None if menu_kind else await _menu_named_in_text(db, text)
     # 保険診療を選んで、施術時間を聞いている途中（分数が分かったら保険診療か保険延長かを決める）
     pending_kind = (
@@ -3035,6 +3124,30 @@ async def _merge_autopilot_slots(
                 "assumed_practitioner": False,
             }
         )
+
+    # 保険診療（15分固定）で、本人が15分より長い分数を言った → 保険延長・その分数（正解 C17・C10）。
+    # 以前は「保険診療40分」が保険診療の15分で計算された（10/20 23:02〜 の実機で3回）。
+    # 確認の途中で分数だけ言い直されたとき（メニューは前の箱）も同じ
+    if stated_duration:
+        current_menu_id = update.get("menu_id") or (None if "menu_id" in drop else previous.get("menu_id"))
+        current_menu = await db.get(Menu, int(current_menu_id)) if current_menu_id else None
+        if (
+            current_menu is not None
+            and not current_menu.is_duration_variable
+            and int(stated_duration) > int(current_menu.duration_minutes or 0)
+            and await _menu_side(db, current_menu) == "insurance"
+        ):
+            longer = await _menu_for_kind_and_minutes(db, "insurance", int(stated_duration))
+            if longer is not None and longer.id != current_menu.id:
+                update.update(
+                    {
+                        "menu_id": longer.id,
+                        "menu_name": longer.name,
+                        "duration_minutes": int(stated_duration),
+                        "menu_explicit": True,
+                        "assumed_menu": False,
+                    }
+                )
 
     # 施術時間が分からないなら、前に入っていた分数（別のメニューの分数・登録値）も捨てる
     if duration_unknown:
@@ -3410,12 +3523,18 @@ async def _extract_requested_practitioner(
         if p.name
     ]
 
-    # ① 解析結果の指名。名字の完全一致だけを採る（推測で別人に紐づけない）。
+    # ① 解析結果の指名。名前（どの部分でも）の完全一致だけを採る（推測で別人に紐づけない）。
+    # さらに、その名前か「院長」がこの1通にあるときだけ採る。AIは前回・いつもの 担当を文脈から
+    # 入れてくることがある（10/20 の実機：「40分でお願いしたい」で時田が入り、上田の確認から担当が消えた・B2）
     named = (parsed or {}).get("practitioner")
+    body = unicodedata.normalize("NFKC", text or "")
     if isinstance(named, str) and named.strip():
         wanted = re.sub(r"(?:先生|さん|様)$", "", named.strip())
         for p in practitioners:
-            if wanted and wanted in {p.name, p.name.split()[0]}:
+            parts = {p.name, *p.name.split()}
+            if not wanted or wanted not in parts:
+                continue
+            if any(part in body for part in parts) or ("院長" in body and getattr(p, "role", None) == "院長"):
                 return p
 
     # ② 取りこぼし用。名字の直後に指名の合図が続く形だけを拾う。
@@ -4374,7 +4493,17 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             ):
                 return
 
-    if current_mode == "autopilot_booking_confirm":
+    # 確認の途中で条件を言い直された（「40分でお願いしたい」「11時で」）。同じ確認を出し直さず、下の予約の処理で
+    # 新しい条件で探し直して確認し直す（正解 C17・C8。10/20 の実機：「40分でお願いしたい」に 10:15 の確認を出し直した）。
+    # 比べるのは、この1通で本人が言った条件だけ（言っていない箱の値と確認中の予約のずれで、確認が進まなくならないように）
+    restated_booking = False
+    if current_mode == "autopilot_booking_confirm" and merged is not None and user_state.get("request_id"):
+        restated_booking = _booking_conditions_changed(
+            await get_request(db, user_state.get("request_id"), line_user_id=user_id),
+            merged,
+            stated=await _conditions_stated_in(db, text, parsed_intent),
+        )
+    if current_mode == "autopilot_booking_confirm" and not restated_booking:
         request_id = user_state.get("request_id")
         request_data = await get_request(db, request_id, line_user_id=user_id) if request_id else None
         if (parsed_intent or {}).get("intent") == "change" or _has_change_intent(text):
