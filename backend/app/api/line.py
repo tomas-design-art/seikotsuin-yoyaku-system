@@ -6244,6 +6244,15 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         request_id,
     )
     await set_user_mode(db, user_id, "adjusting", request_id)
+    # 言われた時刻に空いていなかったら、何時が・誰が空いていないかを、候補の前に伝える（正解 D14・まことさん
+    # 2026-10-21）。10/20 23:05 の実機：「明日10時」で時田が空いていないことを書かずに 13:20 時田・10:00 上田 を出した。
+    # 「午後」のような時間帯の言い方では、時刻は言われていないので書かない
+    unavailable = {}
+    if not practitioner and not _has_vague_time_period(text):
+        stamp = f"{_format_date_with_weekday_jp(target_date)} {target_time.strftime('%H:%M')}"
+        unavailable = {
+            "unavailable_note": f"{stamp}〜は{await _practitioner_label(db, candidate_practitioner_id)}空きがございません。"
+        }
     if reply_token:
         await _reply_offer(
             reply_token,
@@ -6259,6 +6268,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                     "first_visit_note": first_visit_note,
                     "patient_message": text,
                     **_preferred_practitioner_context(merged or prev_draft, alternatives),
+                    **unavailable,
                 },
                 parsed_intent,
             ),

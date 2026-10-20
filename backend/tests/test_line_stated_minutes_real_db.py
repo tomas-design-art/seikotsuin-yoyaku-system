@@ -171,3 +171,29 @@ async def test_a_practitioner_said_in_the_message_is_still_used(text):
 
     expected = ids["tokita"] if "院長" in text else ids["ueda"]
     assert state["draft"]["practitioner_id"] == expected
+
+
+# ─── 言われた時刻に、希望の担当が空いていないとき（D14） ───
+
+
+@pytest.mark.asyncio
+async def test_the_requested_time_being_taken_for_the_wanted_practitioner_is_said_before_the_choices():
+    """「明日10時に時田先生で」：時田の10時が埋まっていたら、候補の前に「10:00〜は時田の空きがございません」と伝える
+    （正解 D14・まことさん 2026-10-21。10/20 23:05 の実機では書かずに 13:20 時田・10:00 上田 を出した）。"""
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _usual_is_muscle_with_tokita(sessions, ids, patient_id, menus)
+        await _reserve(sessions, None, ids["tokita"], day, "10:00", 60)  # ほかの患者さんの予約で時田の10時が埋まっている
+
+        sent, _ = await say(
+            sessions, uid, "明日10時に保険診療で時田先生で予約したい",
+            {"intent": "new", "date": day.isoformat(), "time": "10:00", "menu_name": "保険診療", "practitioner": "時田"},
+        )
+        state = await _state(sessions, uid)
+
+    text = _text(sent)
+    assert state["mode"] == "adjusting"
+    assert "10:00〜は" in text and "時田" in text and "空きがございません" in text, text
+    assert text.index("空きがございません") < text.index("1."), "候補より前に伝えていない"
