@@ -416,6 +416,21 @@ def _booking_conditions_changed(request_data: dict | None, draft: dict | None, *
     )
 
 
+def _shown_minutes(draft: dict, mode: str | None) -> int | None:
+    """いま患者さんに見せている施術時間（確認中の選んだ枠の長さ・出してある候補の長さ）。"""
+    if mode == "autopilot_slot_confirm":
+        picked = draft.get("autopilot_picked_slot") or {}
+        try:
+            start = datetime.strptime(str(picked["start"]), "%H:%M")
+            end = datetime.strptime(str(picked["end"]), "%H:%M")
+        except (KeyError, ValueError):
+            return None
+        return int((end - start).total_seconds() // 60)
+    offer = draft.get("autopilot_offer") or {}
+    minutes = offer.get("duration_minutes") or draft.get("autopilot_offer_duration")
+    return int(minutes) if minutes else None
+
+
 def _stated_duration(text: str, parsed: dict | None) -> int | None:
     """本人がこの1通で言った施術時間。
 
@@ -4410,14 +4425,18 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     # ここを idle 系のモードに限っていたため、候補提示中に何を言われても
     # スロットが更新されず、会話が進むほど埋まらなくなっていた（2026-09-04 実機）。
     if (
-        current_mode in {
-            "idle",
-            "waiting_menu",
-            "waiting_datetime",
-            "waiting_time_duration",
-            "adjusting",
-            "autopilot_booking_confirm",
-        }
+        (
+            current_mode in {
+                "idle",
+                "waiting_menu",
+                "waiting_datetime",
+                "waiting_time_duration",
+                "adjusting",
+                "autopilot_booking_confirm",
+            }
+            # 選んだ枠の確認中は、施術時間を言い直されたときだけ箱へ入れる（「施術時間は40分にして」・10/21 0:58 の実機）
+            or (current_mode == "autopilot_slot_confirm" and _stated_duration(text, parsed_intent))
+        )
         and (
             # メニューのボタン（保険診療／自費診療／相談したい）は、AIの読み取りに関係なく箱へ入れる
             button_menu_kind
@@ -4437,6 +4456,19 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             parsed=parsed_intent,
             menu_kind=button_menu_kind,
         )
+
+    # 候補を出した後・選んだ枠の確認中に、施術時間（メニュー）を言い直された（「施術時間は40分にして」）。
+    # 出してある候補・選んだ枠は前の施術時間のものなので、そのまま出し直さない（正解 C17・C8・D8。
+    # 10/21 0:58 の実機：2回言っても15分の候補・確認を出し直し、別の枠を選ぶと「直前に埋まりました」になった）
+    minutes_restated = False
+    if (
+        merged is not None
+        and current_mode in {"adjusting", "autopilot_slot_confirm"}
+        and merged.get("duration_minutes")
+        and (await _conditions_stated_in(db, text, parsed_intent)) & {"duration_minutes", "menu_id"}
+    ):
+        shown = _shown_minutes(prev_draft, current_mode)
+        minutes_restated = bool(shown) and int(merged["duration_minutes"]) != int(shown)
 
     # 候補提示中に担当を名指しされたら、それも条件変更として扱って探し直す。
     # 黙って同じ候補を出し直すと指名が無視されたまま同じ人が並び続ける
@@ -4463,7 +4495,11 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     # 提示済み候補への条件変更（もっと早く/短くてもいい/別の日 等）は手動退避せず再検索する。
     negotiation_filters = build_slot_filters(parsed_intent.get("constraints"))
-    if negotiation_filters.has_condition or practitioner_changed:
+    if (
+        negotiation_filters.has_condition
+        or practitioner_changed
+        or (minutes_restated and current_mode == "adjusting")
+    ):
         negotiation_state = {
             "draft": merged or prev_draft,
             "request_id": user_state.get("request_id"),
@@ -4604,7 +4640,23 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             )
         return
 
-    if current_mode == "autopilot_slot_confirm":
+    if current_mode == "autopilot_slot_confirm" and minutes_restated:
+        # 選んだ枠の開始・担当はそのままに、新しい施術時間で探し直して確認する（下の予約の処理へ進む。
+        # 空いていなければ「◯:◯〜は（担当）の空きがございません」のあとに候補＝D14）
+        picked = prev_draft.get("autopilot_picked_slot") or {}
+        merged = await merge_user_draft(
+            db,
+            user_id,
+            {
+                "date": picked.get("date") or merged.get("date"),
+                "time": picked.get("start") or merged.get("time"),
+                "practitioner_id": picked.get("practitioner_id") or merged.get("practitioner_id"),
+                "practitioner_name": picked.get("practitioner_name") or merged.get("practitioner_name"),
+                "autopilot_picked_slot": {},
+            },
+            user_state.get("request_id"),
+        )
+    if current_mode == "autopilot_slot_confirm" and not minutes_restated:
         picked = prev_draft.get("autopilot_picked_slot")
         if not isinstance(picked, dict):
             await set_user_mode(db, user_id, "waiting_datetime", user_state.get("request_id"))

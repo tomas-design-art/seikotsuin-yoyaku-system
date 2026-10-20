@@ -22,7 +22,7 @@ import pytest
 
 from app.utils.datetime_jst import JST
 from tests.test_line_change_buttons_real_db import _reserve, _setup
-from tests.test_line_change_cancel_real_db import _at, _day, _patient, _state, clinic
+from tests.test_line_change_cancel_real_db import _at, _buttons, _day, _patient, _state, clinic
 from tests.test_line_confirm_and_buttons_real_db import _text, press, say
 from tests.test_line_menu_real_db import _reservations
 
@@ -197,3 +197,68 @@ async def test_the_requested_time_being_taken_for_the_wanted_practitioner_is_sai
     assert state["mode"] == "adjusting"
     assert "10:00〜は" in text and "時田" in text and "空きがございません" in text, text
     assert text.index("空きがございません") < text.index("1."), "候補より前に伝えていない"
+
+
+# ─── 候補を出した後・選んだ枠の確認中に、施術時間を言い直された（10/21 0:58 の実機） ───
+
+
+async def _offer_morning_insurance_with_ueda(sessions, uid: str, day) -> list[dict]:
+    """「明後日も午前中に保険診療、上田先生で予約したい」→ 保険診療15分の候補（上田）が出ている。"""
+    sent, _ = await say(
+        sessions, uid, "続けて、明後日も午前中に保険診療、上田先生で予約したい",
+        {"intent": "new", "date": day.isoformat(), "time": "10:00", "menu_name": "保険診療", "practitioner": "上田",
+         "duration_minutes": 15, "constraints": ["window:09:00-12:00", "duration:15"]},
+    )
+    return sent
+
+
+@pytest.mark.asyncio
+async def test_saying_40_minutes_while_choices_are_shown_reoffers_40_minute_choices():
+    """15分の候補を出した後の「施術時間は40分にして」：15分の候補を出し直さず、40分（保険延長）で探し直して出す。
+    （10/21 0:58 の実機：2回言っても15分の候補のまま。選ぶと「10:00〜10:15 保険延長」の確認になった）"""
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _usual_is_muscle_with_tokita(sessions, ids, patient_id, menus)
+        await _offer_morning_insurance_with_ueda(sessions, uid, day)
+        assert (await _state(sessions, uid))["draft"]["autopilot_offer"]["duration_minutes"] == 15
+
+        sent, _ = await say(sessions, uid, "施術時間は40分にして", {"intent": "new", "duration_minutes": 40, **_CARRIED_OVER})
+        state = await _state(sessions, uid)
+
+    offer = state["draft"]["autopilot_offer"]
+    assert state["mode"] == "adjusting"
+    assert offer["duration_minutes"] == 40
+    assert state["draft"]["menu_name"] == "保険延長"
+    assert all(c.get("practitioner_id") == ids["ueda"] for c in offer["candidates"][:1]), offer["candidates"]
+    assert "10:15〜" not in _text(sent), _text(sent)
+
+
+@pytest.mark.asyncio
+async def test_saying_40_minutes_while_confirming_a_picked_slot_reconfirms_that_start_with_40_minutes():
+    """10:00 上田（15分）を選んで確認中の「施術時間は40分にして」：選んだ開始はそのまま、10:00〜10:40 上田 保険延長で確認し直す。
+    「はい」で40分の予約ができる（以前は15分の確認を出し直し、別の枠で「直前に埋まりました」になった）。"""
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        menus = await _setup(sessions)
+        await _usual_is_muscle_with_tokita(sessions, ids, patient_id, menus)
+        offered = await _offer_morning_insurance_with_ueda(sessions, uid, day)
+        await press(sessions, uid, offered, _buttons(offered)[0]["label"])  # 1番目＝10:00 上田（15分）
+        assert (await _state(sessions, uid))["mode"] == "autopilot_slot_confirm"
+
+        sent, _ = await say(sessions, uid, "施術時間は40分にして", {"intent": "new", "duration_minutes": 40, **_CARRIED_OVER})
+        state = await _state(sessions, uid)
+        before_yes = await _reservations(sessions, patient_id)
+        await press(sessions, uid, sent, "はい")
+        booked = [r for r in await _reservations(sessions, patient_id) if r.start_time.astimezone(JST) == _at(day, "10:00")]
+
+    assert state["mode"] == "autopilot_booking_confirm", state["mode"]
+    assert "10:00〜10:40" in _text(sent), _text(sent)
+    assert "上田" in _text(sent) and "保険延長" in _text(sent)
+    assert len(before_yes) == 1, "確認の前に予約が作られた"
+    assert len(booked) == 1
+    assert _minutes(booked[0]) == 40
+    assert booked[0].menu_id == menus["extension"]
+    assert booked[0].practitioner_id == ids["ueda"]
