@@ -53,7 +53,7 @@ class Reservation(Base):
     series = relationship("ReservationSeries", back_populates="reservations", lazy="selectin")
 
 
-# ── 予約を動かしたら、RPA に「新しい押さえ」として渡し直す（2026-09-17 まことさん仕様）──
+# ── 予約を動かしたら、RPA に「新しい押さえ」として渡し直す（2026-09-17 オーナー仕様）──
 #
 # 予約を別の時間・担当に動かすと、ボード上は空いていた枠に新しく押さえた状態になる。これを
 # サロンボードへも押さえ直す。古い枠の削除は手作業（RPA にキャンセルはさせない）。

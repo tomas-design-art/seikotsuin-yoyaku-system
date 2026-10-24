@@ -1,7 +1,7 @@
 """LINE自動予約：変える所をボタンで選ぶ変更・施術時間だけの変更・メニューの保険診療／自費診療／相談・20分の下限を、
-本物の PostgreSQL と実際のメッセージ処理で固定する（正解 F6 F7 F8 H3 C9〜C12 X6'・まことさん 2026-10-07）。
+本物の PostgreSQL と実際のメッセージ処理で固定する（正解 F6 F7 F8 H3 C9〜C12 X6'・オーナー 2026-10-07）。
 
-きっかけ＝2026-10-07 14:33〜 のまことさんの実機テスト。金曜16:30〜17:30（60分）を「30分にしてほしい」と
+きっかけ＝2026-10-07 14:33〜 のオーナーの実機テスト。金曜16:30〜17:30（60分）を「30分にしてほしい」と
 4回言っても短くできなかった（変更の処理が元の予約の長さで計算し直していた）。確認の「いいえ」ボタンは
 AIの「会話をやめるか」の判定に回って手続きごと終わり、同じ時刻への「変更」に「変更しました」と返していた。
 
@@ -207,7 +207,7 @@ async def test_lengthening_without_room_offers_nearby_slots_of_the_new_length():
 
 @pytest.mark.asyncio
 async def test_changing_the_duration_of_insurance_15_switches_to_insurance_extension():
-    """保険診療（15分固定）の予約で施術時間が変わったら、保険延長に切り替える（まことさん 2026-10-07 夕方）。"""
+    """保険診療（15分固定）の予約で施術時間が変わったら、保険延長に切り替える（オーナー 2026-10-07 夕方）。"""
     async with clinic() as (sessions, ids):
         day = _day()
         uid, patient_id = await _patient(sessions)
@@ -564,7 +564,7 @@ async def test_the_self_pay_button_with_a_self_pay_usual_uses_the_usual_menu_and
 @pytest.mark.asyncio
 @pytest.mark.parametrize("said, minutes, menu", [("15分で", 15, "保険診療"), ("30分で", 30, "保険延長")])
 async def test_the_insurance_button_is_split_by_the_minutes(said, minutes, menu):
-    """保険診療＝15分なら保険診療、それより長ければ保険延長（まことさん 2026-10-07）。前回は自費（別の側）。"""
+    """保険診療＝15分なら保険診療、それより長ければ保険延長（オーナー 2026-10-07）。前回は自費（別の側）。"""
     async with clinic() as (sessions, ids):
         uid, patient_id = await _patient(sessions)
         menus = await _setup(sessions)
@@ -799,7 +799,7 @@ async def test_halving_after_the_duration_button_keeps_the_start():
     assert state["draft"]["autopilot_change_end_time_iso"].startswith(f"{day.isoformat()}T17:00")
 
 
-# ─── F11・F3：「予約/変更」「変更」の入口（まことさん 2026-10-13・10/8 8:50 の実機） ───
+# ─── F11・F3：「予約/変更」「変更」の入口（オーナー 2026-10-13・10/8 8:50 の実機） ───
 
 
 @pytest.mark.asyncio

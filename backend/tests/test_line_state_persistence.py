@@ -152,7 +152,7 @@ async def test_request_update_is_kept_when_other_writes_follow_in_the_same_event
 
 @pytest.mark.asyncio
 async def test_finishing_a_booking_forgets_the_conversation_but_not_todays_greeting():
-    """予約確定・キャンセル確定では会話の記憶を消す（まことさん決定）。
+    """予約確定・キャンセル確定では会話の記憶を消す（オーナー決定）。
 
     ただし挨拶をした日は残す。消すと、確定直後の「キャンセルしたい」に
     その日二度目の挨拶が付く。

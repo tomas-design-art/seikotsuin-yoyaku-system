@@ -192,7 +192,7 @@ def _offer_plan(context: dict) -> ReplyPlan | None:
             keep.append(f"{start}〜")
 
     # 候補が3つだけだと「ここしか空いていない」と受け取られるので、ほかの時間も
-    # 選べることを伝える（正解 D5・まことさん 2026-10-07）。空いているとは言わない（事実が無いので）。
+    # 選べることを伝える（正解 D5・オーナー 2026-10-07）。空いているとは言わない（事実が無いので）。
     keep.append("ほかのお時間")
     return ReplyPlan(
         facts=facts,

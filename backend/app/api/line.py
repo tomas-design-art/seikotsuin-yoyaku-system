@@ -287,7 +287,7 @@ _NEW_BOOKING_MODES = {
     "autopilot_confirm_previous",
 }
 _CANCEL_MODES = {"autopilot_cancel_select", "autopilot_cancel_confirm"}
-# 押して選ぶボタンは3つまで（正解 D11・まことさん 2026-10-07）。
+# 押して選ぶボタンは3つまで（正解 D11・オーナー 2026-10-07）。
 _MAX_CHOICE_BUTTONS = 3
 _CONVERSATION_TIMEOUT = timedelta(hours=1)
 # 「はい/いいえ」の意味をコードが解釈する場面。ここでは質問文をLLMに決めさせない。
@@ -517,7 +517,7 @@ async def _previous_visit_for_booking(db: AsyncSession, latest: dict | None) -> 
 
     - 予約の入り口のメニュー（ホットペッパー・ホームページ）は引き継がない（正解 C14）
     - 前回がホットペッパーからの予約なら自費診療（マッスルセラピー）で受け、施術時間は決めつけずに
-      確かめる印を付ける（正解 C15・まことさん 2026-10-07：院が いつもの を決めるまでは）
+      確かめる印を付ける（正解 C15・オーナー 2026-10-07：院が いつもの を決めるまでは）
     - 前回が「ホームページ」（ホームページ予約の新規）なら、その60分も使わない。初回の60分は
       カウンセリングを含む枠で、施術時間ではない。メニューも施術時間も空にして、何分かを聞く（正解 C16）
     """
@@ -544,7 +544,7 @@ async def _get_patient_default_preset(db: AsyncSession, patient: Patient | None)
         return None
     if getattr(patient, "line_autopilot_enabled", False) and is_channel_menu_name(menu.name):
         # 予約の入り口のメニュー（ホットペッパー・ホームページ）は LINE の自動予約とは関係がないので、
-        # いつもの にしない（正解 C14・まことさん 2026-10-07）
+        # いつもの にしない（正解 C14・オーナー 2026-10-07）
         return None
     duration = getattr(patient, "default_duration", None) or menu.duration_minutes
     practitioner_id = None
@@ -648,7 +648,7 @@ async def _build_menu_quick_reply_items(
 ) -> list[dict]:
     """メニューを聞くときのボタン。
 
-    自動予約の人（正解 C9・まことさん 2026-10-07）：いつもの がある人は［⭐️いつもの］［保険診療］［自費診療］［相談したい］、
+    自動予約の人（正解 C9・オーナー 2026-10-07）：いつもの がある人は［⭐️いつもの］［保険診療］［自費診療］［相談したい］、
     いつもの が無いリピーターは後ろの3つ。初回の人にはメニューを聞かない（ボタン無し）。
     院のメニューを全部は並べない（ホットペッパーのような患者さんに見せないものまで出る・数が多いと横に送る）。
     患者さんはメニューの中身までは覚えていないので、保険か自費か・相談かの大きな分け方で受ける
@@ -1028,7 +1028,7 @@ def _cancel_confirmation_plan(reservation: Reservation, remaining: int = 0) -> R
 async def _apply_daily_greeting(reply: str) -> str:
     """関係性の挨拶（「いつも当院をご利用いただき…」）は、その日のうち最初の1通だけ。
 
-    普通、人は「いつもありがとうございます」を1日に何度も言わない（2026-09-15 まことさん）。
+    普通、人は「いつもありがとうございます」を1日に何度も言わない（2026-09-15 オーナー）。
     挨拶した日は会話履歴とは別に持つので、予約確定・キャンセル確定で履歴を消しても
     その日のうちに二度目は出ない。
 
@@ -1794,7 +1794,7 @@ async def _reply_with_loop_guard(
     return False
 
 
-# 変更で「どこを変えるか」のボタン（正解 F7・まことさん 2026-10-07）
+# 変更で「どこを変えるか」のボタン（正解 F7・オーナー 2026-10-07）
 _CHANGE_ITEMS = (
     ("datetime", "日時を変更したい"),
     ("duration", "施術時間を変更したい"),
@@ -1931,7 +1931,7 @@ async def _resolve_change_minutes(
 ) -> tuple[int, dict | None]:
     """変更で言われた施術時間を、予約に入れてよい分数にする。メニューを切り替えるならその中身も返す。
 
-    - 保険診療（15分固定）で施術時間が変わったら保険延長に切り替える（まことさん 2026-10-07）
+    - 保険診療（15分固定）で施術時間が変わったら保険延長に切り替える（オーナー 2026-10-07）
     - 固定のメニューより短くはしない（保険診療は15分のまま）
     - 時間を選べるメニュー・メニュー無しは、20分より短く言われたら「かしこまりました」とだけ返して20分（正解 X6'）
     """
@@ -2249,7 +2249,7 @@ async def _offer_practitioner_choice(
     reply_token: str | None,
     reservation: Reservation,
 ) -> None:
-    """担当の変更。今の担当を除いた施術者をボタンで出す（まことさん 2026-10-07）。"""
+    """担当の変更。今の担当を除いた施術者をボタンで出す（オーナー 2026-10-07）。"""
     others = (
         await db.execute(
             select(Practitioner)
@@ -3189,7 +3189,7 @@ async def _merge_autopilot_slots(
             if preview.get(key) in (None, "") and update.get(key) in (None, ""):
                 update[key] = value
 
-    # 20分より短い施術は予約しない（正解 X6'：20分を1枠・まことさん 2026-10-07）。
+    # 20分より短い施術は予約しない（正解 X6'：20分を1枠・オーナー 2026-10-07）。
     # 本人が短く言ったときは「かしこまりました」とだけ返し、20分で探す。固定のメニュー（保険診療15分）はそのまま
     duration_now = update.get("duration_minutes") or (None if "duration_minutes" in drop else previous.get("duration_minutes"))
     if duration_now:
@@ -3270,7 +3270,7 @@ async def _usual_minutes_for_menu(
     patient: Patient | None,
     menu: Menu,
 ) -> int | None:
-    """「いつもの」か前回の予約が同じメニューなら、その分数（正解 C8・まことさん 2026-10-07）。
+    """「いつもの」か前回の予約が同じメニューなら、その分数（正解 C8・オーナー 2026-10-07）。
 
     別のメニューの分数は使わない（前回が保険診療15分の人のマッスルセラピーを15分にしない）。
     「いつもの」に分数が登録されていなければメニューの登録値になるが、時間を選べるメニューでは
@@ -3744,7 +3744,7 @@ def _duration_question_plan(menu_name: str | None = None) -> ReplyPlan:
 
 
 def _late_notice_plan(reservation_count: int) -> ReplyPlan:
-    """遅刻の連絡への返事（正解 I4・まことさん 2026-10-07）。
+    """遅刻の連絡への返事（正解 I4・オーナー 2026-10-07）。
 
     ちょっとした遅れはただの連絡（施術時間でスタッフが調整する）。後の予約が詰まっていれば
     施術時間が短くなる場合があることと、大きく遅れるならお時間の変更をこのチャットで受けられることを伝える。
@@ -3773,7 +3773,7 @@ async def _handoff_autopilot_to_human(
     parsed_intent: dict | None,
     notification: str,
 ) -> None:
-    """自動予約がうまくいかなかったとき（正解 I1〜I3・まことさん 2026-10-07）。
+    """自動予約がうまくいかなかったとき（正解 I1〜I3・オーナー 2026-10-07）。
 
     - 1回目：「理解できなかった場合、お手数ですが最初からやり直してください」と案内し、会話を最初からにする
     - 2回目：丁寧に謝って「医院に直接お電話ください」と案内する（数え直す）
@@ -4102,7 +4102,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
 
     # 返事をするのは、自動予約の人と、合言葉で本人確認を始めた人（途中の人を含む）だけ。
     # それ以外の人には何もしない（返信・AI・プロフィールの取得・会話の状態・記録・通知なし）。
-    # スタッフが公式アカウントの画面から手で返す。シャドーモードはここで閉じた（まことさん 2026-10-17）。
+    # スタッフが公式アカウントの画面から手で返す。シャドーモードはここで閉じた（オーナー 2026-10-17）。
     # 全体のスイッチを切ったときも同じで、古い自動返信には落ちない。
     if not _autopilot_is_globally_enabled():
         return
@@ -4235,7 +4235,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             await _start_change_from_entry(db, user_id=user_id, reply_token=reply_token, reservations=upcoming)
             return
         if trigger == "予約/変更" and upcoming:
-            # 予約がある人には、新しい予約か今の予約の変更かを聞く（正解 F11・まことさん 2026-10-13）
+            # 予約がある人には、新しい予約か今の予約の変更かを聞く（正解 F11・オーナー 2026-10-13）
             plan = ReplyPlan(
                 ask="新しくご予約されますか、それとも今のご予約を変更されますか？",
                 ask_about="ご予約",
@@ -4398,7 +4398,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             # 遅刻の連絡や相談など、人が受けるべき内容。院長のLINEへの通知を待たせて
             # 宙に浮かせない（正解 I3）。失敗ではないので回数には数えない。
             # 予約がある人には、まず「お時間の変更はこのチャットで承れます」と案内し、
-            # 予約が1件ならその変更を受けられる状態にする。それ以外の相談は電話（まことさん 2026-10-07）。
+            # 予約が1件ならその変更を受けられる状態にする。それ以外の相談は電話（オーナー 2026-10-07）。
             await reset_user_conversation(db, user_id, reason="needs_human")
             upcoming = await _find_upcoming_reservations(db, line_patient.id)
             is_late_notice = bool(_LATE_NOTICE.search(text or ""))
@@ -5195,7 +5195,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
             return
         # 遅刻の連絡への案内のあと、日時を言わない返事（「了解です」「急ぎます」）は、ただの連絡として
-        # 終える。日時を聞き返し続けない（まことさん 2026-10-07：ちょっとした遅れはただの事務連絡）。
+        # 終える。日時を聞き返し続けない（オーナー 2026-10-07：ちょっとした遅れはただの事務連絡）。
         if (
             prev_draft.get("autopilot_change_opened_by") == "late_notice"
             and not parsed.get("date")
@@ -5496,7 +5496,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
             return
         # 「いつものでよろしいですか」に別のメニューを言われた（言い方が違ってもよい）。
-        # いつものではなく、そのメニューで進む。以前は聞き直していた（正解 C13・まことさん 2026-10-07）
+        # いつものではなく、そのメニューで進む。以前は聞き直していた（正解 C13・オーナー 2026-10-07）
         other_menu = await _menu_named_by_patient(db, text, parsed_intent, current_menu_id=preset["menu_id"])
         # 確認しているのはメニューであって枠ではない。同じ文に日時が入っていても
         # 「別の希望」とは読まない（下でその日時を拾う）。
@@ -5880,7 +5880,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             },
         )
 
-    # メニューは予約の必須条件にしない（正解 C7・まことさん 2026-10-07）。患者さんはメニュー名を知らない。
+    # メニューは予約の必須条件にしない（正解 C7・オーナー 2026-10-07）。患者さんはメニュー名を知らない。
     # 施術時間が分かっていれば（初回は60分・いつもの・前回・本人が言った）メニュー無しで進め、
     # メニューはスタッフが後から入れる（電話予約と同じ・2026-04-14 の決定）。
     # 以前はメニューが空だと聞き返して止まり、初回の人はメニューのボタンでしか先へ進めなかった。
@@ -5909,7 +5909,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 await reply_to_line(reply_token, await _polished_from_plan(_duration_question_plan(menu.name)))
             return
 
-    # リピーターには最初に「いつものメニューでよろしいでしょうか」と確認する（正解 C2・まことさん 2026-09-16）。
+    # リピーターには最初に「いつものメニューでよろしいでしょうか」と確認する（正解 C2・オーナー 2026-09-16）。
     # 以前は登録上のいつもの（メニュー・担当）を黙って埋めて進んでいた。本人がメニューを言った・
     # 「いつもの」を押した・一度はいと答えた後は聞かない。言われた日時は draft に残っている。
     if (
@@ -5937,7 +5937,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                 )
             return
 
-    # 前回がホットペッパーからの予約の人は、施術時間を決めつけずに確かめる（正解 C15・まことさん 2026-10-07）
+    # 前回がホットペッパーからの予約の人は、施術時間を決めつけずに確かめる（正解 C15・オーナー 2026-10-07）
     if merged.get(_PREVIOUS_MINUTES_KEY) and merged.get("duration_minutes"):
         await set_user_mode(db, user_id, "autopilot_confirm_previous", user_state.get("request_id"))
         await _reply_plan(reply_token, "previous", _previous_minutes_plan(int(merged["duration_minutes"])))
@@ -6001,7 +6001,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         window_start_min=slot_filters.window_start_min,
                         window_end_min=slot_filters.window_end_min,
                         max_results=3,
-                        # いつもの担当の枠を先頭に出す（2026-09-16 まことさん）
+                        # いつもの担当の枠を先頭に出す（2026-09-16 オーナー）
                         preferred_first=True,
                     )
                     candidates = [candidate.to_dict() for candidate in scored]
@@ -6217,7 +6217,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
             exclude_weekdays=slot_filters.exclude_weekdays,
             max_results=3,
             search_days=1,
-            # いつもの担当・指名の担当の枠を先頭に出す（2026-09-16 まことさん）
+            # いつもの担当・指名の担当の枠を先頭に出す（2026-09-16 オーナー）
             preferred_first=True,
         )
         alternatives = [s.to_dict() for s in scored]
@@ -6264,7 +6264,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     )
 
     if practitioner:
-        # 空いていても、毎回「◯/◯ 10:00〜 担当でよろしいですか」と確認してから取る（正解 D13・まことさん 2026-10-17：
+        # 空いていても、毎回「◯/◯ 10:00〜 担当でよろしいですか」と確認してから取る（正解 D13・オーナー 2026-10-17：
         # 復唱による互いの確認）。以前は、前回の予約があり、AIの読み取りの自信が high で、登録から補った条件が
         # 無いと、確認なしで予約を作っていた（備考「LINE AI秘書 高確信即時確定」）。確認を挟むかをAIの自己申告で決めていた。
         await update_request(db, request_id, line_user_id=user_id, status="awaiting_patient_confirmation")
@@ -6296,7 +6296,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
         request_id,
     )
     await set_user_mode(db, user_id, "adjusting", request_id)
-    # 言われた時刻に空いていなかったら、何時が・誰が空いていないかを、候補の前に伝える（正解 D14・まことさん
+    # 言われた時刻に空いていなかったら、何時が・誰が空いていないかを、候補の前に伝える（正解 D14・オーナー
     # 2026-10-21）。10/20 23:05 の実機：「明日10時」で時田が空いていないことを書かずに 13:20 時田・10:00 上田 を出した。
     # 「午後」のような時間帯の言い方では、時刻は言われていないので書かない
     unavailable = {}
@@ -6705,7 +6705,7 @@ async def _handle_postback(event: dict, db: AsyncSession):
     if not data_str:
         return
 
-    # ボタンも、自動予約の人のものだけ受ける（文字のメッセージと同じ。まことさん 2026-10-17）
+    # ボタンも、自動予約の人のものだけ受ける（文字のメッセージと同じ。オーナー 2026-10-17）
     if not _autopilot_is_globally_enabled() or not actor_user_id:
         return
     actor_patient = await _find_line_patient(db, actor_user_id)
