@@ -236,7 +236,7 @@ def test_each_offer_gets_its_own_id():
 def test_a_kanji_number_is_treated_as_a_choice(text, expected):
     """フリック入力では「2」のつもりが「二」になる。
 
-    2026-09-08 まことさん指摘: 入力は人間の指なので、タップ次第で十分起こりうる。
+    2026-09-08 オーナー指摘: 入力は人間の指なので、タップ次第で十分起こりうる。
     """
     assert offered_slots.selected_index(text) == expected
 

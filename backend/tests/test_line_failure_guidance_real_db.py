@@ -1,6 +1,6 @@
 """LINE自動予約：うまくいかなかったときの案内（正解 I1 I2 I3 X4）を、本物の PostgreSQL で固定する。
 
-まことさん 2026-10-07:
+オーナー 2026-10-07:
   - 1回目は「理解できなかった場合、お手数ですが最初からやり直してください」を入れる
   - 電話は失敗2回目。丁寧に謝罪し「医院に直接お電話ください」と案内する
   - 院長のLINEへの引き継ぎはメッセージだと気づかないことがあるので頼らない（宙に浮かせない）
@@ -131,7 +131,7 @@ LATE = {"intent": "other", "needs_human": True, "has_reservation_intent": False}
 async def test_a_late_notice_says_the_treatment_may_be_shorter_and_the_time_can_be_changed_in_the_chat():
     """「遅れそうです」：ご連絡のお礼＋後の予約の状況で施術時間が短くなる場合があること＋
     お時間の変更はこのチャットで承れること。ちょっとした遅れはただの連絡なので電話は求めない
-    （まことさん 2026-10-07）。予約が1件なら、その変更を受けられる状態にしておく。"""
+    （オーナー 2026-10-07）。予約が1件なら、その変更を受けられる状態にしておく。"""
     async with clinic() as (sessions, ids):
         uid, patient_id = await _patient(sessions)
         own = await _book(sessions, patient_id, ids["tokita"], _day(), "13:00")

@@ -1,7 +1,7 @@
 """add the consult color (相談（当日決定）・水色)
 
 LINE自動予約で「相談したい」を選んだ予約（メニューは当日スタッフと決める）の色を足す
-（正解の一覧 C11・まことさん 2026-10-07：緑と青の間の水色）。LINE の処理は色コード #38bdf8 で探す
+（正解の一覧 C11・オーナー 2026-10-07：緑と青の間の水色）。LINE の処理は色コード #38bdf8 で探す
 （app.models.reservation_color.CONSULT_COLOR_CODE）。同じ色コードの色がすでにあれば足さない。
 
 Revision ID: 032_line_consult_color

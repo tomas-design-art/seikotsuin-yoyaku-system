@@ -131,7 +131,7 @@ async def test_choosing_a_menu_by_name_does_not_ask_about_the_usual_menu():
     assert state["draft"]["menu_name"] == menus["extension"]
 
 
-# ─── C13：言い方が違うメニューの名前・「いつものでよろしいですか」の最中の別のメニュー（まことさん 2026-10-07） ───
+# ─── C13：言い方が違うメニューの名前・「いつものでよろしいですか」の最中の別のメニュー（オーナー 2026-10-07） ───
 
 
 async def _paraphrased_menus(sessions) -> None:
@@ -210,7 +210,7 @@ async def test_a_paraphrased_menu_name_in_a_new_booking_is_the_clinic_menu():
 
 
 # ─── C14：予約の入り口のメニュー（ホームページ・ホットペッパー）は、LINE で患者さんが選べるメニューに入れない ───
-# まことさん 2026-10-07：「LINE からの自動予約とは全く関係がないので、そちらのメニューに行かないように」。
+# オーナー 2026-10-07：「LINE からの自動予約とは全く関係がないので、そちらのメニューに行かないように」。
 # 予約システムのメニューとしては残す（消さない）。
 
 
@@ -283,7 +283,7 @@ async def test_a_channel_menu_registered_as_the_usual_is_not_offered_as_the_usua
     assert state["draft"].get("menu_name") not in CHANNEL_NAMES
 
 
-# ─── C15：前回がホットペッパーからの予約 ＝ 自費診療（マッスルセラピー）・施術時間は決めつけずに確かめる（まことさん 2026-10-07） ───
+# ─── C15：前回がホットペッパーからの予約 ＝ 自費診療（マッスルセラピー）・施術時間は決めつけずに確かめる（オーナー 2026-10-07） ───
 
 
 async def _previous_hotpepper_visit(sessions, ids) -> tuple[str, dict]:
@@ -357,7 +357,7 @@ async def test_minutes_said_by_the_patient_are_not_asked_again(text, parse):
     assert state["draft"]["duration_minutes"] == 60
 
 
-# ─── C16：前回が「ホームページ」（HP予約の新規）＝ 前回の60分は施術時間ではない。何分かを聞く（まことさん 2026-10-07） ───
+# ─── C16：前回が「ホームページ」（HP予約の新規）＝ 前回の60分は施術時間ではない。何分かを聞く（オーナー 2026-10-07） ───
 
 
 @pytest.mark.asyncio
@@ -411,13 +411,13 @@ async def _reserve_past(sessions, patient_id: int, practitioner_id: int, menu_id
         await db.commit()
 
 
-# ─── D7・D11・C9：院のメニューはボタンで並べない。メニューのボタンは「⭐️いつもの」と保険／自費／相談だけ（まことさん 2026-10-07） ───
+# ─── D7・D11・C9：院のメニューはボタンで並べない。メニューのボタンは「⭐️いつもの」と保険／自費／相談だけ（オーナー 2026-10-07） ───
 
 
 @pytest.mark.asyncio
 async def test_the_menu_question_does_not_list_the_clinic_menus():
     """メニューを全部ボタンで並べない（ホットペッパー等も出てしまう・スクロールが要る＝D7）。
-    ボタンは「⭐️いつもの」と、保険診療／自費診療／相談したい の大きな分け方だけ（C9・まことさん 2026-10-07 に
+    ボタンは「⭐️いつもの」と、保険診療／自費診療／相談したい の大きな分け方だけ（C9・オーナー 2026-10-07 に
     「⭐️いつもの」だけから変更。ボタンの「保険診療」は院のメニューの保険診療（15分固定）とは別の、保険の側を選ぶボタン）。"""
     async with clinic() as (sessions, ids):
         uid, patient_id = await _patient(sessions)
@@ -457,7 +457,7 @@ async def test_the_minimum_duration_for_automatic_booking_is_20_minutes_by_defau
             assert await clinic_context.get_autopilot_min_duration(db) == 20
 
 
-# ─── C7：メニューは予約の必須条件にしない（まことさん 2026-10-07） ───
+# ─── C7：メニューは予約の必須条件にしない（オーナー 2026-10-07） ───
 
 
 @pytest.mark.asyncio
@@ -507,7 +507,7 @@ async def test_the_booking_menu_for_a_first_visit_patient_asks_for_a_date_not_a_
     assert _buttons(sent) == []
 
 
-# ─── C8：時間を選べるメニューの名前だけを言われたときの施術時間（まことさん 2026-10-07） ───
+# ─── C8：時間を選べるメニューの名前だけを言われたときの施術時間（オーナー 2026-10-07） ───
 #
 # 可変メニューの menus.duration_minutes は刻み・最小値（本番のマッスルセラピーは10分）。
 # 以前はメニュー名を言われるとその値を施術時間に入れていたため、10分刻みの候補が出て、

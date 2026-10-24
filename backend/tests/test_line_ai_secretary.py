@@ -1066,7 +1066,7 @@ async def test_autopilot_cancel_failure_replies_and_keeps_confirmation_active():
 
 @pytest.mark.asyncio
 async def test_autopilot_change_without_details_asks_what_to_change_and_keeps_conversation_active():
-    """何を変えるか言わない変更は、日時を聞き返さずに、変える所をボタンで聞く（正解 F7・まことさん 2026-10-07。
+    """何を変えるか言わない変更は、日時を聞き返さずに、変える所をボタンで聞く（正解 F7・オーナー 2026-10-07。
     以前は日時を聞いていた）。会話は変更の途中のまま。"""
     from app.api.line import _handle_text_message
 
@@ -1821,7 +1821,7 @@ async def test_autopilot_usual_button_still_fills_slots():
 
 @pytest.mark.asyncio
 async def test_autopilot_full_natural_message_is_repeated_back_before_booking():
-    """日時・メニュー・担当がそろった文でも、確認なしで予約を作らない（正解 D13・まことさん 2026-10-17）。
+    """日時・メニュー・担当がそろった文でも、確認なしで予約を作らない（正解 D13・オーナー 2026-10-17）。
     以前はこのテストが「AIの自信が high なら確認なしで作る」を固定していた。"""
     from app.api.line import _handle_text_message
     from app.utils.datetime_jst import JST
