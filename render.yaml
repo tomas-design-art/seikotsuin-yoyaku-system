@@ -85,6 +85,6 @@ services:
     startCommand: node server.js
     envVars:
       - key: NODE_VERSION
-        value: "22.23.4"
+        value: "24.22.1" # frontend/package.json の engines と同じ
       - key: VITE_API_BASE_URL
         sync: false
