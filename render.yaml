@@ -85,6 +85,6 @@ services:
     startCommand: node server.js
     envVars:
       - key: NODE_VERSION
-        value: "20"
+        value: "22.23.4"
       - key: VITE_API_BASE_URL
         sync: false
