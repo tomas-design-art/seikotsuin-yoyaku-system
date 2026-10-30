@@ -27,3 +27,8 @@ nginx/ssl/*
 *.pptx
 *.docx
 *.pdf
+*.xlsx
+
+# テストや評価の出力はリポジトリに入れない
+test_output.txt
+eval-*.txt
