@@ -22,3 +22,8 @@ nginx/ssl/*.key
 nginx/ssl/*
 !nginx/ssl/.gitkeep
 *.log
+
+# 院長向けの資料などはリポジトリに入れない（プログラムが使わないため・手元に置く）
+*.pptx
+*.docx
+*.pdf
