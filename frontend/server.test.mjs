@@ -2,12 +2,16 @@
 // 本物の API の代わりに、受け取った中身をそのまま返す小さなサーバーを立てて確かめる。
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { createApp, normalizeUpstream } from './server.js';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 
 const BASIC = 'Basic ' + Buffer.from('staff:long-test-password').toString('base64');
 const received = [];
@@ -170,4 +174,41 @@ test('API の住所は、末尾の / や /api が付いていてもオリジン�
     assert.equal(normalizeUpstream('https://api.example.test/api').href, 'https://api.example.test/');
     assert.equal(normalizeUpstream('https://api.example.test/api/').href, 'https://api.example.test/');
     assert.equal(normalizeUpstream(''), null);
+});
+
+async function freePort() {
+    const probe = http.createServer();
+    const port = await listen(probe);
+    await new Promise((resolve) => probe.close(resolve));
+    return port;
+}
+
+// 本番（Render）と同じく `node server.js` で起動して、画面を返すこと。
+// 中継の設定がまだ無い（いまの本番）ときも、画面は今まで通り開ける。dist は `npm run build` で作られる
+test('`node server.js` で起動し、中継の設定が無くても画面を返す', async () => {
+    assert.ok(fs.existsSync(path.join(HERE, 'dist', 'index.html')), '先に npm run build を実行する');
+    const port = await freePort();
+    const child = spawn(process.execPath, ['server.js'], {
+        cwd: HERE,
+        env: { ...process.env, BASIC_AUTH_USER: 'staff', BASIC_AUTH_PASSWORD: 'long-test-password', PORT: String(port), API_UPSTREAM_URL: '', INTERNAL_API_KEY: '' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    try {
+        await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => reject(new Error('10秒たっても起動しなかった')), 10000);
+            child.stdout.on('data', (chunk) => {
+                if (String(chunk).includes('listening')) {
+                    clearTimeout(timer);
+                    resolve();
+                }
+            });
+            child.on('exit', (code) => reject(new Error(`起動せずに終わった（code ${code}）`)));
+        });
+        const page = await fetch(`http://127.0.0.1:${port}/`, { headers: { Authorization: BASIC } });
+        assert.equal(page.status, 200);
+        const locked = await fetch(`http://127.0.0.1:${port}/`);
+        assert.equal(locked.status, 401);
+    } finally {
+        child.kill();
+    }
 });

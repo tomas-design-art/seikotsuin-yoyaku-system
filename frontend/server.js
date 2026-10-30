@@ -18,7 +18,7 @@ import http from 'node:http';
 import https from 'node:https';
 import path from 'node:path';
 import fs from 'node:fs';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -244,6 +244,17 @@ function main() {
     });
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+// `node server.js`（npm start）で起動されたときだけ待ち受ける。テストから読み込んだときは起動しない。
+// フォルダに別名（シンボリックリンク）があっても見分けられるよう、実体のパスで比べる。
+function isRunDirectly() {
+    if (!process.argv[1]) return false;
+    try {
+        return fs.realpathSync(process.argv[1]) === fs.realpathSync(fileURLToPath(import.meta.url));
+    } catch {
+        return false;
+    }
+}
+
+if (isRunDirectly()) {
     main();
 }
