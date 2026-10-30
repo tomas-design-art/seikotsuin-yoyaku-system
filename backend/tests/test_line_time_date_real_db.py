@@ -1,4 +1,4 @@
-"""LINE自動予約：時刻・日付の受け方と空きの伝え方（正解 D3 D4 D5 D9 D10 D11 E2 E3）を、
+"""LINE自動予約：時刻・日付の受け方と空きの伝え方（正解 D3 D4 D5 D9 D10 D11 E2 E3 E5）を、
 本物の PostgreSQL と実際のメッセージ処理で固定する。
 
 2026-09-28 の院長の実機テスト（前半）で、
@@ -8,7 +8,7 @@
 
 見るのは返信の文面ではなく、提示した候補（会話の状態）と予約ボード。
 AIの読み取りだけは「正しく読めた」ときの値に固定する。
-「1日」の2つ（E2・E3）は、メッセージを受け取った日時も固定する（テストを回した日で答えが変わらないように）。
+「1日」のテスト（E2・E3・E5）は、メッセージを受け取った日時も固定する（テストを回した日で答えが変わらないように）。
 """
 from __future__ import annotations
 
@@ -82,6 +82,19 @@ async def _booking_in_progress(
     }
     await _set_state(sessions, uid, "adjusting", draft)
     return {"menu_id": menu_id}
+
+
+async def _waiting_for_a_day(sessions, uid: str, ids: dict) -> None:
+    """新しい予約の途中。メニューと担当は決まり、日の話はまだしていない。"""
+    menu_id, menu_name = await _menu(sessions)
+    draft = {
+        "menu_id": menu_id,
+        "menu_name": menu_name,
+        "duration_minutes": 60,
+        "practitioner_id": ids["tokita"],
+        "practitioner_name": TOKITA,
+    }
+    await _set_state(sessions, uid, "waiting_datetime", draft)
 
 
 def _text(sent: list[dict]) -> str:
@@ -215,22 +228,51 @@ async def test_saying_1st_while_talking_about_the_1st_means_that_day():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("received", "talking_day", "first"),
+    ("received", "talking_day"),
     [
-        # E2 の例の日付（「10月1日(木)のことですか？」）。受け取りは 9/28、話している日は 9/30（1日ではない）
-        (_jst(2026, 9, 28), date(2026, 9, 30), date(2026, 10, 1)),
+        # オーナーの例（E5）：10/30 に 11/29 の話をしている。11/1 でも 12/1 でもなく、11/29 のこと
+        (_jst(2026, 10, 30), date(2026, 11, 29)),
+        # 9/28 に 9/30 の話をしている。10/1 を聞き返さず、9/30 の空きを出す
+        (_jst(2026, 9, 28), date(2026, 9, 30)),
+    ],
+    ids=["owner-example-1129", "talking-0930"],
+)
+async def test_saying_1_nichi_while_talking_about_a_day_asks_whether_that_whole_day_is_full(received, talking_day):
+    """予約を取ろうとしている日の話の途中の「1日空いてない？」は、その日が一日じゅう埋まっているか
+    という質問（いちにち・E5）。聞き返さず、その日の空いている時間を候補で出す。"""
+    async with clinic() as (sessions, ids):
+        uid, _patient_id = await _patient(sessions)
+        await _booking_in_progress(sessions, uid, ids, talking_day, ["12:00", "13:00", "14:00"])
+
+        with _received_at(received):
+            sent = await send(sessions, uid, "1日空いてない？", {"intent": "question"})
+            state = await _state(sessions, uid)
+
+    assert state["mode"] == "adjusting"
+    assert state["draft"]["autopilot_offer"]["offer_id"] != "offer-before"
+    candidates = state["draft"]["autopilot_offer"]["candidates"]
+    assert candidates and all(c["date"] == talking_day.isoformat() for c in candidates)
+    assert 1 <= len(_buttons(sent)) <= 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("received", "first"),
+    [
+        # E2 の例の日付（「10月1日(木)のことですか？」）。受け取りは 9/28
+        (_jst(2026, 9, 28), date(2026, 10, 1)),
         # 月末：次の1日は2日後の 11/1(日)（2026-10-30 の CI で落ちた日）
-        (_jst(2026, 10, 30), date(2026, 10, 30), date(2026, 11, 1)),
+        (_jst(2026, 10, 30), date(2026, 11, 1)),
     ],
     ids=["owner-example-0928", "month-end-1030"],
 )
-async def test_an_ambiguous_1st_is_confirmed_before_offering(received, talking_day, first):
-    """話している日が1日（ついたち）でないときの「1日空いてない？」は、
+async def test_an_ambiguous_1st_is_confirmed_before_offering(received, first):
+    """まだ日の話をしていないときの「1日空いてない？」は、流れから決められないので
     「◯月1日(◯)のことですか？」と聞き返し、「はい」でその日の候補を出す（E2）。
     聞き返す1日は、メッセージを受け取った日から数えて次の1日（E1）。"""
     async with clinic() as (sessions, ids):
         uid, _patient_id = await _patient(sessions)
-        await _booking_in_progress(sessions, uid, ids, talking_day, ["12:00", "13:00", "14:00"])
+        await _waiting_for_a_day(sessions, uid, ids)
 
         with _received_at(received):
             asked = await send(sessions, uid, "1日空いてない？", {"intent": "question"})
