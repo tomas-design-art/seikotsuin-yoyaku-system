@@ -56,7 +56,20 @@ async def lifespan(app: FastAPI):
 
 from app.config import settings as app_settings_early
 
-app = FastAPI(title=app_settings_early.app_title, version="1.0.0", lifespan=lifespan)
+
+def docs_urls(environment: str) -> dict:
+    """本番では API の説明ページ（/docs・/redoc・/openapi.json）を出さない。"""
+    if environment == "production":
+        return {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    return {"docs_url": "/docs", "redoc_url": "/redoc", "openapi_url": "/openapi.json"}
+
+
+app = FastAPI(
+    title=app_settings_early.app_title,
+    version="1.0.0",
+    lifespan=lifespan,
+    **docs_urls(app_settings_early.environment),
+)
 
 
 @app.exception_handler(RequestValidationError)
@@ -99,6 +112,12 @@ app.add_middleware(
 from app.middlewares.rpa_call_log import RpaCallLogMiddleware  # noqa: E402
 
 app.add_middleware(RpaCallLogMiddleware)
+
+# API の入口の鍵。最後に足す＝いちばん外側で、ほかの処理より先に確かめる
+from app.middlewares.api_access import ApiAccessMiddleware, warn_if_misconfigured  # noqa: E402
+
+app.add_middleware(ApiAccessMiddleware)
+warn_if_misconfigured(app_settings)
 
 app.include_router(practitioners.router)
 app.include_router(patients.router)
