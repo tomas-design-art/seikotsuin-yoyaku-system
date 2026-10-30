@@ -4348,12 +4348,13 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     ):
         return
 
-    # 「1日空いてない？」の「1日」（正解 E2・E3）。話している日が1日（ついたち）なら、その日のこと。
-    # そうでなければ「◯/1(◯)のことでしょうか？」と聞き返す。AIの読み取りには任せない。
+    # 「1日空いてない？」の「1日」（正解 E2・E3・E5）。予約を取ろうとしている日の話の途中なら、その日のこと
+    # （その日が1日なら「ついたち」、そうでなければ「一日じゅう」）。聞き返さず、その日の空きを出す。
+    # 日の話をしていなければ流れから決められないので「◯/1(◯)のことでしょうか？」と聞き返す。AIの読み取りには任せない。
     if (current_mode in _NEW_BOOKING_MODES or current_mode in {None, "idle"}) and current_mode != "autopilot_date_confirm" and _mentions_bare_first_day(text):
         today = now_jst().date()
-        discussed = _parse_iso_date(prev_draft.get("date"))
-        if discussed and discussed.day == 1 and discussed >= today:
+        discussed = _parse_iso_date(prev_draft.get("date")) if current_mode in _NEW_BOOKING_MODES else None
+        if discussed and discussed >= today:
             await _offer_booking_day(
                 db,
                 user_id=user_id,
