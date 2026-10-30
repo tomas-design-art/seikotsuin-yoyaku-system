@@ -1,11 +1,14 @@
 """API の入口の鍵（画面サーバー経由・オーナーの判断 2026-10-30）。
 
-API を呼んでよいのは次の4つだけ。それ以外は、強さが enforce のとき 401 で断る。
+API を呼んでよいのは次の5つだけ。それ以外は、強さが enforce のとき 401 で断る。
 
 - スタッフの画面を配るサーバー（frontend/server.js・入口のログインの後ろ）：X-Internal-Key。
   API の全部に通す（口ごとのログイン・暗証番号・管理者の確認は今まで通り別にかかる）。
 - ホームページのサーバー：X-Homepage-Key。公開の口（/api/public/*）とホームページの予約だけ。
 - HotPepper の RPA：Authorization: Bearer <RPA の合言葉>。RPA が使う3つの口だけ。
+- 日計表のツール：Authorization: Bearer <日計表の合言葉>。予約の一覧を読むこと（GET）だけ。
+  RPA（.env の SOURCE_AUTH_TOKEN）も日計表のツール（config.yaml の auth_token）も、もともと
+  設定の値を Bearer で送る作り。院のパソコンでは設定の値を入れるだけで、プログラムは直さない。
 - 合言葉なし：死活確認と LINE の Webhook（署名で確かめる）だけ。
 
 強さ（settings.api_access_mode）
@@ -34,6 +37,7 @@ _RPA_PATHS = (
     re.compile(r"^/api/hotpepper/reconcile-queue$"),
     re.compile(r"^/api/hotpepper/[^/]+/mark-synced$"),
 )
+_DAILY_REPORT_PATH = "/api/reservations"
 
 
 def _same(given: str | None, expected: str) -> bool:
@@ -62,6 +66,9 @@ def decide(method: str, path: str, headers: Mapping[str, str], settings: Any) ->
             return True
     if any(pattern.match(path) for pattern in _RPA_PATHS):
         if _same(_bearer(headers), settings.rpa_api_key):
+            return True
+    if method == "GET" and path == _DAILY_REPORT_PATH:
+        if _same(_bearer(headers), settings.daily_report_api_key):
             return True
     return False
 

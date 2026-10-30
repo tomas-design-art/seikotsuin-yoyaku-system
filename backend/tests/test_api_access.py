@@ -1,11 +1,14 @@
 """API の入口の鍵（画面サーバー経由・オーナーの判断 2026-10-30）。
 
 API は、スタッフの画面を配るサーバー（入口のログインの後ろ）が中継したときだけ通す。
-そのサーバーは合言葉（X-Internal-Key）を付けて呼ぶ。ほかに外から呼ぶのは次の3つだけで、
+そのサーバーは合言葉（X-Internal-Key）を付けて呼ぶ。ほかに外から呼ぶのは次の4つだけで、
 それぞれ自分の合言葉で、決めた口にだけ通す。
 
 - ホームページのサーバー：X-Homepage-Key。空き枠・公開メニュー・ホームページの予約だけ。
 - HotPepper の RPA：Authorization: Bearer <RPA の合言葉>。RPA が使う3つの口だけ。
+- 日計表のツール：Authorization: Bearer <日計表の合言葉>。予約の一覧を読むこと（GET）だけ。
+  RPA も日計表のツールも、もともと設定ファイルの値を Bearer で送る作り＝プログラムは直さず、
+  設定の値を1つ入れるだけで済む（オーナーの判断 2026-10-31：ローカルで作業が要る変更は困る）。
 - LINE：Webhook（署名で確かめる）。合言葉は要らない。
 
 切り替えで止まらないよう、強さは3段階（open＝今まで通り／report＝通すが記録する／
@@ -24,6 +27,7 @@ from app.middlewares.api_access import ApiAccessMiddleware, decide
 INTERNAL = "internal-key-for-tests"
 HOMEPAGE = "homepage-key-for-tests"
 RPA = "rpa-key-for-tests"
+DAILY = "daily-report-key-for-tests"
 
 
 @pytest.fixture
@@ -31,6 +35,7 @@ def keys(monkeypatch):
     monkeypatch.setattr(app_settings, "internal_api_key", INTERNAL, raising=False)
     monkeypatch.setattr(app_settings, "homepage_api_key", HOMEPAGE, raising=False)
     monkeypatch.setattr(app_settings, "rpa_api_key", RPA, raising=False)
+    monkeypatch.setattr(app_settings, "daily_report_api_key", DAILY, raising=False)
 
 
 def _decide(method: str, path: str, headers: dict[str, str] | None = None) -> bool:
@@ -99,6 +104,20 @@ def test_the_rpa_key_opens_only_the_three_rpa_paths(keys):
     # 種類が違う口の合言葉では開かない
     assert not _decide("GET", "/api/hotpepper/pending-sync", {"X-Homepage-Key": HOMEPAGE})
     assert not _decide("GET", "/api/public/menus", rpa)
+
+
+def test_the_daily_report_key_opens_only_reading_the_reservation_list(keys):
+    # 日計表のツールは config.yaml の auth_token を Bearer で送り、予約の一覧を日付で読む
+    daily = {"Authorization": f"Bearer {DAILY}"}
+    assert _decide("GET", "/api/reservations/", daily)
+    assert _decide("GET", "/api/reservations", daily)
+    assert not _decide("POST", "/api/reservations/", daily)
+    assert not _decide("GET", "/api/reservations/12", daily)
+    assert not _decide("PUT", "/api/reservations/12", daily)
+    assert not _decide("GET", "/api/patients/", daily)
+    assert not _decide("GET", "/api/hotpepper/pending-sync", daily)
+    # RPA の合言葉では予約の一覧は開かない（上のテスト）。逆も同じ
+    assert not _decide("GET", "/api/reservations/", {"Authorization": f"Bearer {RPA}"})
 
 
 # ─── 強さの3段階（ASGI のミドルウェアとして） ───

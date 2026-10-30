@@ -58,6 +58,7 @@ class Settings(BaseSettings):
     internal_api_key: str = ""  # スタッフの画面を配るサーバー（frontend/server.js）が付ける合言葉
     homepage_api_key: str = ""  # ホームページのサーバーが付ける合言葉
     rpa_api_key: str = ""  # HotPepper の RPA が Authorization: Bearer で付ける合言葉
+    daily_report_api_key: str = ""  # 日計表のツールが Authorization: Bearer で付ける合言葉
 
     class Config:
         env_file = str(_ENV_FILE)
