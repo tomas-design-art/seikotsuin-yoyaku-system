@@ -300,13 +300,15 @@ _CODE_OWNED_QUESTION_SITUATIONS = {
 
 
 def _verify_signature(body: bytes, signature: Optional[str]):
-    if settings.line_channel_secret and settings.line_channel_secret != "xxx":
-        if not signature:
-            raise HTTPException(status_code=400, detail="署名がありません")
-        hash_val = hmac.new(settings.line_channel_secret.encode(), body, hashlib.sha256).digest()
-        expected = base64.b64encode(hash_val).decode()
-        if expected != signature:
-            raise HTTPException(status_code=403, detail="署名が不正です")
+    # 署名の鍵が無いときは、確かめようがないので受け付けない（素通しにしない）
+    if not settings.line_channel_secret or settings.line_channel_secret == "xxx":
+        raise HTTPException(status_code=403, detail="署名を確かめられません")
+    if not signature:
+        raise HTTPException(status_code=400, detail="署名がありません")
+    hash_val = hmac.new(settings.line_channel_secret.encode(), body, hashlib.sha256).digest()
+    expected = base64.b64encode(hash_val).decode()
+    if not hmac.compare_digest(expected.encode("utf-8"), signature.encode("utf-8")):
+        raise HTTPException(status_code=403, detail="署名が不正です")
 
 
 async def _get_setting(db: AsyncSession, key: str, default: str = "") -> str:

@@ -158,6 +158,8 @@ export default function SystemSettings() {
               maxLength={s.key === 'staff_pin' ? 4 : undefined}
               inputMode={s.key === 'staff_pin' ? 'numeric' : undefined}
               pattern={s.key === 'staff_pin' ? '\\d{4}' : undefined}
+              // 今のPINは画面に返さない。変えるときだけ新しい4桁を入れる
+              placeholder={s.key === 'staff_pin' ? '変えるときだけ新しい4桁を入力' : undefined}
               className="flex-1 border rounded px-3 py-2 text-sm"
             />
             <button

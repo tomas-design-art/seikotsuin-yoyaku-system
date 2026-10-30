@@ -45,12 +45,25 @@ const api = axios.create({
 
 const OPERATOR_STORAGE_KEY = 'operator';
 
+// 同じオリジンの /api（画面を配る server.js・開発時は vite が中継）へ送るときは、
+// Authorization を入口のログイン（Basic 認証）が使うので、トークンは X-Auth-Token で送る。
+// 中継する側が API へ渡すときに Authorization: Bearer に直す。
+const VIA_SCREEN_SERVER = baseURL.startsWith('/');
+
+function setAuthToken(headers: Record<string, unknown>, token: string) {
+  if (VIA_SCREEN_SERVER) {
+    headers['X-Auth-Token'] = token;
+  } else {
+    headers.Authorization = `Bearer ${token}`;
+  }
+}
+
 // Auth interceptor
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('auth_token');
   const operator = localStorage.getItem(OPERATOR_STORAGE_KEY)?.trim();
   if (token) {
-    config.headers.Authorization = `Bearer ${token}`;
+    setAuthToken(config.headers, token);
   }
   if (operator) {
     // X-Operator は非ASCII（日本語）を含む可能性があるため URL エンコードして送る
@@ -80,7 +93,7 @@ api.interceptors.response.use(
         original._retry = true;
         localStorage.removeItem('admin_token');
         localStorage.setItem('auth_token', staffToken);
-        original.headers.Authorization = `Bearer ${staffToken}`;
+        setAuthToken(original.headers, staffToken);
         // useAuth に role 降格を通知
         window.dispatchEvent(new CustomEvent('auth:admin-expired'));
         return api(original);

@@ -11,17 +11,31 @@ from app.api.auth import require_admin
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
-_INTERNAL_PREFIXES = ("staff_pin_failures:", "staff_pin_lock_until:")
+_INTERNAL_PREFIXES = (
+    "staff_pin_failures:",
+    "staff_pin_lock_until:",
+    "admin_login_failures:",
+    "admin_login_lock_until:",
+)
+# 管理者の ID とパスワードは専用の口（/api/auth/*）だけで扱う。一覧にも出さず、ここから書き換えさせない
+_AUTH_KEYS = frozenset({"admin_username", "admin_password_hash"})
+# 欄は残す（管理者が書き換えるため）が、値は返さない
+_MASKED_KEYS = frozenset({"staff_pin"})
 
 
 def _is_visible_setting(key: str) -> bool:
-    return not key.startswith(_INTERNAL_PREFIXES)
+    return not key.startswith(_INTERNAL_PREFIXES) and key not in _AUTH_KEYS
+
+
+def _response(setting: Setting) -> SettingResponse:
+    value = "" if setting.key in _MASKED_KEYS else setting.value
+    return SettingResponse(id=setting.id, key=setting.key, value=value, updated_at=setting.updated_at)
 
 
 @router.get("/", response_model=list[SettingResponse])
 async def list_settings(db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(Setting).order_by(Setting.key))
-    return [s for s in result.scalars().all() if _is_visible_setting(s.key)]
+    return [_response(s) for s in result.scalars().all() if _is_visible_setting(s.key)]
 
 
 @router.put("/{key}", response_model=SettingResponse)
@@ -37,7 +51,7 @@ async def update_setting(key: str, data: SettingUpdate, db: AsyncSession = Depen
     setting.value = data.value
     await db.commit()
     await db.refresh(setting)
-    return setting
+    return _response(setting)
 
 
 @router.post("/reset-operational-data", tags=["settings"])

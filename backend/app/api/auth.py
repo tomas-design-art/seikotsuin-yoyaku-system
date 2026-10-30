@@ -1,6 +1,7 @@
 """2段階認証API（スタッフPIN + 管理者ID/パスワード）"""
 from datetime import datetime, timedelta
 import hashlib
+import hmac
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Depends, Header, Request
@@ -25,6 +26,28 @@ STAFF_TOKEN_HOURS = 24
 ADMIN_TOKEN_HOURS = 8
 STAFF_LOGIN_MAX_FAILURES = 5
 STAFF_LOGIN_LOCK_MINUTES = 15
+ADMIN_LOGIN_MAX_FAILURES = 5
+ADMIN_LOGIN_LOCK_MINUTES = 15
+
+# 失敗が続いたら一時的にロックする。接続元ごとに数える（キーは settings の行）
+_LOGIN_LOCKS = {
+    "staff": {
+        "failures": "staff_pin_failures:",
+        "lock_until": "staff_pin_lock_until:",
+        "max_failures": STAFF_LOGIN_MAX_FAILURES,
+        "lock_minutes": STAFF_LOGIN_LOCK_MINUTES,
+        "locked": "PIN入力の失敗が続いたため、一時的にロックされています",
+        "now_locked": "PIN入力の失敗が続いたため、一時的にロックしました",
+    },
+    "admin": {
+        "failures": "admin_login_failures:",
+        "lock_until": "admin_login_lock_until:",
+        "max_failures": ADMIN_LOGIN_MAX_FAILURES,
+        "lock_minutes": ADMIN_LOGIN_LOCK_MINUTES,
+        "locked": "ログインの失敗が続いたため、一時的にロックされています",
+        "now_locked": "ログインの失敗が続いたため、一時的にロックしました",
+    },
+}
 
 
 def _create_token(role: str, expires_delta: timedelta) -> str:
@@ -75,45 +98,48 @@ def _client_key(request: Request, x_forwarded_for: Optional[str], x_real_ip: Opt
     return digest
 
 
-async def _require_staff_login_not_locked(db: AsyncSession, client_key: str) -> None:
-    raw_until = await _get_setting(db, f"staff_pin_lock_until:{client_key}")
+async def _require_login_not_locked(db: AsyncSession, kind: str, client_key: str) -> None:
+    lock = _LOGIN_LOCKS[kind]
+    raw_until = await _get_setting(db, f"{lock['lock_until']}{client_key}")
     if not raw_until:
         return
     try:
         lock_until = datetime.fromisoformat(raw_until)
     except ValueError:
-        await _delete_setting(db, f"staff_pin_lock_until:{client_key}")
+        await _delete_setting(db, f"{lock['lock_until']}{client_key}")
         await db.commit()
         return
     if now_jst() < lock_until:
-        raise HTTPException(status_code=429, detail="PIN入力の失敗が続いたため、一時的にロックされています")
-    await _delete_setting(db, f"staff_pin_lock_until:{client_key}")
-    await _delete_setting(db, f"staff_pin_failures:{client_key}")
+        raise HTTPException(status_code=429, detail=lock["locked"])
+    await _delete_setting(db, f"{lock['lock_until']}{client_key}")
+    await _delete_setting(db, f"{lock['failures']}{client_key}")
     await db.commit()
 
 
-async def _record_staff_login_failure(db: AsyncSession, client_key: str) -> None:
-    key = f"staff_pin_failures:{client_key}"
+async def _record_login_failure(db: AsyncSession, kind: str, client_key: str) -> None:
+    lock = _LOGIN_LOCKS[kind]
+    key = f"{lock['failures']}{client_key}"
     raw_count = await _get_setting(db, key)
     try:
         count = int(raw_count or "0") + 1
     except ValueError:
         count = 1
 
-    if count >= STAFF_LOGIN_MAX_FAILURES:
-        lock_until = now_jst() + timedelta(minutes=STAFF_LOGIN_LOCK_MINUTES)
-        await _set_setting(db, f"staff_pin_lock_until:{client_key}", lock_until.isoformat())
+    if count >= lock["max_failures"]:
+        lock_until = now_jst() + timedelta(minutes=lock["lock_minutes"])
+        await _set_setting(db, f"{lock['lock_until']}{client_key}", lock_until.isoformat())
         await _set_setting(db, key, str(count))
         await db.commit()
-        raise HTTPException(status_code=429, detail="PIN入力の失敗が続いたため、一時的にロックしました")
+        raise HTTPException(status_code=429, detail=lock["now_locked"])
 
     await _set_setting(db, key, str(count))
     await db.commit()
 
 
-async def _clear_staff_login_failures(db: AsyncSession, client_key: str) -> None:
-    await _delete_setting(db, f"staff_pin_failures:{client_key}")
-    await _delete_setting(db, f"staff_pin_lock_until:{client_key}")
+async def _clear_login_failures(db: AsyncSession, kind: str, client_key: str) -> None:
+    lock = _LOGIN_LOCKS[kind]
+    await _delete_setting(db, f"{lock['failures']}{client_key}")
+    await _delete_setting(db, f"{lock['lock_until']}{client_key}")
     await db.commit()
 
 
@@ -172,29 +198,40 @@ async def staff_login(
     x_real_ip: Optional[str] = Header(None, alias="X-Real-IP"),
 ):
     client_key = _client_key(request, x_forwarded_for, x_real_ip)
-    await _require_staff_login_not_locked(db, client_key)
+    await _require_login_not_locked(db, "staff", client_key)
 
     stored_pin = await _get_setting(db, "staff_pin")
     if stored_pin is None:
         stored_pin = "1234"
-    if body.pin != stored_pin:
-        await _record_staff_login_failure(db, client_key)
+    if not hmac.compare_digest(body.pin.encode("utf-8"), stored_pin.encode("utf-8")):
+        await _record_login_failure(db, "staff", client_key)
         raise HTTPException(status_code=401, detail="PINが正しくありません")
-    await _clear_staff_login_failures(db, client_key)
+    await _clear_login_failures(db, "staff", client_key)
     token = _create_token("staff", timedelta(hours=STAFF_TOKEN_HOURS))
     return {"token": token, "role": "staff"}
 
 
 @router.post("/admin-login", response_model=TokenResponse)
-async def admin_login(body: AdminLoginRequest, db: AsyncSession = Depends(get_db)):
+async def admin_login(
+    body: AdminLoginRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    x_forwarded_for: Optional[str] = Header(None, alias="X-Forwarded-For"),
+    x_real_ip: Optional[str] = Header(None, alias="X-Real-IP"),
+):
+    client_key = _client_key(request, x_forwarded_for, x_real_ip)
+    await _require_login_not_locked(db, "admin", client_key)
+
     stored_username = await _get_setting(db, "admin_username")
     stored_hash = await _get_setting(db, "admin_password_hash")
     if stored_username is None or stored_hash is None:
         raise HTTPException(status_code=500, detail="管理者アカウントが設定されていません")
-    if body.username != stored_username:
+    # ID の間違いも、パスワードの間違いと同じく失敗に数える
+    username_ok = hmac.compare_digest(body.username.encode("utf-8"), stored_username.encode("utf-8"))
+    if not username_ok or not pwd_context.verify(body.password, stored_hash):
+        await _record_login_failure(db, "admin", client_key)
         raise HTTPException(status_code=401, detail="IDまたはパスワードが正しくありません")
-    if not pwd_context.verify(body.password, stored_hash):
-        raise HTTPException(status_code=401, detail="IDまたはパスワードが正しくありません")
+    await _clear_login_failures(db, "admin", client_key)
     token = _create_token("admin", timedelta(hours=ADMIN_TOKEN_HOURS))
     return {"token": token, "role": "admin"}
 

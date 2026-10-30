@@ -24,6 +24,16 @@ export default defineConfig({
       '/api': {
         target: apiProxyTarget,
         changeOrigin: true,
+        configure: (proxy) => {
+          // 本番の server.js と同じく、画面が X-Auth-Token で送るトークンを Authorization: Bearer に直す
+          proxy.on('proxyReq', (proxyReq, req) => {
+            const token = req.headers['x-auth-token'];
+            if (typeof token === 'string' && token) {
+              proxyReq.setHeader('Authorization', `Bearer ${token}`);
+              proxyReq.removeHeader('X-Auth-Token');
+            }
+          });
+        },
       },
     },
   },

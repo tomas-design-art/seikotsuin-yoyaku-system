@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     environment: str = "development"  # development | production
     line_autopilot_enabled: bool = False  # True: setup完了済み患者だけLINE自動応答を許可
     line_inbox_rollout: Literal["legacy", "autopilot", "all"] = "legacy"
+    # API の入口の鍵（app/middlewares/api_access.py）。open＝今まで通り／report＝通すが記録／enforce＝断る
+    api_access_mode: Literal["open", "report", "enforce"] = "open"
+    internal_api_key: str = ""  # スタッフの画面を配るサーバー（frontend/server.js）が付ける合言葉
+    homepage_api_key: str = ""  # ホームページのサーバーが付ける合言葉
+    rpa_api_key: str = ""  # HotPepper の RPA が Authorization: Bearer で付ける合言葉
 
     class Config:
         env_file = str(_ENV_FILE)

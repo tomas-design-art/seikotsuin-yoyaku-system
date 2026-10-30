@@ -84,3 +84,5 @@ jobs:
       - run: npm ci
       # tsc（型チェック）＋ vite build。本番のビルドと同じ
       - run: npm run build
+      # 画面を配る server.js（入口のログインと API の中継）のテスト
+      - run: npm test
