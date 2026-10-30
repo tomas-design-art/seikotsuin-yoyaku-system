@@ -1,1 +1,0 @@
-C:\Users\totot\OneDrive\Documents\Yoyaku_AppV2\.venv\Scripts\python.exe: Error while finding module specification for 'scripts.eval_line_parser' (ModuleNotFoundError: No module named 'scripts')
