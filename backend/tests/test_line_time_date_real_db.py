@@ -8,16 +8,20 @@
 
 見るのは返信の文面ではなく、提示した候補（会話の状態）と予約ボード。
 AIの読み取りだけは「正しく読めた」ときの値に固定する。
+「1日」の2つ（E2・E3）は、メッセージを受け取った日時も固定する（テストを回した日で答えが変わらないように）。
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
+import sys
+from contextlib import ExitStack, contextmanager
+from datetime import date, datetime
+from unittest.mock import patch
 from urllib.parse import parse_qs
 
-import holidays
 import pytest
 
 from app.models.menu import Menu
+from app.utils import datetime_jst
 from tests.test_line_change_cancel_real_db import (
     TOKITA,
     YES,
@@ -90,15 +94,25 @@ async def _reservations_of(sessions, patient_id: int) -> list[Reservation]:
         return list(rows.scalars().all())
 
 
-def _first_of_a_month(min_offset: int = 3) -> date:
-    """今日から min_offset 日以上先の「1日」。祝日・過去は避ける。"""
-    japan = holidays.Japan()
-    day = _day(min_offset)
-    while True:
-        first = date(day.year + (day.month // 12), day.month % 12 + 1, 1) if day.day != 1 else day
-        if first not in japan:
-            return first
-        day = first + timedelta(days=1)
+@contextmanager
+def _received_at(moment: datetime):
+    """アプリが読む「いま」（now_jst）を moment に固定する。
+
+    「1日」をどの日と読むかは、メッセージを受け取った日時から数える（正解 E1）。
+    以前はテストを回した日から「3日以上先の1日」を選んでいて、月末・1日・12月はアプリの答え
+    （受け取った日から次の1日）とずれて落ちた（2026-10-30 の CI）。
+    now_jst を取り込んでいるアプリのモジュールをすべて同じ時刻にそろえる。
+    """
+    original = datetime_jst.now_jst
+    with ExitStack() as stack:
+        for name, module in list(sys.modules.items()):
+            if (name == "app" or name.startswith("app.")) and getattr(module, "now_jst", None) is original:
+                stack.enter_context(patch.object(module, "now_jst", new=lambda: moment))
+        yield
+
+
+def _jst(year: int, month: int, day: int, hour: int = 10) -> datetime:
+    return datetime(year, month, day, hour, 0, tzinfo=JST)
 
 
 # ─── D4・D10：言われた時刻ちょうどを確かめる ───
@@ -182,18 +196,16 @@ async def test_asking_about_another_day_offers_that_days_slots_with_the_usual_pr
 async def test_saying_1st_while_talking_about_the_1st_means_that_day():
     """9/28 の形：候補は 9/30 のまま、話は木曜（10/1）に移っている。そこでの「1日空いてない？」は
     10/1 のこと（E3）。聞き返さず、10/1 の候補を出す。9/30 の候補を出し直すのは誤り。"""
+    first = date(2026, 10, 1)
     async with clinic() as (sessions, ids):
-        first = _first_of_a_month()
-        offered_day = first - timedelta(days=1)
-        while offered_day in holidays.Japan():
-            offered_day -= timedelta(days=1)
         uid, _patient_id = await _patient(sessions)
         await _booking_in_progress(
-            sessions, uid, ids, offered_day, ["12:00", "13:00", "14:00"], talking_about=first
+            sessions, uid, ids, date(2026, 9, 30), ["12:00", "13:00", "14:00"], talking_about=first
         )
 
-        await send(sessions, uid, "1日空いてない？", {"intent": "question"})
-        state = await _state(sessions, uid)
+        with _received_at(_jst(2026, 9, 28)):
+            await send(sessions, uid, "1日空いてない？", {"intent": "question"})
+            state = await _state(sessions, uid)
 
     assert state["mode"] == "adjusting"
     assert state["draft"]["autopilot_offer"]["offer_id"] != "offer-before"
@@ -202,25 +214,33 @@ async def test_saying_1st_while_talking_about_the_1st_means_that_day():
 
 
 @pytest.mark.asyncio
-async def test_an_ambiguous_1st_is_confirmed_before_offering():
+@pytest.mark.parametrize(
+    ("received", "talking_day", "first"),
+    [
+        # E2 の例の日付（「10月1日(木)のことですか？」）。受け取りは 9/28、話している日は 9/30（1日ではない）
+        (_jst(2026, 9, 28), date(2026, 9, 30), date(2026, 10, 1)),
+        # 月末：次の1日は2日後の 11/1(日)（2026-10-30 の CI で落ちた日）
+        (_jst(2026, 10, 30), date(2026, 10, 30), date(2026, 11, 1)),
+    ],
+    ids=["owner-example-0928", "month-end-1030"],
+)
+async def test_an_ambiguous_1st_is_confirmed_before_offering(received, talking_day, first):
     """話している日が1日（ついたち）でないときの「1日空いてない？」は、
-    「◯月1日(◯)のことですか？」と聞き返し、「はい」でその日の候補を出す（E2）。"""
+    「◯月1日(◯)のことですか？」と聞き返し、「はい」でその日の候補を出す（E2）。
+    聞き返す1日は、メッセージを受け取った日から数えて次の1日（E1）。"""
     async with clinic() as (sessions, ids):
-        first = _first_of_a_month()
-        talking_day = first - timedelta(days=2)
-        while talking_day in holidays.Japan():
-            talking_day -= timedelta(days=1)
         uid, _patient_id = await _patient(sessions)
         await _booking_in_progress(sessions, uid, ids, talking_day, ["12:00", "13:00", "14:00"])
 
-        asked = await send(sessions, uid, "1日空いてない？", {"intent": "question"})
-        state = await _state(sessions, uid)
-        assert state["mode"] == "autopilot_date_confirm"
-        assert f"{first.month}月1日" in _text(asked) or f"{first.month}/1" in _text(asked)
-        assert len(_buttons(asked)) == 2
+        with _received_at(received):
+            asked = await send(sessions, uid, "1日空いてない？", {"intent": "question"})
+            state = await _state(sessions, uid)
+            assert state["mode"] == "autopilot_date_confirm"
+            assert f"{first.month}月1日" in _text(asked) or f"{first.month}/1" in _text(asked)
+            assert len(_buttons(asked)) == 2
 
-        await send(sessions, uid, "はい", YES)
-        after = await _state(sessions, uid)
+            await send(sessions, uid, "はい", YES)
+            after = await _state(sessions, uid)
 
     assert after["mode"] == "adjusting"
     candidates = after["draft"]["autopilot_offer"]["candidates"]
