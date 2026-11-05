@@ -36,6 +36,7 @@ from tests.test_line_change_cancel_real_db import (
     send,
     tap,
 )
+from tests.test_line_menu_real_db import _menus_and_usual
 from app.models.reservation import Reservation
 from app.utils.datetime_jst import JST
 from sqlalchemy import select
@@ -308,3 +309,57 @@ async def test_the_offer_tells_start_times_only_and_invites_other_times():
         assert f"{candidate['start']}〜" in text
         assert f"{candidate['start']}〜{candidate['end']}" not in text
     assert "ほかのお時間" in text
+
+
+# ─── D3：「午後」のように時刻を言わないときは、いつもの確認のあとも候補で出す ───
+
+_USUAL_YES_BUTTON = "action=confirm&form=usual&answer=yes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("answer", ["button", "text"])
+async def test_afternoon_without_a_time_is_offered_as_candidates_after_the_usual_menu(answer):
+    """「明日の午後予約したい」→「いつものでよろしいですか」→「はい」。時刻は言っていないので、
+    午後の空きを2〜3個の候補で出す（D3）。AIの読み取りが「午後」から補った 14:00 を、本人が言った
+    時刻として1つだけ確認しない（2026-11-05 22:06 の実機。日時を聞いた後の「明日の午後で」は候補が出ていた）。"""
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        await _menus_and_usual(sessions, ids, patient_id)
+
+        await send(
+            sessions, uid, f"{day.month}月{day.day}日の午後予約したい",
+            {"intent": "new", "date": day.isoformat(), "time": "14:00", "constraints": ["window:12:00-24:00"]},
+        )
+        assert (await _state(sessions, uid))["mode"] == "autopilot_confirm_usual"
+
+        if answer == "button":
+            sent = await tap(sessions, uid, _USUAL_YES_BUTTON)
+        else:
+            sent = await send(sessions, uid, "はい", YES)
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "adjusting", state["mode"]
+    candidates = state["draft"]["autopilot_offer"]["candidates"]
+    assert 2 <= len(candidates) <= 3, candidates
+    assert all(c["date"] == day.isoformat() and c["start"] >= "12:00" for c in candidates), candidates
+    assert 2 <= len(_buttons(sent)) <= 3
+
+
+@pytest.mark.asyncio
+async def test_a_stated_time_is_still_confirmed_as_that_slot_after_the_usual_menu():
+    """時刻を言ったとき（「14時」）は、いつもの確認のあと、その枠で「よろしいですか」と確かめる（D10・D13）。"""
+    async with clinic() as (sessions, ids):
+        day = _day()
+        uid, patient_id = await _patient(sessions)
+        await _menus_and_usual(sessions, ids, patient_id)
+
+        await send(
+            sessions, uid, f"{day.month}月{day.day}日の14時から予約したい",
+            {"intent": "new", "date": day.isoformat(), "time": "14:00"},
+        )
+        await tap(sessions, uid, _USUAL_YES_BUTTON)
+        state = await _state(sessions, uid)
+
+    assert state["mode"] == "autopilot_booking_confirm", state["mode"]
+    assert state["draft"]["time"] == "14:00"
