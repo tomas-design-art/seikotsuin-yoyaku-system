@@ -1154,7 +1154,10 @@ async def _confirm_picked_slot(
     candidate = offered_slots.picked_record(offer, index)
     if candidate is None:
         return
-    await merge_user_draft(db, user_id, {"autopilot_picked_slot": candidate}, request_id)
+    # 枠を選んだ＝時刻が決まった。前に言われた「午後」などで候補を出し直さない
+    await merge_user_draft(
+        db, user_id, {"autopilot_picked_slot": candidate}, request_id, drop=(_VAGUE_TIME_KEY,)
+    )
     await set_user_mode(db, user_id, "autopilot_slot_confirm", request_id)
     await _reply_plan(reply_token, "slot", _picked_slot_plan(candidate, menu_name))
 
@@ -3022,6 +3025,12 @@ async def _merge_autopilot_slots(
     # 8/31の話をしていたのに今日で確定してしまう（実機で発生）。
     if update["date"] and previous.get("date") and not _mentions_explicit_date(text):
         update["date"] = previous["date"]
+    # 時間帯だけを言われたら覚えておく。時刻を言われたら忘れる（正解 D3・D10）
+    period = _VAGUE_TIME_PERIOD.search(text or "")
+    if _mentions_clock_time(text):
+        drop.append(_VAGUE_TIME_KEY)
+    elif period:
+        update[_VAGUE_TIME_KEY] = period.group(0)
     menu_hint = parsed.get("menu_name") or parsed.get("menu_hint")
     if (
         menu_hint
@@ -3499,8 +3508,25 @@ async def _handle_autopilot_setup_message(
     return False
 
 
+_VAGUE_TIME_PERIOD = re.compile(r"午前(?:中)?|午後|夕方|夜|晩|朝|morning|afternoon|evening|night", re.IGNORECASE)
+# 本人が「午後」のように時間帯だけを言い、時刻を言っていない（その時間帯の空きを候補で出す・正解 D3）。
+# 「いつものでよろしいですか」への「はい」のように、時間帯の言葉が無い次の1通でも覚えておく。
+# 以前は今の1通だけを見ていて、AIの読み取りが「午後」から補った14:00を、本人が言った時刻として
+# 1つだけ確認した（2026-11-05 22:06 の実機）。
+_VAGUE_TIME_KEY = "vague_time_period"
+
+
 def _has_vague_time_period(text: str) -> bool:
-    return bool(re.search(r"午前(?:中)?|午後|夕方|夜|晩|朝|morning|afternoon|evening|night", text or "", re.IGNORECASE))
+    return bool(_VAGUE_TIME_PERIOD.search(text or ""))
+
+
+def _vague_time_words(text: str, draft: dict | None) -> str:
+    """時間帯の言葉。今の1通にあればそれ、時刻を言い直していなければ前に言われたもの。"""
+    if _has_vague_time_period(text):
+        return text
+    if _mentions_clock_time(text):
+        return ""
+    return str((draft or {}).get(_VAGUE_TIME_KEY) or "")
 
 
 def _vague_time_window(text: str) -> tuple[int, int] | None:
@@ -5549,6 +5575,8 @@ async def _handle_text_message(event: dict, db: AsyncSession):
                         "date": parsed_same.get("date"),
                         "time": parsed_same.get("time"),
                     },
+                    # 「はい、15時で」のように時刻を言われたら、前に言われた時間帯は使わない
+                    drop=(_VAGUE_TIME_KEY,) if _mentions_clock_time(text) else (),
                 )
             await set_user_mode(db, user_id, "idle")
         # 「変更」は予約そのものの変更依頼と語がぶつかる。ここで拾うと
@@ -6201,11 +6229,12 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     )
     alternatives: list[dict] = []
     vague_choice = False
-    needs_candidates = (not practitioner) or _has_vague_time_period(text)
+    vague_words = _vague_time_words(text, merged)
+    needs_candidates = (not practitioner) or bool(vague_words)
     if needs_candidates:
         vague_choice = practitioner is not None  # 空きはあるが曖昧時間帯 → 候補から選ばせる
         slot_filters = build_slot_filters(merged.get("constraints"))
-        window = _vague_time_window(text)
+        window = _vague_time_window(vague_words)
         if slot_filters.window_start_min is None and slot_filters.window_end_min is None and window:
             slot_filters.window_start_min, slot_filters.window_end_min = window
         scored = await build_candidates_over_days(
@@ -6303,7 +6332,7 @@ async def _handle_text_message(event: dict, db: AsyncSession):
     # 2026-10-21）。10/20 23:05 の実機：「明日10時」で時田が空いていないことを書かずに 13:20 時田・10:00 上田 を出した。
     # 「午後」のような時間帯の言い方では、時刻は言われていないので書かない
     unavailable = {}
-    if not practitioner and not _has_vague_time_period(text):
+    if not practitioner and not vague_words:
         stamp = f"{_format_date_with_weekday_jp(target_date)} {target_time.strftime('%H:%M')}"
         unavailable = {
             "unavailable_note": f"{stamp}〜は{await _practitioner_label(db, candidate_practitioner_id)}空きがございません。"

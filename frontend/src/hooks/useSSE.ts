@@ -22,8 +22,13 @@ export function useSSE(onEvent: (event: SSEEvent) => void) {
     const sseUrl = `${apiBaseURL.replace(/\/$/, '')}/sse/events`;
     const es = new EventSource(sseUrl, { withCredentials: true });
 
+    // 一覧に無い名前は届いても捨てる。API でお知らせを足したら、ここに足すか
+    // backend/tests/test_sse_event_names.py の「画面に出さない」に理由つきで足す。
     const eventTypes = [
       'new_reservation',
+      // LINE・HotPepper の変更とキャンセル。無いと予約表が読み直されなかった（2026-11-05）
+      'reservation_changed',
+      'reservation_cancelled',
       'conflict_detected',
       'schedule_conflict_alert',
       'cancel_requested',
