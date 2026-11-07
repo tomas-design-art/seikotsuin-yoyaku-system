@@ -45,6 +45,9 @@ class WebReserveRequest(BaseModel):
 
     # フルネーム入力（外国人名など長い名前用・姓名分割しない）
     full_name: Optional[str] = Field(default=None, max_length=400)
+    # フルネームの読み（カタカナ / ローマ字）。スタッフ画面の「フルネーム」と同じく患者の reading に入れる。
+    # 上限は患者の reading の枠（200文字）にそろえる
+    full_name_kana: Optional[str] = Field(default=None, max_length=200)
 
     # HP側から送られる登録モード ("full" or "split")
     # "full" → full_name フィールドを使用、"split" → last_name/first_name を使用
@@ -190,12 +193,17 @@ async def web_reserve(body: WebReserveRequest, db: AsyncSession = Depends(get_db
         ]
         return WebReserveConflict(status="conflict", alternatives=iso_alternatives)
 
+    # フルネームで登録するときだけ、その読みを reading に渡す
+    # （姓名で登録するときの reading は、患者の作成でセイ・メイをつないで作られる）
+    full_name_reading = ((body.full_name_kana or "").strip() or None) if has_full else None
+
     # 患者を検索 or 作成（電話番号 → LINE ID → 名前 のフォールバックマッチ）
     from app.services.patient_match import find_or_create_patient
     patient = await find_or_create_patient(
         db,
         name=body.name,
         phone=body.phone,
+        reading=full_name_reading,
         last_name=effective_last_name,
         first_name=effective_first_name,
         last_name_kana=body.last_name_kana,
