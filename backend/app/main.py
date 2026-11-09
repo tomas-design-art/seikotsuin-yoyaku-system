@@ -119,6 +119,11 @@ from app.middlewares.api_access import ApiAccessMiddleware, warn_if_misconfigure
 app.add_middleware(ApiAccessMiddleware)
 warn_if_misconfigured(app_settings)
 
+# uvicorn のアクセスログに ? より後ろ（患者の検索の文字・電話番号など）を残さない
+from app.access_log import install as install_access_log_filter  # noqa: E402
+
+install_access_log_filter()
+
 app.include_router(practitioners.router)
 app.include_router(patients.router)
 app.include_router(menus.router)
